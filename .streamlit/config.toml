@@ -1,0 +1,17 @@
+[server]
+# Puerto de escucha (por defecto 8501)
+port = 8502
+
+# Escuchar en todas las interfaces de red (necesario para acceso desde otros equipos)
+address = "0.0.0.0"
+
+# Certificado SSL auto-firmado (generado con generate_cert.py)
+sslCertFile = "ssl/cert.pem"
+sslKeyFile  = "ssl/key.pem"
+
+[browser]
+# Evita que el servidor intente abrir el navegador automáticamente en el equipo host
+gatherUsageStats = false
+
+[theme]
+base = "light"
