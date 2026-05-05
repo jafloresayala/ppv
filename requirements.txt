@@ -33,3 +33,4 @@ azure-core==1.39.0
 
 # ── SSL (generación de certificado auto-firmado) ───────────────────────────────
 cryptography==46.0.3
+plotly==5.24.1
