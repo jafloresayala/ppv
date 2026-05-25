@@ -79,11 +79,16 @@ REM ── FastAPI backend (PPV) ───────────────�
 echo [INFO] Starting PPV backend on port 8080...
 start "PPV Backend" cmd /k "cd /d "%ROOT%backend" && %PYTHON% -m uvicorn main:app --host 0.0.0.0 --port 8080 --reload"
 
-REM ── Price Calculator backend (sibling project or same repo) ───────────────
-REM Busca primero como subcarpeta del repo, luego como proyecto hermano
+REM ── Price Calculator backend (busca en varias ubicaciones conocidas) ─────────
 set PRICECALC_DIR=%ROOT%conexion_internalquery
 if not exist "%PRICECALC_DIR%\app.py" (
     for %%P in ("%ROOT%..\conexion_internalquery") do set PRICECALC_DIR=%%~fP
+)
+if not exist "%PRICECALC_DIR%\app.py" (
+    set PRICECALC_DIR=F:\api_combined_search\api_combined_search
+)
+if not exist "%PRICECALC_DIR%\app.py" (
+    for %%P in ("%ROOT%..\api_combined_search\api_combined_search") do set PRICECALC_DIR=%%~fP
 )
 if exist "%PRICECALC_DIR%\app.py" (
     echo [INFO] Starting Price Calculator backend on port 8081...
