@@ -92,7 +92,9 @@ if not exist "%PRICECALC_DIR%\app.py" (
 )
 if exist "%PRICECALC_DIR%\app.py" (
     echo [INFO] Starting Price Calculator backend on port 8081...
-    if exist "%PRICECALC_DIR%\env\Scripts\uvicorn.exe" (
+    if exist "%PRICECALC_DIR%\launch.bat" (
+        start "Price Calculator" cmd /k "cd /d "%PRICECALC_DIR%" && call launch.bat"
+    ) else if exist "%PRICECALC_DIR%\env\Scripts\uvicorn.exe" (
         start "Price Calculator" cmd /k "cd /d "%PRICECALC_DIR%" && "%PRICECALC_DIR%\env\Scripts\uvicorn.exe" app:app --host 0.0.0.0 --port 8081 --reload"
     ) else (
         start "Price Calculator" cmd /k "cd /d "%PRICECALC_DIR%" && %PYTHON% -m uvicorn app:app --host 0.0.0.0 --port 8081 --reload"
