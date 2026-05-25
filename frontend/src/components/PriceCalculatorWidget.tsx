@@ -880,22 +880,25 @@ async function downloadMpnExcelFile(
     // Deep Analysis
     const ws = wb.addWorksheet('Deep Analysis', { views: [{ state: 'frozen', ySplit: 1 }] })
     ws.columns = [
-      { header: 'Internal PN',              key: 'internalPN',  width: 16 },
-      { header: 'MPN (Multi-MPN)',           key: 'mpnMpn',      width: 24 },
-      { header: 'Plant (Multi-MPN)',         key: 'mpnPlant',    width: 12 },
-      { header: 'Supplier (Multi-MPN)',      key: 'mpnSupplier', width: 30 },
-      { header: 'Last PO USD (Multi-MPN)',   key: 'mpnPrice',    width: 20 },
-      { header: 'Date (Multi-MPN)',          key: 'mpnDate',     width: 14 },
-      { header: 'Internal PN (Multi-Comp)', key: 'mcInternalPN', width: 16 },
-      { header: 'MPN (Multi-Comp)',          key: 'mcMpn',        width: 24 },
-      { header: 'Plant (Multi-Comp)',        key: 'mcPlant',      width: 12 },
-      { header: 'Supplier (Multi-Comp)',     key: 'mcSupplier',   width: 30 },
-      { header: 'Last PO USD (Multi-Comp)',  key: 'mcPrice',      width: 20 },
-      { header: 'Date (Multi-Comp)',         key: 'mcDate',       width: 14 },
-      { header: 'Winner',                    key: 'winner',       width: 14 },
+      { header: 'Internal PN',                      key: 'internalPN',  width: 16 },
+      { header: 'QTY Inserted',                     key: 'qtyIns',      width: 14 },
+      { header: 'MPN (Multi-MPN)',                   key: 'mpnMpn',      width: 24 },
+      { header: 'Plant (Multi-MPN)',                 key: 'mpnPlant',    width: 12 },
+      { header: 'Supplier (Multi-MPN)',              key: 'mpnSupplier', width: 30 },
+      { header: 'Last PO USD (Multi-MPN)',           key: 'mpnPrice',    width: 20 },
+      { header: 'Total (USD) per QTY (Multi-MPN)',  key: 'totalMpn',    width: 26 },
+      { header: 'Date (Multi-MPN)',                  key: 'mpnDate',     width: 14 },
+      { header: 'Internal PN (Multi-Comp)',          key: 'mcInternalPN', width: 16 },
+      { header: 'MPN (Multi-Comp)',                  key: 'mcMpn',        width: 24 },
+      { header: 'Plant (Multi-Comp)',                key: 'mcPlant',      width: 12 },
+      { header: 'Supplier (Multi-Comp)',             key: 'mcSupplier',   width: 30 },
+      { header: 'Last PO USD (Multi-Comp)',          key: 'mcPrice',      width: 20 },
+      { header: 'Total (USD) per QTY (Multi-Comp)', key: 'totalMc',      width: 26 },
+      { header: 'Date (Multi-Comp)',                 key: 'mcDate',       width: 14 },
+      { header: 'Winner',                            key: 'winner',       width: 14 },
     ]
     styleHeader(ws)
-    ws.autoFilter = 'A1:M1'
+    ws.autoFilter = `A1:P1`
     deepAnalysisRows.filter(dr => dr.status === 'done').forEach((dr, i) => {
       const candidates = mpnEntries.filter(e => e.bestRow.internalPN === dr.internalPN)
       const mpnBest    = candidates.reduce<typeof mpnEntries[0] | null>((min, e) => {
@@ -904,21 +907,27 @@ async function downloadMpnExcelFile(
       }, null)
       const mpnPrice = mpnBest ? resolveLastPoPrice(mpnBest.bestRow) : null
       const mcPrice  = dr.mcBestPriceUsd
+      const qtyIns   = ctx.mpnComponentQtys[mpnBest?.mpn ?? ''] ?? ctx.qty
+      const totalMpn = mpnPrice != null && mpnPrice > 0 ? mpnPrice * qtyIns : null
+      const totalMc  = mcPrice  != null && mcPrice  > 0 ? mcPrice  * qtyIns : null
       const winner   = mpnPrice != null && mcPrice != null
         ? mpnPrice < mcPrice ? 'Multi-MPN' : mcPrice < mpnPrice ? 'Multi-Comp' : 'Tie'
         : mpnPrice != null ? 'Multi-MPN' : mcPrice != null ? 'Multi-Comp' : ''
       const row = ws.addRow({
         internalPN: dr.internalPN,
+        qtyIns,
         mpnMpn:      mpnBest?.mpn || '',
         mpnPlant:    mpnBest?.bestRow.siteName || '',
         mpnSupplier: mpnBest ? (mpnBest.bestRow.supplierName || mpnBest.bestRow.englishName || '') : '',
         mpnPrice:    mpnPrice ?? '',
+        totalMpn:    totalMpn ?? '',
         mpnDate:     mpnBest?.bestRow.lastPoDate || '',
         mcInternalPN: dr.mcBestInternalPN || '',
         mcMpn:        dr.mcBestMpn || '',
         mcPlant:      dr.mcBestPlant || '',
         mcSupplier:   dr.mcBestSupplier || '',
         mcPrice:      mcPrice ?? '',
+        totalMc:      totalMc ?? '',
         mcDate:       dr.mcLastPoDate || '',
         winner,
       })
@@ -930,22 +939,136 @@ async function downloadMpnExcelFile(
         cell.alignment = { vertical: 'middle' }
         cell.border    = { bottom: { style: 'thin', color: { argb: 'FFE5E7EB' } } }
       })
-      for (const k of ['mpnPrice', 'mcPrice']) {
+      for (const k of ['mpnPrice', 'mcPrice', 'totalMpn', 'totalMc']) {
         const c = row.getCell(k)
         c.alignment = { horizontal: 'right', vertical: 'middle' }
         if (c.value !== '' && c.value != null) c.numFmt = '#,##0.000000'
       }
+      row.getCell('qtyIns').alignment = { horizontal: 'right', vertical: 'middle' }
+      if (row.getCell('qtyIns').value != null) row.getCell('qtyIns').numFmt = '#,##0'
       const wc = row.getCell('winner')
       wc.alignment = { horizontal: 'center', vertical: 'middle' }
       if (winner === 'Multi-MPN') {
         wc.font = { bold: true, size: 9, name: 'Calibri', color: { argb: 'FF166534' } }
-        row.getCell('mpnPrice').font = { bold: true, size: 9, name: 'Calibri', color: { argb: 'FF166534' } }
+        row.getCell('mpnPrice').font  = { bold: true, size: 9, name: 'Calibri', color: { argb: 'FF166534' } }
+        row.getCell('totalMpn').font  = { bold: true, size: 9, name: 'Calibri', color: { argb: 'FF166534' } }
       } else if (winner === 'Multi-Comp') {
         wc.font = { bold: true, size: 9, name: 'Calibri', color: { argb: 'FF7C3AED' } }
         row.getCell('mcPrice').font = { bold: true, size: 9, name: 'Calibri', color: { argb: 'FF7C3AED' } }
+        row.getCell('totalMc').font = { bold: true, size: 9, name: 'Calibri', color: { argb: 'FF7C3AED' } }
       }
     })
   }
+
+  const buffer = await wb.xlsx.writeBuffer()
+  const blob   = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })
+  const url    = URL.createObjectURL(blob)
+  const a      = document.createElement('a')
+  a.href = url; a.download = filename; a.click()
+  URL.revokeObjectURL(url)
+}
+
+async function downloadMcDeepExcelFile(
+  rows: McDeepRow[],
+  componentQtys: Record<string, number>,
+  qty: number,
+  filename: string,
+): Promise<void> {
+  const ExcelJS = (await import('exceljs')).default
+  const wb = new ExcelJS.Workbook()
+  wb.creator = 'PPV Dashboard'
+  const ws = wb.addWorksheet('MC Deep Analysis', { views: [{ state: 'frozen', ySplit: 2 }] })
+
+  ws.columns = [
+    { header: 'BMATN',                          key: 'bmatn',          width: 18 },
+    { header: 'QTY Inserted',                   key: 'qtyIns',         width: 14 },
+    { header: 'MC Internal PN',                 key: 'mcInternalPN',   width: 16 },
+    { header: 'MC MPN',                         key: 'mcMpn',          width: 24 },
+    { header: 'MC Plant',                       key: 'mcPlant',        width: 12 },
+    { header: 'MC Supplier',                    key: 'mcSupplier',     width: 30 },
+    { header: 'MC Last PO (USD)',               key: 'mcPrice',        width: 18 },
+    { header: 'MC Std (USD)',                   key: 'mcStd',          width: 14 },
+    { header: 'MC Date',                        key: 'mcDate',         width: 14 },
+    { header: 'MPN Internal PN',                key: 'mpnInternalPN',  width: 16 },
+    { header: 'MPN MPN',                        key: 'mpnMpn',         width: 24 },
+    { header: 'MPN Plant',                      key: 'mpnPlant',       width: 12 },
+    { header: 'MPN Supplier',                   key: 'mpnSupplier',    width: 30 },
+    { header: 'MPN Last PO (USD)',              key: 'mpnPrice',       width: 18 },
+    { header: 'MPN Std (USD)',                  key: 'mpnStd',         width: 14 },
+    { header: 'MPN Date',                       key: 'mpnDate',        width: 14 },
+    { header: 'Total (USD) per QTY',            key: 'totalUsd',       width: 22 },
+    { header: 'Winner',                         key: 'winner',         width: 14 },
+  ]
+
+  // Style header
+  const headerRow = ws.getRow(1)
+  headerRow.height = 22
+  headerRow.eachCell((cell: any) => {
+    cell.font      = { bold: true, size: 9, name: 'Calibri', color: { argb: 'FFFFFFFF' } }
+    cell.fill      = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1F2937' } }
+    cell.alignment = { vertical: 'middle', horizontal: 'center' }
+    cell.border    = { bottom: { style: 'medium', color: { argb: 'FF374151' } } }
+  })
+  ws.autoFilter = `A1:R1`
+
+  rows.filter(dr => dr.mpnStatus === 'done').forEach((dr, i) => {
+    const mcPrice  = dr.mcPrice
+    const mpnPrice = dr.mpnBestPriceUsd
+    const qtyIns   = componentQtys[dr.bmatn] ?? qty
+    let winner: 'MC' | 'MPN' | 'Tie' | '' = ''
+    if (mcPrice != null && mpnPrice != null) {
+      winner = mcPrice < mpnPrice ? 'MC' : mpnPrice < mcPrice ? 'MPN' : 'Tie'
+    } else if (mcPrice != null) winner = 'MC'
+    else if (mpnPrice != null) winner = 'MPN'
+    const winnerPrice = winner === 'MC' ? mcPrice : winner === 'MPN' ? mpnPrice : winner === 'Tie' ? (mcPrice ?? mpnPrice) : null
+    const totalUsd = winnerPrice != null ? winnerPrice * qtyIns : null
+
+    const row = ws.addRow({
+      bmatn:         dr.bmatn,
+      qtyIns,
+      mcInternalPN:  dr.mcInternalPN || '',
+      mcMpn:         dr.mcMpn || '',
+      mcPlant:       dr.mcPlant || '',
+      mcSupplier:    dr.mcSupplier || '',
+      mcPrice:       mcPrice ?? '',
+      mcStd:         dr.mcStdPriceUsd ?? '',
+      mcDate:        dr.mcLastPoDate || '',
+      mpnInternalPN: dr.mpnBestInternalPN || '',
+      mpnMpn:        dr.mpnBestMpn || '',
+      mpnPlant:      dr.mpnBestPlant || '',
+      mpnSupplier:   dr.mpnBestSupplier || '',
+      mpnPrice:      mpnPrice ?? '',
+      mpnStd:        dr.mpnBestStdPriceUsd ?? '',
+      mpnDate:       dr.mpnLastPoDate || '',
+      totalUsd:      totalUsd ?? '',
+      winner,
+    })
+    row.height = 18
+    const bg = winner === 'MC' ? 'FFEDE9FE' : winner === 'MPN' ? 'FFD1FAE5' : i % 2 === 0 ? 'FFFFFFFF' : 'FFF8FAFC'
+    row.eachCell({ includeEmpty: true }, (cell: any) => {
+      cell.fill      = { type: 'pattern', pattern: 'solid', fgColor: { argb: bg } }
+      cell.font      = { size: 9, name: 'Calibri' }
+      cell.alignment = { vertical: 'middle' }
+      cell.border    = { bottom: { style: 'thin', color: { argb: 'FFE5E7EB' } } }
+    })
+    for (const k of ['mcPrice', 'mcStd', 'mpnPrice', 'mpnStd', 'totalUsd']) {
+      const c = row.getCell(k)
+      c.alignment = { horizontal: 'right', vertical: 'middle' }
+      if (c.value !== '' && c.value != null) c.numFmt = '#,##0.000000'
+    }
+    row.getCell('qtyIns').alignment = { horizontal: 'right', vertical: 'middle' }
+    if (row.getCell('qtyIns').value != null) row.getCell('qtyIns').numFmt = '#,##0'
+    row.getCell('winner').alignment = { horizontal: 'center', vertical: 'middle' }
+    if (winner === 'MC') {
+      row.getCell('winner').font  = { bold: true, size: 9, name: 'Calibri', color: { argb: 'FF7C3AED' } }
+      row.getCell('mcPrice').font = { bold: true, size: 9, name: 'Calibri', color: { argb: 'FF7C3AED' } }
+      row.getCell('totalUsd').font = { bold: true, size: 9, name: 'Calibri', color: { argb: 'FF7C3AED' } }
+    } else if (winner === 'MPN') {
+      row.getCell('winner').font   = { bold: true, size: 9, name: 'Calibri', color: { argb: 'FF166534' } }
+      row.getCell('mpnPrice').font = { bold: true, size: 9, name: 'Calibri', color: { argb: 'FF166534' } }
+      row.getCell('totalUsd').font = { bold: true, size: 9, name: 'Calibri', color: { argb: 'FF166534' } }
+    }
+  })
 
   const buffer = await wb.xlsx.writeBuffer()
   const blob   = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })
@@ -2757,7 +2880,23 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                             <p className="text-sm text-gray-400 py-8 text-center">Click "Deep Analysis" to compare component prices with Multi-MPN best prices.</p>
                           ) : (
                             <div>
-                              <p className="text-[10px] text-gray-400 mb-3">Comparison of Multi-Component (45-day window best) vs Multi-MPN (AMPL active MPNs best) prices per BMATN</p>
+                              <div className="flex items-center justify-between mb-3">
+                                <p className="text-[10px] text-gray-400">Comparison of Multi-Component (45-day window best) vs Multi-MPN (AMPL active MPNs best) prices per BMATN</p>
+                                <button
+                                  onClick={() => downloadMcDeepExcelFile(
+                                    mcDeepRows,
+                                    componentQtys,
+                                    qty,
+                                    `PPV_MC_DeepAnalysis_${new Date().toISOString().slice(0, 10)}.xlsx`,
+                                  )}
+                                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-emerald-700 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded-lg transition-colors whitespace-nowrap"
+                                >
+                                  <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+                                    <path strokeLinecap="round" strokeLinejoin="round" d="M12 10v6m0 0l-3-3m3 3l3-3m2 4H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                                  </svg>
+                                  Export Excel
+                                </button>
+                              </div>
                               <div className="overflow-x-auto rounded-xl border border-gray-200 shadow-sm">
                                 <table className="min-w-max w-full text-xs border-collapse">
                                   <thead className="bg-gray-50 text-[10px] uppercase tracking-wide text-gray-500">
