@@ -46,39 +46,33 @@ if not exist "%ROOT%frontend\node_modules" (
     echo [OK] Node dependencies already present.
 )
 
-REM ── Docker / Redis ────────────────────────────────────────────────────────
-echo Checking Docker...
-docker info >nul 2>&1
-if %errorlevel% equ 0 goto docker_ready
-
-echo [INFO] Docker not running — trying to start Docker Desktop...
-set DOCKER_DESKTOP=C:\Program Files\Docker\Docker\Docker Desktop.exe
-if exist "%DOCKER_DESKTOP%" (
-    start "" "%DOCKER_DESKTOP%"
-    echo [INFO] Waiting for Docker to be ready (up to 60 s)...
-    set /a _tries=0
-    :wait_docker
-    timeout /t 3 /nobreak >nul
-    set /a _tries+=1
-    docker info >nul 2>&1
-    if %errorlevel% equ 0 goto docker_ready
-    if %_tries% lss 20 goto wait_docker
-)
-echo [WARN] Docker not available. Redis will be skipped (in-memory fallback).
-goto skip_redis
-
-:docker_ready
-echo [OK] Docker is ready.
+REM ── Redis (servicio Windows nativo tiene prioridad sobre Docker) ──────────
 echo Checking Redis...
+sc query Redis >nul 2>&1
+if %errorlevel% equ 0 (
+    sc start Redis >nul 2>&1
+    "%PYTHON%" -c "import socket; s=socket.create_connection(('127.0.0.1',6379),timeout=2); s.close()" >nul 2>&1
+    if %errorlevel% equ 0 (
+        echo [OK] Redis Windows service running on localhost:6379
+        goto skip_redis
+    )
+)
+
+REM Redis nativo no disponible — intentar con Docker
+docker info >nul 2>&1
+if %errorlevel% neq 0 goto no_redis
+
 docker start ppv-redis >nul 2>&1
 if %errorlevel% neq 0 (
     docker run -d --name ppv-redis -p 6379:6379 --restart unless-stopped redis:7-alpine >nul 2>&1
 )
-if %errorlevel% neq 0 (
-    echo [WARN] Redis not available. App will use in-memory fallback.
-) else (
-    echo [OK] Redis running on localhost:6379
+if %errorlevel% equ 0 (
+    echo [OK] Redis Docker container running on localhost:6379
+    goto skip_redis
 )
+
+:no_redis
+echo [WARN] Redis no disponible — usando fallback en memoria.
 :skip_redis
 
 REM ── FastAPI backend (PPV) ─────────────────────────────────────────────────
@@ -104,7 +98,12 @@ if exist "%PRICECALC_DIR%\app.py" (
 )
 
 REM ── Frontend ──────────────────────────────────────────────────────────────
-timeout /t 3 /nobreak >nul
+REM Liberar puerto 5173 si hay una instancia vieja de Vite
+for /f "tokens=5" %%P in ('netstat -ano ^| findstr ":5173 " 2^>nul') do (
+    taskkill /PID %%P /F >nul 2>&1
+)
+
+timeout /t 2 /nobreak >nul
 start http://localhost:5173
 
 REM Start Vite dev server (--host exposes Network URL for LAN sharing)
