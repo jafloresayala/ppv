@@ -1,4 +1,5 @@
 // src/App.tsx — Main application shell
+import { Routes, Route } from 'react-router-dom'
 import { usePPV } from './store/ppvStore'
 import QueryForm    from './components/QueryForm'
 import KPICards     from './components/KPICards'
@@ -40,7 +41,7 @@ const TAB_CONTENT: JSX.Element[] = [
   <TabAI />,
 ]
 
-export default function App() {
+function MainApp() {
   const { analytics, activeTab, setTab, error, clearError, loading } = usePPV()
   const hasData = !!analytics
 
@@ -148,5 +149,22 @@ export default function App() {
       {hasData && <Sidebar />}
       <PriceCalculatorWidget />
     </div>
+  )
+}
+
+function PriceCalculatorPage() {
+  return (
+    <div className="min-h-screen bg-gray-50">
+      <PriceCalculatorWidget mode="page" />
+    </div>
+  )
+}
+
+export default function App() {
+  return (
+    <Routes>
+      <Route path="/pricecalculator" element={<PriceCalculatorPage />} />
+      <Route path="/*" element={<MainApp />} />
+    </Routes>
   )
 }
