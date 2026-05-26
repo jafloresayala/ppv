@@ -1147,6 +1147,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
   const [multiSubTab, setMultiSubTab]     = useState<'results' | 'allrecords' | 'blocked' | 'deep'>('results')
   const [myPlant, setMyPlant]             = useState<string>('')
   const [windowDays, setWindowDays]       = useState(45)
+  const [searchMode, setSearchMode]       = useState<'internal' | 'mpn'>('internal')
   const [searchNexar, setSearchNexar]     = useState(false)
   const [componentQtys, setComponentQtys] = useState<Record<string, number>>({})
   const [componentQtyDefaults, setComponentQtyDefaults] = useState<Record<string, 'empty' | '0'>>({})
@@ -1188,63 +1189,81 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
     if (!bmatn.trim()) return
     reset()
     try {
-      setStatus('loading-ampl')
-      const amplData = await apiPost<AmplResponse>('/api/pricecalc/ampl', { internal_part_number: bmatn.trim().toUpperCase() })
-      setAmpl(amplData)
-
-      // Build query MPNs: prefer active, fall back to blocked+deleted (same logic as sourcing.py)
-      let queryMpns = amplData.mpns_list
-      let usedFallback = false
-      if (!queryMpns.length) {
-        const fallback = [
-          ...amplData.blocked.map(i => i.MfgPartNumber),
-          ...amplData.deleted.map(i => i.MfgPartNumber),
-        ].filter(Boolean).filter((v, i, a) => a.indexOf(v) === i)
-        if (!fallback.length) {
-          setError('No MPNs found for this component in SAP.')
+      if (searchMode === 'mpn') {
+        // ── MPN mode: skip AMPL, query IQ + market directly ──────────────────
+        const queryMpns = [bmatn.trim().toUpperCase()]
+        setStatus('loading-iq')
+        const iqData = await apiPost<{ count: number; data: IQItem[] }>('/api/pricecalc/internal-query', { mpns: queryMpns })
+        const rows: IQItem[] = Array.isArray(iqData.data) ? iqData.data : []
+        if (!rows.length) {
+          setError('No pricing data found for this MPN.')
           setStatus('error'); return
         }
-        queryMpns = fallback
-        usedFallback = true
-        setUsedFallback(true)
-      }
+        setIqRows(rows)
+        setPlants(buildPlantSummaries(rows, windowDays * 86400000))
+        setStatus('loading-market')
+        const mkt = await apiPost<MarketResponse>('/api/pricecalc/market-prices', { mpns: queryMpns, quantity: qty })
+        setMarket(mkt)
+      } else {
+        // ── Internal PN mode: original flow ──────────────────────────────────
+        setStatus('loading-ampl')
+        const amplData = await apiPost<AmplResponse>('/api/pricecalc/ampl', { internal_part_number: bmatn.trim().toUpperCase() })
+        setAmpl(amplData)
 
-      setStatus('loading-iq')
-      const iqData = await apiPost<{ count: number; data: IQItem[] }>('/api/pricecalc/internal-query', { mpns: queryMpns })
-      const rows: IQItem[] = Array.isArray(iqData.data) ? iqData.data : []
-      if (!rows.length && usedFallback) {
-        setError('Component found in SAP (blocked/deleted MPNs only) but no pricing data available.')
-        setStatus('error'); return
-      }
-      setIqRows(rows)
-      setPlants(buildPlantSummaries(rows, windowDays * 86400000))
-
-      // Always fetch historical data from blocked/deleted MPNs when they exist (for full picture)
-      if (!usedFallback) {
-        const blockedMpns = [
-          ...amplData.blocked.map(i => i.MfgPartNumber),
-          ...amplData.deleted.map(i => i.MfgPartNumber),
-        ].filter(Boolean).filter((v, i, a) => a.indexOf(v) === i)
-        if (blockedMpns.length) {
-          try {
-            const biqData = await apiPost<{ count: number; data: IQItem[] }>('/api/pricecalc/internal-query', { mpns: blockedMpns })
-            const bRows: IQItem[] = Array.isArray(biqData.data) ? biqData.data : []
-            setBlockedIqRows(bRows)
-            setBlockedPlants(buildPlantSummaries(bRows, windowDays * 86400000))
-          } catch { /* non-critical */ }
+        // Build query MPNs: prefer active, fall back to blocked+deleted (same logic as sourcing.py)
+        let queryMpns = amplData.mpns_list
+        let usedFallback = false
+        if (!queryMpns.length) {
+          const fallback = [
+            ...amplData.blocked.map(i => i.MfgPartNumber),
+            ...amplData.deleted.map(i => i.MfgPartNumber),
+          ].filter(Boolean).filter((v, i, a) => a.indexOf(v) === i)
+          if (!fallback.length) {
+            setError('No MPNs found for this component in SAP.')
+            setStatus('error'); return
+          }
+          queryMpns = fallback
+          usedFallback = true
+          setUsedFallback(true)
         }
-      }
 
-      setStatus('loading-market')
-      const mkt = await apiPost<MarketResponse>('/api/pricecalc/market-prices', { mpns: queryMpns, quantity: qty })
-      setMarket(mkt)
+        setStatus('loading-iq')
+        const iqData = await apiPost<{ count: number; data: IQItem[] }>('/api/pricecalc/internal-query', { mpns: queryMpns })
+        const rows: IQItem[] = Array.isArray(iqData.data) ? iqData.data : []
+        if (!rows.length && usedFallback) {
+          setError('Component found in SAP (blocked/deleted MPNs only) but no pricing data available.')
+          setStatus('error'); return
+        }
+        setIqRows(rows)
+        setPlants(buildPlantSummaries(rows, windowDays * 86400000))
+
+        // Always fetch historical data from blocked/deleted MPNs when they exist (for full picture)
+        if (!usedFallback) {
+          const blockedMpns = [
+            ...amplData.blocked.map(i => i.MfgPartNumber),
+            ...amplData.deleted.map(i => i.MfgPartNumber),
+          ].filter(Boolean).filter((v, i, a) => a.indexOf(v) === i)
+          if (blockedMpns.length) {
+            try {
+              const biqData = await apiPost<{ count: number; data: IQItem[] }>('/api/pricecalc/internal-query', { mpns: blockedMpns })
+              const bRows: IQItem[] = Array.isArray(biqData.data) ? biqData.data : []
+              setBlockedIqRows(bRows)
+              setBlockedPlants(buildPlantSummaries(bRows, windowDays * 86400000))
+            } catch { /* non-critical */ }
+          }
+        }
+
+        setStatus('loading-market')
+        const mkt = await apiPost<MarketResponse>('/api/pricecalc/market-prices', { mpns: queryMpns, quantity: qty })
+        setMarket(mkt)
+      }
 
       setStatus('done')
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e))
       setStatus('error')
     }
-  }, [bmatn, qty, reset, windowDays])
+  }, [bmatn, qty, reset, windowDays, searchMode])
 
   const handleMultiSearch = useCallback(async () => {
     const bmats = multiBmatn
@@ -2122,9 +2141,25 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
               <div className="bg-gray-50 rounded-xl border border-gray-200 p-5">
                 <div className="flex gap-4 mb-4">
                   <div className="flex-1">
-                    <label className="block text-sm font-medium text-gray-600 mb-1.5">Internal Part Number</label>
+                    <div className="flex items-center justify-between mb-1.5">
+                      <label className="text-sm font-medium text-gray-600">
+                        {searchMode === 'internal' ? 'Internal Part Number' : 'MPN'}
+                      </label>
+                      <div className="flex text-xs rounded-lg overflow-hidden border border-gray-200">
+                        <button
+                          type="button"
+                          onClick={() => setSearchMode('internal')}
+                          className={`px-2.5 py-1 font-medium transition-colors ${searchMode === 'internal' ? 'bg-blue-600 text-white' : 'bg-white text-gray-500 hover:bg-gray-50'}`}
+                        >Internal PN</button>
+                        <button
+                          type="button"
+                          onClick={() => setSearchMode('mpn')}
+                          className={`px-2.5 py-1 font-medium border-l border-gray-200 transition-colors ${searchMode === 'mpn' ? 'bg-blue-600 text-white' : 'bg-white text-gray-500 hover:bg-gray-50'}`}
+                        >MPN</button>
+                      </div>
+                    </div>
                     <input
-                      type="text" placeholder="e.g. EC03018"
+                      type="text" placeholder={searchMode === 'internal' ? 'e.g. EC03018' : 'e.g. TPS62130DSGR'}
                       value={bmatn} onChange={e => setBmatn(e.target.value)}
                       onKeyDown={e => e.key === 'Enter' && !isLoading && handleSearch()}
                       className="w-full rounded-lg border border-gray-300 px-4 py-2.5 text-sm font-mono uppercase focus:outline-none focus:ring-2 focus:ring-blue-500"
@@ -2199,29 +2234,31 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
               )}
 
               {/* ── Results ──────────────────────────────────────────── */}
-              {status === 'done' && ampl && (
+              {status === 'done' && (ampl || searchMode === 'mpn') && (
                 <>
                   {/* Component header */}
                   <div className="flex items-center gap-3 flex-wrap">
-                    <h3 className="text-lg font-bold text-gray-800">{ampl.internal_part_number}</h3>
+                    <h3 className="text-lg font-bold text-gray-800">{ampl ? ampl.internal_part_number : bmatn.toUpperCase()}</h3>
                     <span className="text-sm text-gray-500 bg-gray-100 px-3 py-1 rounded-full">
                       {iqRows[0]?.materialDescription}
                     </span>
-                    <div className="flex gap-2 text-xs">
-                      <span className="bg-emerald-100 text-emerald-700 px-2 py-1 rounded-full font-medium">
-                         {ampl.total_active} active MPNs
-                      </span>
-                      {ampl.total_blocked > 0 && (
-                        <span className="bg-amber-100 text-amber-700 px-2 py-1 rounded-full font-medium">
-                           {ampl.total_blocked} blocked
+                    {ampl && (
+                      <div className="flex gap-2 text-xs">
+                        <span className="bg-emerald-100 text-emerald-700 px-2 py-1 rounded-full font-medium">
+                           {ampl.total_active} active MPNs
                         </span>
-                      )}
-                      {ampl.total_deleted > 0 && (
-                        <span className="bg-red-100 text-red-700 px-2 py-1 rounded-full font-medium">
-                           {ampl.total_deleted} deleted
-                        </span>
-                      )}
-                    </div>
+                        {ampl.total_blocked > 0 && (
+                          <span className="bg-amber-100 text-amber-700 px-2 py-1 rounded-full font-medium">
+                             {ampl.total_blocked} blocked
+                          </span>
+                        )}
+                        {ampl.total_deleted > 0 && (
+                          <span className="bg-red-100 text-red-700 px-2 py-1 rounded-full font-medium">
+                             {ampl.total_deleted} deleted
+                          </span>
+                        )}
+                      </div>
+                    )}
                   </div>
 
                   {/* Fallback warning */}
@@ -2248,8 +2285,11 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                   {/* No SAP pricing data */}
                   {!globalBest && (
                     <div className="rounded-xl bg-yellow-50 border border-yellow-200 px-5 py-4 text-sm text-yellow-800 space-y-1">
-                      <p><strong>No purchase history found for the active MPNs.</strong></p>
-                      <p className="text-xs text-yellow-700">The active MPNs ({ampl.mpns_list.join(', ')}) exist in SAP but the IQ system has no purchase order records for them. This may happen if the component was recently approved or has never been purchased under these MPNs.</p>
+                      <p><strong>No purchase history found{ampl ? ' for the active MPNs' : ''}.</strong></p>
+                      {ampl
+                        ? <p className="text-xs text-yellow-700">The active MPNs ({ampl.mpns_list.join(', ')}) exist in SAP but the IQ system has no purchase order records for them. This may happen if the component was recently approved or has never been purchased under these MPNs.</p>
+                        : <p className="text-xs text-yellow-700">The MPN {bmatn.toUpperCase()} has no purchase order records in the IQ system.</p>
+                      }
                     </div>
                   )}
 
