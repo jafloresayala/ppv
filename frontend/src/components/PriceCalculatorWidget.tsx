@@ -143,24 +143,24 @@ const fmt2 = (v: number | null | undefined) =>
 const fmtLocal = (v: number | null | undefined, cur = '') =>
   v != null ? `${v.toLocaleString('en-US', { minimumFractionDigits: 4 })} ${cur}`.trim() : '—'
 
-function buildPlantSummaries(rows: IQItem[]): PlantSummary[] {
+function buildPlantSummaries(rows: IQItem[], windowMs: number): PlantSummary[] {
   const map = new Map<string, IQItem[]>()
   for (const row of rows) {
     if (!map.has(row.siteName)) map.set(row.siteName, [])
     map.get(row.siteName)!.push(row)
   }
 
-  // 45-day look-back window from the most recent purchase date across all plants
+  // Configurable look-back window from the most recent purchase date across all plants
   const maxTime = rows.length
     ? Math.max(...rows.map(r => new Date(r.lastPoDate || 0).getTime()))
     : 0
   const windowStart = isFinite(maxTime) && maxTime > 0
-    ? maxTime - 45 * 24 * 60 * 60 * 1000
+    ? maxTime - windowMs
     : 0
 
   return Array.from(map.entries())
     .map(([siteName, siteRows]) => {
-      // Only consider rows within the 45-day window; fall back to all rows if none qualify
+      // Only consider rows within the look-back window; fall back to all rows if none qualify
       const inWindow   = siteRows.filter(r => new Date(r.lastPoDate || 0).getTime() >= windowStart)
       const hadInWindowData = inWindow.length > 0
       const candidates = hadInWindowData ? inWindow : siteRows
@@ -196,7 +196,7 @@ function buildPlantSummaries(rows: IQItem[]): PlantSummary[] {
 /**
  * Selects the best row from a list of IQ rows using the following rules:
  * 1. Only consider active MPNs (rows whose mpn is in activeSet).
- * 2. Find the most recent purchase date and define a 45-day look-back window.
+ * 2. Find the most recent purchase date and define a configurable look-back window.
  * 3. Within that window, deduplicate by Alt PN (mpnToAltPn map): if the same supplier
  *    (same Alt PN) appears multiple times, keep only their most recent row.
  *    This avoids rewarding a supplier whose price was lower before they raised it.
@@ -207,6 +207,7 @@ function selectBestRow(
   rows: IQItem[],
   activeSet: Set<string>,
   mpnToAltPn: Map<string, string>,
+  windowMs: number,
 ): IQItem | null {
   // Step 1 — filter to active rows (if we have active info)
   const workRows = activeSet.size > 0 ? rows.filter(r => activeSet.has(r.mpn)) : rows
@@ -216,8 +217,8 @@ function selectBestRow(
   const maxTime = Math.max(...workRows.map(r => new Date(r.lastPoDate || 0).getTime()))
   if (!isFinite(maxTime) || maxTime <= 0) return workRows[0]
 
-  // Step 3 — 45-day look-back window
-  const windowStart = maxTime - 45 * 24 * 60 * 60 * 1000
+  // Step 3 — configurable look-back window
+  const windowStart = maxTime - windowMs
   const windowRows  = workRows.filter(r => new Date(r.lastPoDate || 0).getTime() >= windowStart)
 
   // Step 4 — deduplicate by Alt PN: keep only the most recent row per supplier variant
@@ -245,6 +246,40 @@ function selectBestRow(
   }
 
   return best
+}
+
+/**
+ * Replicates the exact same algorithm used by mpnEntries in Multi-MPN:
+ * group IQ rows by MPN → per-MPN configurable window from that MPN's latest date
+ * → cheapest within window → pick cheapest across all MPN groups.
+ */
+function pickBestRowByMpn(rows: IQItem[], windowMs: number): IQItem | null {
+  const mpnGroupsMap = new Map<string, IQItem[]>()
+  for (const row of rows) {
+    if (!mpnGroupsMap.has(row.mpn)) mpnGroupsMap.set(row.mpn, [])
+    mpnGroupsMap.get(row.mpn)!.push(row)
+  }
+  let overallBest: IQItem | null = null
+  let overallBestPrice = Infinity
+  for (const mpnRows of mpnGroupsMap.values()) {
+    const validRows = mpnRows.filter(r => r.lastPoDate && !isNaN(new Date(r.lastPoDate).getTime()))
+    if (!validRows.length) continue
+    const maxT = Math.max(...validRows.map(r => new Date(r.lastPoDate).getTime()))
+    const windowStart = maxT - windowMs
+    const inWindow = validRows.filter(r => new Date(r.lastPoDate).getTime() >= windowStart)
+    if (!inWindow.length) continue
+    const best = inWindow.reduce<IQItem>((min, r) => {
+      const p  = resolveLastPoPrice(r)
+      const mp = resolveLastPoPrice(min)
+      if (p == null) return min
+      if (mp == null) return r
+      return p < mp ? r : min
+    }, inWindow[0])
+    const price = resolveLastPoPrice(best)
+    if (price != null && price < overallBestPrice) { overallBestPrice = price; overallBest = best }
+    else if (price == null && overallBest == null)  { overallBest = best }
+  }
+  return overallBest
 }
 
 function getDecision(diffPct: number | null, withStock: number, total: number) {
@@ -320,7 +355,7 @@ function PlantTable({ plants, bestPlant, pinnedSite, selectedSite, onPin, onSele
           </tr>
         </thead>
         <tbody className="divide-y divide-gray-100">
-          {plants.map(p => {
+          {[...plants].sort((a, b) => new Date(b.lastPoDate || 0).getTime() - new Date(a.lastPoDate || 0).getTime()).map(p => {
             const isBest     = p.siteName === bestPlant
             const isPinned   = p.siteName === pinnedSite
             const isSelected = p.siteName === selectedSite
@@ -385,7 +420,7 @@ function PlantTable({ plants, bestPlant, pinnedSite, selectedSite, onPin, onSele
 }
 
 function DetailTable({ rows, variant = 'green', mpnInfoMap }: { rows: IQItem[]; variant?: 'green' | 'orange'; mpnInfoMap?: Map<string, MpnInfo> }) {
-  const sorted = [...rows].sort((a, b) => (resolveLastPoPrice(a) ?? Infinity) - (resolveLastPoPrice(b) ?? Infinity))
+  const sorted = [...rows].sort((a, b) => new Date(b.lastPoDate || 0).getTime() - new Date(a.lastPoDate || 0).getTime())
   return (
     <div className="overflow-x-auto rounded-xl border border-gray-200 shadow-sm">
       <table className="min-w-full text-xs">
@@ -880,25 +915,26 @@ async function downloadMpnExcelFile(
     // Deep Analysis
     const ws = wb.addWorksheet('Deep Analysis', { views: [{ state: 'frozen', ySplit: 1 }] })
     ws.columns = [
-      { header: 'Internal PN',                      key: 'internalPN',  width: 16 },
-      { header: 'QTY Inserted',                     key: 'qtyIns',      width: 14 },
-      { header: 'MPN (Multi-MPN)',                   key: 'mpnMpn',      width: 24 },
-      { header: 'Plant (Multi-MPN)',                 key: 'mpnPlant',    width: 12 },
-      { header: 'Supplier (Multi-MPN)',              key: 'mpnSupplier', width: 30 },
-      { header: 'Last PO USD (Multi-MPN)',           key: 'mpnPrice',    width: 20 },
-      { header: 'Total (USD) per QTY (Multi-MPN)',  key: 'totalMpn',    width: 26 },
-      { header: 'Date (Multi-MPN)',                  key: 'mpnDate',     width: 14 },
-      { header: 'Internal PN (Multi-Comp)',          key: 'mcInternalPN', width: 16 },
-      { header: 'MPN (Multi-Comp)',                  key: 'mcMpn',        width: 24 },
-      { header: 'Plant (Multi-Comp)',                key: 'mcPlant',      width: 12 },
-      { header: 'Supplier (Multi-Comp)',             key: 'mcSupplier',   width: 30 },
-      { header: 'Last PO USD (Multi-Comp)',          key: 'mcPrice',      width: 20 },
-      { header: 'Total (USD) per QTY (Multi-Comp)', key: 'totalMc',      width: 26 },
-      { header: 'Date (Multi-Comp)',                 key: 'mcDate',       width: 14 },
-      { header: 'Winner',                            key: 'winner',       width: 14 },
+      { header: 'Internal PN',             key: 'internalPN',   width: 16 },
+      { header: 'MPN (Multi-MPN)',          key: 'mpnMpn',       width: 24 },
+      { header: 'Plant (Multi-MPN)',        key: 'mpnPlant',     width: 12 },
+      { header: 'Supplier (Multi-MPN)',     key: 'mpnSupplier',  width: 30 },
+      { header: 'Last PO USD (Multi-MPN)', key: 'mpnPrice',     width: 20 },
+      { header: 'Std USD (Multi-MPN)',     key: 'mpnStd',       width: 18 },
+      { header: 'Date (Multi-MPN)',         key: 'mpnDate',      width: 14 },
+      { header: 'Internal PN (Multi-Comp)',key: 'mcInternalPN', width: 16 },
+      { header: 'MPN (Multi-Comp)',         key: 'mcMpn',        width: 24 },
+      { header: 'Plant (Multi-Comp)',       key: 'mcPlant',      width: 12 },
+      { header: 'Supplier (Multi-Comp)',    key: 'mcSupplier',   width: 30 },
+      { header: 'Last PO USD (Multi-Comp)',key: 'mcPrice',      width: 20 },
+      { header: 'Std USD (Multi-Comp)',    key: 'mcStd',        width: 18 },
+      { header: 'Date (Multi-Comp)',        key: 'mcDate',       width: 14 },
+      { header: 'QTY Inserted',            key: 'qtyIns',       width: 14 },
+      { header: 'Total (USD) per QTY',     key: 'totalUsd',     width: 22 },
+      { header: 'Winner',                  key: 'winner',       width: 14 },
     ]
     styleHeader(ws)
-    ws.autoFilter = `A1:P1`
+    ws.autoFilter = `A1:Q1`
     deepAnalysisRows.filter(dr => dr.status === 'done').forEach((dr, i) => {
       const candidates = mpnEntries.filter(e => e.bestRow.internalPN === dr.internalPN)
       const mpnBest    = candidates.reduce<typeof mpnEntries[0] | null>((min, e) => {
@@ -908,27 +944,28 @@ async function downloadMpnExcelFile(
       const mpnPrice = mpnBest ? resolveLastPoPrice(mpnBest.bestRow) : null
       const mcPrice  = dr.mcBestPriceUsd
       const qtyIns   = ctx.mpnComponentQtys[mpnBest?.mpn ?? ''] ?? ctx.qty
-      const totalMpn = mpnPrice != null && mpnPrice > 0 ? mpnPrice * qtyIns : null
-      const totalMc  = mcPrice  != null && mcPrice  > 0 ? mcPrice  * qtyIns : null
       const winner   = mpnPrice != null && mcPrice != null
         ? mpnPrice < mcPrice ? 'Multi-MPN' : mcPrice < mpnPrice ? 'Multi-Comp' : 'Tie'
         : mpnPrice != null ? 'Multi-MPN' : mcPrice != null ? 'Multi-Comp' : ''
+      const winnerPrice = winner === 'Multi-MPN' ? mpnPrice : winner === 'Multi-Comp' ? mcPrice : winner === 'Tie' ? (mpnPrice ?? mcPrice) : null
+      const totalUsd = winnerPrice != null && winnerPrice > 0 ? winnerPrice * qtyIns : null
       const row = ws.addRow({
-        internalPN: dr.internalPN,
-        qtyIns,
-        mpnMpn:      mpnBest?.mpn || '',
-        mpnPlant:    mpnBest?.bestRow.siteName || '',
-        mpnSupplier: mpnBest ? (mpnBest.bestRow.supplierName || mpnBest.bestRow.englishName || '') : '',
-        mpnPrice:    mpnPrice ?? '',
-        totalMpn:    totalMpn ?? '',
-        mpnDate:     mpnBest?.bestRow.lastPoDate || '',
+        internalPN:   dr.internalPN,
+        mpnMpn:       mpnBest?.mpn || '',
+        mpnPlant:     mpnBest?.bestRow.siteName || '',
+        mpnSupplier:  mpnBest ? (mpnBest.bestRow.supplierName || mpnBest.bestRow.englishName || '') : '',
+        mpnPrice:     mpnPrice ?? '',
+        mpnStd:       mpnBest?.bestRow.standardPriceUsd ?? '',
+        mpnDate:      mpnBest?.bestRow.lastPoDate || '',
         mcInternalPN: dr.mcBestInternalPN || '',
         mcMpn:        dr.mcBestMpn || '',
         mcPlant:      dr.mcBestPlant || '',
         mcSupplier:   dr.mcBestSupplier || '',
         mcPrice:      mcPrice ?? '',
-        totalMc:      totalMc ?? '',
+        mcStd:        dr.mcStdPriceUsd ?? '',
         mcDate:       dr.mcLastPoDate || '',
+        qtyIns,
+        totalUsd:     totalUsd ?? '',
         winner,
       })
       row.height = 18
@@ -939,7 +976,7 @@ async function downloadMpnExcelFile(
         cell.alignment = { vertical: 'middle' }
         cell.border    = { bottom: { style: 'thin', color: { argb: 'FFE5E7EB' } } }
       })
-      for (const k of ['mpnPrice', 'mcPrice', 'totalMpn', 'totalMc']) {
+      for (const k of ['mpnPrice', 'mpnStd', 'mcPrice', 'mcStd', 'totalUsd']) {
         const c = row.getCell(k)
         c.alignment = { horizontal: 'right', vertical: 'middle' }
         if (c.value !== '' && c.value != null) c.numFmt = '#,##0.000000'
@@ -950,12 +987,12 @@ async function downloadMpnExcelFile(
       wc.alignment = { horizontal: 'center', vertical: 'middle' }
       if (winner === 'Multi-MPN') {
         wc.font = { bold: true, size: 9, name: 'Calibri', color: { argb: 'FF166534' } }
-        row.getCell('mpnPrice').font  = { bold: true, size: 9, name: 'Calibri', color: { argb: 'FF166534' } }
-        row.getCell('totalMpn').font  = { bold: true, size: 9, name: 'Calibri', color: { argb: 'FF166534' } }
+        row.getCell('mpnPrice').font = { bold: true, size: 9, name: 'Calibri', color: { argb: 'FF166534' } }
+        row.getCell('totalUsd').font = { bold: true, size: 9, name: 'Calibri', color: { argb: 'FF166534' } }
       } else if (winner === 'Multi-Comp') {
         wc.font = { bold: true, size: 9, name: 'Calibri', color: { argb: 'FF7C3AED' } }
-        row.getCell('mcPrice').font = { bold: true, size: 9, name: 'Calibri', color: { argb: 'FF7C3AED' } }
-        row.getCell('totalMc').font = { bold: true, size: 9, name: 'Calibri', color: { argb: 'FF7C3AED' } }
+        row.getCell('mcPrice').font  = { bold: true, size: 9, name: 'Calibri', color: { argb: 'FF7C3AED' } }
+        row.getCell('totalUsd').font = { bold: true, size: 9, name: 'Calibri', color: { argb: 'FF7C3AED' } }
       }
     })
   }
@@ -977,11 +1014,10 @@ async function downloadMcDeepExcelFile(
   const ExcelJS = (await import('exceljs')).default
   const wb = new ExcelJS.Workbook()
   wb.creator = 'PPV Dashboard'
-  const ws = wb.addWorksheet('MC Deep Analysis', { views: [{ state: 'frozen', ySplit: 2 }] })
+  const ws = wb.addWorksheet('MC Deep Analysis', { views: [{ state: 'frozen', ySplit: 1 }] })
 
   ws.columns = [
     { header: 'BMATN',                          key: 'bmatn',          width: 18 },
-    { header: 'QTY Inserted',                   key: 'qtyIns',         width: 14 },
     { header: 'MC Internal PN',                 key: 'mcInternalPN',   width: 16 },
     { header: 'MC MPN',                         key: 'mcMpn',          width: 24 },
     { header: 'MC Plant',                       key: 'mcPlant',        width: 12 },
@@ -996,6 +1032,7 @@ async function downloadMcDeepExcelFile(
     { header: 'MPN Last PO (USD)',              key: 'mpnPrice',       width: 18 },
     { header: 'MPN Std (USD)',                  key: 'mpnStd',         width: 14 },
     { header: 'MPN Date',                       key: 'mpnDate',        width: 14 },
+    { header: 'QTY Inserted',                   key: 'qtyIns',         width: 14 },
     { header: 'Total (USD) per QTY',            key: 'totalUsd',       width: 22 },
     { header: 'Winner',                         key: 'winner',         width: 14 },
   ]
@@ -1109,6 +1146,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
   const [multiLoading, setMultiLoading]   = useState(false)
   const [multiSubTab, setMultiSubTab]     = useState<'results' | 'allrecords' | 'blocked' | 'deep'>('results')
   const [myPlant, setMyPlant]             = useState<string>('')
+  const [windowDays, setWindowDays]       = useState(45)
   const [searchNexar, setSearchNexar]     = useState(false)
   const [componentQtys, setComponentQtys] = useState<Record<string, number>>({})
   const [componentQtyDefaults, setComponentQtyDefaults] = useState<Record<string, 'empty' | '0'>>({})
@@ -1179,7 +1217,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
         setStatus('error'); return
       }
       setIqRows(rows)
-      setPlants(buildPlantSummaries(rows))
+      setPlants(buildPlantSummaries(rows, windowDays * 86400000))
 
       // Always fetch historical data from blocked/deleted MPNs when they exist (for full picture)
       if (!usedFallback) {
@@ -1192,7 +1230,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
             const biqData = await apiPost<{ count: number; data: IQItem[] }>('/api/pricecalc/internal-query', { mpns: blockedMpns })
             const bRows: IQItem[] = Array.isArray(biqData.data) ? biqData.data : []
             setBlockedIqRows(bRows)
-            setBlockedPlants(buildPlantSummaries(bRows))
+            setBlockedPlants(buildPlantSummaries(bRows, windowDays * 86400000))
           } catch { /* non-critical */ }
         }
       }
@@ -1206,7 +1244,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
       setError(e instanceof Error ? e.message : String(e))
       setStatus('error')
     }
-  }, [bmatn, qty, reset])
+  }, [bmatn, qty, reset, windowDays])
 
   const handleMultiSearch = useCallback(async () => {
     const bmats = multiBmatn
@@ -1242,7 +1280,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
         const iqData = await apiPostWithRetry<{ count: number; data: IQItem[] }>('/api/pricecalc/internal-query', { mpns: queryMpns }, signal)
         const rows: IQItem[] = Array.isArray(iqData.data) ? iqData.data : []
         setMultiIqRowsMap(prev => ({ ...prev, [bmatn]: rows }))
-        const bestPlant = buildPlantSummaries(rows)[0] ?? null
+        const bestPlant = buildPlantSummaries(rows, windowDays * 86400000)[0] ?? null
         const bestRow   = bestPlant?.bestRow ?? null
         const bestPrice = bestPlant?.bestPrice ?? null
         const stdPrice  = bestRow?.standardPriceUsd ?? null
@@ -1294,7 +1332,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
     }))
     setMultiLoading(false)
     setStopHover(false)
-  }, [multiBmatn, searchNexar, qty, componentQtys])
+  }, [multiBmatn, searchNexar, qty, componentQtys, windowDays])
 
   const handleExcelUpload = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
@@ -1563,7 +1601,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
           '/api/pricecalc/internal-query', { mpns: queryMpns }, signal
         )
         const rows: IQItem[] = Array.isArray(iqData.data) ? iqData.data : []
-        const bestRow = buildPlantSummaries(rows)[0]?.bestRow ?? null
+        const bestRow = buildPlantSummaries(rows, windowDays * 86400000)[0]?.bestRow ?? null
         setDeepAnalysisRows(prev => prev.map(r => r.internalPN === ip ? {
           ...r, status: 'done',
           mcBestPriceUsd:      bestRow ? resolveLastPoPrice(bestRow) : null,
@@ -1583,7 +1621,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
       }
     }))
     setDeepAnalysisLoading(false)
-  }, [])
+  }, [windowDays])
 
   const handleMcDeepAnalysis = useCallback(async () => {
     const doneBmats = multiResults.filter(r => r.status === 'done')
@@ -1627,7 +1665,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
         const iqData = await apiPostWithRetry<{ count: number; data: IQItem[] }>(
           '/api/pricecalc/internal-query', { mpns: queryMpns }, signal)
         const rows: IQItem[] = Array.isArray(iqData.data) ? iqData.data : []
-        const bestRow = buildPlantSummaries(rows)[0]?.bestRow ?? null
+        const bestRow = pickBestRowByMpn(rows, windowDays * 86400000)
         setMcDeepRows(prev => prev.map(dr => dr.bmatn === bmatn ? {
           ...dr, mpnStatus: 'done',
           mpnBestPriceUsd:      bestRow ? resolveLastPoPrice(bestRow) : null,
@@ -1647,7 +1685,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
       }
     }))
     setMcDeepLoading(false)
-  }, [multiResults])
+  }, [multiResults, windowDays])
 
   const downloadResultsExcel = useCallback(
     () => downloadResultsExcelFile(multiResults, myPlant, qty, `PPV_Results_${new Date().toISOString().slice(0, 10)}.xlsx`),
@@ -1699,8 +1737,8 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
       if (!groups.has(code)) groups.set(code, { code, rows: [] })
       groups.get(code)!.rows.push(row)
     }
-    return [...groups.values()].map(g => ({ ...g, plants: buildPlantSummaries(g.rows) }))
-  }, [blockedIqRows, blockedMpnMap])
+    return [...groups.values()].map(g => ({ ...g, plants: buildPlantSummaries(g.rows, windowDays * 86400000) }))
+  }, [blockedIqRows, blockedMpnMap, windowDays])
 
   // ── Side panel ────────────────────────────────────────────────────────────
   const showComparison  = pinnedPlant !== null && selectedPlant !== null && selectedPlant.siteName !== pinnedPlant.siteName
@@ -2097,6 +2135,14 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                     <input
                       type="number" min={0.0001} step="any" value={qty}
                       onChange={e => setQty(Math.max(0.0001, parseFloat(e.target.value) || 0.0001))}
+                      className="w-full rounded-lg border border-gray-300 px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    />
+                  </div>
+                  <div className="w-28">
+                    <label className="block text-sm font-medium text-gray-600 mb-1.5">Window (days)</label>
+                    <input
+                      type="number" min={1} max={365} step={1} value={windowDays}
+                      onChange={e => setWindowDays(Math.max(1, Math.min(365, parseInt(e.target.value) || 45)))}
                       className="w-full rounded-lg border border-gray-300 px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
                     />
                   </div>
@@ -2506,6 +2552,14 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                           <option value="KERO">KERO</option>
                         </select>
                       </div>
+                      <div className="w-28">
+                        <label className="block text-sm font-medium text-gray-600 mb-1.5">Window (days)</label>
+                        <input
+                          type="number" min={1} max={365} step={1} value={windowDays}
+                          onChange={e => setWindowDays(Math.max(1, Math.min(365, parseInt(e.target.value) || 45)))}
+                          className="w-full rounded-lg border border-gray-300 px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                        />
+                      </div>
                     </div>
                     <div className="flex items-center gap-4">
                       <button
@@ -2584,7 +2638,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                           <div className="ml-auto flex items-center gap-2">
                             <button
                               onClick={handleMcDeepAnalysis}
-                              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white shadow-sm transition-colors"
+                              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-indigo-700 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 rounded-lg transition-colors whitespace-nowrap"
                             >
                               <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" /></svg>
                               Deep Analysis
@@ -2592,7 +2646,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                             {multiSubTab === 'results' && (
                               <button
                                 onClick={downloadResultsExcel}
-                                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white shadow-sm transition-colors"
+                                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-emerald-700 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded-lg transition-colors whitespace-nowrap"
                               >
                                 <Download className="h-3.5 w-3.5" />
                                 Export Excel
@@ -2742,7 +2796,9 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                         Object.keys(multiIqRowsMap).length > 0 ? (
                           <div className="rounded-xl border border-gray-200 overflow-hidden shadow-sm">
                             {multiResults.filter(r => r.status === 'done').map((mr, idx) => {
-                              const rows = multiIqRowsMap[mr.bmatn] ?? []
+                              const rows = [...(multiIqRowsMap[mr.bmatn] ?? [])].sort(
+                                (a, b) => new Date(b.lastPoDate || 0).getTime() - new Date(a.lastPoDate || 0).getTime()
+                              )
                               if (!rows.length) return null
                               const isOpen = multiExpandedBmats.has(mr.bmatn)
                               const toggle = () => setMultiExpandedBmats(prev => {
@@ -2881,7 +2937,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                           ) : (
                             <div>
                               <div className="flex items-center justify-between mb-3">
-                                <p className="text-[10px] text-gray-400">Comparison of Multi-Component (45-day window best) vs Multi-MPN (AMPL active MPNs best) prices per BMATN</p>
+                                <p className="text-[10px] text-gray-400">Comparison of Multi-Component ({windowDays}-day window best) vs Multi-MPN (AMPL active MPNs best) prices per BMATN</p>
                                 <button
                                   onClick={() => downloadMcDeepExcelFile(
                                     mcDeepRows,
@@ -3111,6 +3167,14 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                           <option value="KERO">KERO</option>
                         </select>
                       </div>
+                      <div className="w-28">
+                        <label className="block text-sm font-medium text-gray-600 mb-1.5">Window (days)</label>
+                        <input
+                          type="number" min={1} max={365} step={1} value={windowDays}
+                          onChange={e => setWindowDays(Math.max(1, Math.min(365, parseInt(e.target.value) || 45)))}
+                          className="w-full rounded-lg border border-gray-300 px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                        />
+                      </div>
                     </div>
                     <div className="flex items-center gap-4">
                       <button
@@ -3166,7 +3230,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                     const blockedGroups = [...groupMap.values()].sort((a, b) => a.kind.localeCompare(b.kind) || a.code.localeCompare(b.code))
                     const blockedCount = allBlockedItems.length
 
-                    // Best price per MPN: cheapest Last PO (USD) within 45-day window from latest purchase date
+                    // Best price per MPN: cheapest Last PO (USD) within configurable window from latest purchase date
                     const mpnGroupsMap = new Map<string, IQItem[]>()
                     for (const row of multiMpnRawResults) {
                       if (!mpnGroupsMap.has(row.mpn)) mpnGroupsMap.set(row.mpn, [])
@@ -3178,7 +3242,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                         const validRows = rows.filter(r => r.lastPoDate && !isNaN(new Date(r.lastPoDate).getTime()))
                         if (!validRows.length) return null
                         const maxT = Math.max(...validRows.map(r => new Date(r.lastPoDate).getTime()))
-                        const windowStart = new Date(maxT - 45 * 24 * 60 * 60 * 1000)
+                        const windowStart = new Date(maxT - windowDays * 86400000)
                         const inWindow = validRows.filter(r => new Date(r.lastPoDate).getTime() >= windowStart.getTime())
                         const best = inWindow.reduce<IQItem>((min, r) => {
                           const p = resolveLastPoPrice(r)
@@ -3318,10 +3382,74 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                           })()}
                         </div>
 
+                        {/* ── IQ Results: loading preview (while bulk API call is in progress) ── */}
+                        {multiMpnSubTab === 'results' && multiMpnLoading && multiMpnSearchedList.length > 0 && (
+                          <div>
+                            <p className="text-[10px] text-gray-400 mb-2">Cheapest Last PO (USD) within a {windowDays}-day window from the latest purchase date — one row per MPN</p>
+                            <div className="overflow-x-auto rounded-xl border border-gray-200 shadow-sm">
+                              <table className="min-w-max w-full text-xs border-collapse">
+                                <thead className="bg-gray-50 text-[10px] uppercase tracking-wide text-gray-500 sticky top-0">
+                                  <tr>
+                                    <th className="px-2 py-2.5 w-6 border-b border-gray-200" />
+                                    <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">MPN</th>
+                                    <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">Alt PN</th>
+                                    <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">Supplier</th>
+                                    <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">Searched</th>
+                                    <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">Internal PN</th>
+                                    <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">Plant</th>
+                                    <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200">Qty</th>
+                                    <th className="px-3 py-2.5 text-center whitespace-nowrap border-b border-gray-200">Cur</th>
+                                    <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200">Last PO (Local)</th>
+                                    <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200">Std (Local)</th>
+                                    <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200">Last PO (USD)</th>
+                                    <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200">Std (USD)</th>
+                                    <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200">QTY Inserted</th>
+                                    <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200">Total Cost (USD) per QTY Inserted</th>
+                                    <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">Date</th>
+                                    <th className="px-3 py-2.5 text-center whitespace-nowrap border-b border-gray-200">Last PO Price &gt; Std Price</th>
+                                    <th className="px-3 py-2.5 text-center whitespace-nowrap border-b border-gray-200">Swap</th>
+                                    <th className="px-3 py-2.5 text-center whitespace-nowrap border-b border-gray-200">Manual Rev.</th>
+                                  </tr>
+                                </thead>
+                                <tbody className="divide-y divide-gray-100">
+                                  {multiMpnSearchedList.map(mpn => (
+                                    <tr key={mpn} className="bg-blue-50/40 animate-pulse">
+                                      <td className="px-2 py-2 text-center">
+                                        <svg className="animate-spin h-3 w-3 text-blue-500 mx-auto" fill="none" viewBox="0 0 24 24">
+                                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
+                                        </svg>
+                                      </td>
+                                      <td className="px-3 py-2 font-mono text-gray-700 whitespace-nowrap">—</td>
+                                      <td className="px-3 py-2 font-mono text-gray-500 whitespace-nowrap">—</td>
+                                      <td className="px-3 py-2 text-gray-500 whitespace-nowrap">—</td>
+                                      <td className="px-3 py-2 font-mono font-semibold text-blue-700 whitespace-nowrap">{mpn}</td>
+                                      <td className="px-3 py-2 font-mono text-gray-700 whitespace-nowrap">—</td>
+                                      <td className="px-3 py-2 text-gray-700 whitespace-nowrap">—</td>
+                                      <td className="px-3 py-2 text-right font-mono text-gray-700 whitespace-nowrap">—</td>
+                                      <td className="px-3 py-2 text-center font-mono text-gray-500 whitespace-nowrap">—</td>
+                                      <td className="px-3 py-2 text-right font-mono text-gray-700 whitespace-nowrap">—</td>
+                                      <td className="px-3 py-2 text-right font-mono text-gray-500 whitespace-nowrap">—</td>
+                                      <td className="px-3 py-2 text-right font-mono text-blue-700 font-semibold whitespace-nowrap">—</td>
+                                      <td className="px-3 py-2 text-right font-mono text-gray-500 whitespace-nowrap">—</td>
+                                      <td className="px-3 py-2 text-right font-mono text-gray-700 whitespace-nowrap">—</td>
+                                      <td className="px-3 py-2 text-right font-mono text-gray-700 whitespace-nowrap">—</td>
+                                      <td className="px-3 py-2 text-gray-500 whitespace-nowrap">—</td>
+                                      <td className="px-3 py-2 text-center whitespace-nowrap" />
+                                      <td className="px-3 py-2 text-center whitespace-nowrap" />
+                                      <td className="px-3 py-2 text-center whitespace-nowrap" />
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </div>
+                          </div>
+                        )}
+
                         {/* ── IQ Results: one best-price row per MPN ── */}
                         {multiMpnSubTab === 'results' && !multiMpnLoading && (mpnEntries.length > 0 || multiMpnSearchedList.length > 0) && (
                           <div>
-                            <p className="text-[10px] text-gray-400 mb-2">Cheapest Last PO (USD) within a 45-day window from the latest purchase date — one row per MPN</p>
+                            <p className="text-[10px] text-gray-400 mb-2">Cheapest Last PO (USD) within a {windowDays}-day window from the latest purchase date — one row per MPN</p>
                             <div className="overflow-x-auto rounded-xl border border-gray-200 shadow-sm">
                               <table className="min-w-max w-full text-xs border-collapse">
                                 <thead className="bg-gray-50 text-[10px] uppercase tracking-wide text-gray-500 sticky top-0">
@@ -3367,7 +3495,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                                       <tr key={mpn} className={bgColor}>
                                         <td className="px-2 py-2 text-center text-emerald-500 font-bold"></td>
                                         <td className="px-3 py-2 font-mono font-semibold text-emerald-700 whitespace-nowrap">{bestRow.mpn}</td>
-                                        <td className="px-3 py-2 font-mono text-gray-500 whitespace-nowrap">—</td>
+                                        <td className="px-3 py-2 font-mono text-gray-500 whitespace-nowrap">{(() => { const p = multiMpnAmplMap[bestRow.internalPN]?.active.find(a => a.MfgPartNumber === bestRow.mpn)?.MpnPartNumber; return p && p !== bestRow.mpn ? p : '—' })()}</td>
                                         <td className="px-3 py-2 text-gray-600 max-w-[180px] truncate" title={bestRow.supplierName || bestRow.englishName || ''}>{bestRow.supplierName || bestRow.englishName || '—'}</td>
                                         <td className="px-3 py-2 font-mono font-semibold text-blue-700 whitespace-nowrap">{mpn}</td>
                                         <td className="px-3 py-2 font-mono text-gray-700 whitespace-nowrap">{bestRow.internalPN || '—'}</td>
@@ -3474,7 +3602,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                               <p className="text-sm text-gray-400 py-8 text-center">Click "Deep Analysis" in the IQ Results tab to compare prices.</p>
                             ) : (
                               <div>
-                                <p className="text-[10px] text-gray-400 mb-3">Comparison of Multi-MPN (45-day window best) vs Multi-Component (AMPL active MPNs best) prices per Internal PN</p>
+                                <p className="text-[10px] text-gray-400 mb-3">Comparison of Multi-MPN ({windowDays}-day window best) vs Multi-Component (AMPL active MPNs best) prices per Internal PN</p>
                                 <div className="overflow-x-auto rounded-xl border border-gray-200 shadow-sm">
                                   <table className="min-w-max w-full text-xs border-collapse">
                                     <thead className="bg-gray-50 text-[10px] uppercase tracking-wide text-gray-500">
@@ -3596,6 +3724,14 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                               <div className="space-y-4">
                                 {blockedGroups.map(group => {
                                   const isDanger = group.code === 'F' || group.code === 'ER'
+                                  const seen = new Set<string>()
+                                  const dedupedItems = group.items.filter(item => {
+                                    const altPn = item.mpnPartNumber && item.mpnPartNumber !== item.mpn ? item.mpnPartNumber : '—'
+                                    const key = `${item.internalPN}|${item.mpn}|${altPn}|${item.mfgName || '—'}`
+                                    if (seen.has(key)) return false
+                                    seen.add(key)
+                                    return true
+                                  })
                                   return (
                                     <div key={`${group.kind}:${group.code}`}>
                                       {/* Group header */}
@@ -3605,7 +3741,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                                         </span>
                                         <span className="font-mono font-bold text-sm text-gray-800">{group.code}</span>
                                         <span className="text-gray-600 text-sm flex-1">{group.reason}</span>
-                                        <span className="text-xs text-gray-500 bg-white border border-gray-200 rounded-full px-2 py-0.5">{group.items.length} MPN{group.items.length !== 1 ? 's' : ''}</span>
+                                        <span className="text-xs text-gray-500 bg-white border border-gray-200 rounded-full px-2 py-0.5">{dedupedItems.length} MPN{dedupedItems.length !== 1 ? 's' : ''}</span>
                                       </div>
                                       {/* Items table */}
                                       <div className="overflow-x-auto border border-t-0 border-gray-200 rounded-b-xl">
@@ -3619,7 +3755,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                                             </tr>
                                           </thead>
                                           <tbody className="divide-y divide-gray-100">
-                                            {group.items.map((item, idx) => (
+                                            {dedupedItems.map((item, idx) => (
                                               <tr key={idx} className="hover:bg-gray-50">
                                                 <td className="px-3 py-1.5 font-mono font-semibold text-blue-700 whitespace-nowrap">{item.internalPN}</td>
                                                 <td className="px-3 py-1.5 font-mono text-gray-700 whitespace-nowrap">{item.mpn}</td>
