@@ -1398,7 +1398,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
       cell.border    = { bottom: { style: 'medium', color: { argb: 'FF2563EB' } } }
     })
     // Example rows
-    const examples = [{ component: 'EC03018', quantity: 1000 }, { component: 'EC05432', quantity: 500 }, { component: 'EC09876', quantity: 2500 }]
+    const examples = [{ component: 'CCR00292', quantity: 1000 }, { component: 'EC03018', quantity: 500 }, { component: '40012', quantity: 2500 }]
     examples.forEach((ex, i) => {
       const row = ws.addRow(ex)
       row.height = 18
@@ -1482,7 +1482,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
       cell.alignment = { horizontal: 'center', vertical: 'middle' }
       cell.border    = { bottom: { style: 'medium', color: { argb: 'FF2563EB' } } }
     })
-    const examples = [{ mpn: 'CCR00292', quantity: 500 }, { mpn: '40012', quantity: 1000 }, { mpn: 'EC03018', quantity: 250 }]
+    const examples = [{ mpn: 'RC0402FR-07100KL', quantity: 500 }, { mpn: 'RC0402FR-0710KL', quantity: 1000 }, { mpn: 'RC0402FR-071KL', quantity: 250 }]
     examples.forEach((ex, i) => {
       const row = ws.addRow(ex)
       row.height = 18
@@ -2122,7 +2122,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
               <div className="bg-gray-50 rounded-xl border border-gray-200 p-5">
                 <div className="flex gap-4 mb-4">
                   <div className="flex-1">
-                    <label className="block text-sm font-medium text-gray-600 mb-1.5">Component Number (BMATN)</label>
+                    <label className="block text-sm font-medium text-gray-600 mb-1.5">Internal Part Number</label>
                     <input
                       type="text" placeholder="e.g. EC03018"
                       value={bmatn} onChange={e => setBmatn(e.target.value)}
@@ -2300,60 +2300,24 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                               : <><ChevronDown size={14} /> Show Blocked/Deleted MPNs ({blockedGroups.length} reason{blockedGroups.length > 1 ? 's' : ''})</>}
                           </button>
                           {showBlockedDetail && (
-                            <div className="mt-3 rounded-xl border border-orange-200 bg-orange-50 space-y-4 p-4">
-                              <div className="flex items-start gap-2">
-                                <span className="text-lg leading-none">—</span>
-                                <div>
-                                  <p className="text-sm font-semibold text-orange-800">Purchase Data — Blocked / Deleted MPNs</p>
-                                  <p className="text-xs text-orange-700 mt-0.5">
-                                    Historical pricing grouped by SAP block reason. Shown for reference only.
-                                  </p>
-                                </div>
-                              </div>
-
+                            <div className="mt-3 space-y-3">
                               {blockedGroups.map(group => {
                                 const label = BLOCK_REASONS[group.code] ?? (group.code ? group.code : 'Unknown reason')
-                                const groupBest = group.rows.reduce((a, b) =>
-                                  (resolveLastPoPrice(a) ?? Infinity) <= (resolveLastPoPrice(b) ?? Infinity) ? a : b)
                                 const isDanger = group.code === 'F' || group.code === 'ER'
                                 return (
-                                  <div key={group.code || '__none__'} className="space-y-3">
-                                    {/* Group header */}
-                                    <div className={`flex items-center gap-2 rounded-lg px-3 py-2 ${isDanger ? 'bg-red-100 border border-red-200' : 'bg-amber-100 border border-amber-200'}`}>
+                                  <div key={group.code || '__none__'} className="rounded-xl border border-orange-200 overflow-hidden">
+                                    <div className={`flex items-center gap-2 px-3 py-2 ${isDanger ? 'bg-red-50 border-b border-red-200' : 'bg-amber-50 border-b border-amber-200'}`}>
                                       {group.code && (
-                                        <span className={`text-xs font-bold px-2 py-0.5 rounded ${isDanger ? 'bg-red-200 text-red-800' : 'bg-amber-200 text-amber-800'}`}>
+                                        <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${isDanger ? 'bg-red-100 text-red-700' : 'bg-amber-100 text-amber-700'}`}>
                                           {group.code}
                                         </span>
                                       )}
-                                      <span className={`text-sm font-semibold ${isDanger ? 'text-red-800' : 'text-amber-800'}`}>{label}</span>
+                                      <span className={`text-xs font-medium ${isDanger ? 'text-red-700' : 'text-amber-700'}`}>{label}</span>
                                       <span className="text-xs text-gray-400 ml-auto">{group.rows.length} record{group.rows.length > 1 ? 's' : ''}</span>
                                     </div>
-                                    {/* KPI mini-cards */}
-                                    <div className="grid grid-cols-3 gap-3 text-xs">
-                                      <div className="bg-white rounded-lg border border-orange-200 p-3">
-                                        <p className="text-gray-400 mb-1"> Best Plant</p>
-                                        <p className="font-bold text-gray-800">{group.plants[0]?.siteName ?? '—'}</p>
-                                      </div>
-                                      <div className="bg-white rounded-lg border border-orange-200 p-3">
-                                        <p className="text-gray-400 mb-1"> Supplier</p>
-                                        <p className="font-bold text-gray-800 truncate">{groupBest.supplierName}</p>
-                                        <p className="text-gray-500">#{groupBest.supplierNumber}</p>
-                                      </div>
-                                      <div className="bg-white rounded-lg border border-orange-200 p-3">
-                                        <p className="text-gray-400 mb-1"> Last Price (USD)</p>
-                                        <p className="font-bold text-gray-800">{fmt6(resolveLastPoPrice(groupBest))}</p>
-                                        <p className="text-gray-500">{groupBest.lastPoDate}</p>
-                                      </div>
+                                    <div className="p-2 bg-white">
+                                      <DetailTable rows={group.rows} variant="orange" mpnInfoMap={blockedMpnMap} />
                                     </div>
-                                    <PlantTable
-                                      plants={group.plants}
-                                      bestPlant={group.plants[0]?.siteName ?? ''}
-                                      onPin={() => {}}
-                                      onSelect={() => {}}
-                                      variant="orange"
-                                      mpnInfoMap={blockedMpnMap}
-                                    />
-                                    <DetailTable rows={group.rows} variant="orange" mpnInfoMap={blockedMpnMap} />
                                   </div>
                                 )
                               })}
@@ -2451,7 +2415,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                       <div className="flex-1">
                         <div className="flex items-center justify-between mb-1.5">
                         <label className="block text-sm font-medium text-gray-600">
-                            Component Numbers
+                            Internal Part Numbers
                             <span className="text-gray-400 font-normal ml-1">{excelFileName ? '' : '(one per line or comma-separated)'}</span>
                           </label>
                           <div className="flex items-center gap-2">
@@ -2518,7 +2482,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                         ) : (
                           /* ── Normal textarea ── */
                           <textarea
-                            placeholder={"EC03018\nEC05432\nEC09876"}
+                            placeholder={"CCR00292\nEC03018\n40012"}
                             value={multiBmatn}
                             onChange={e => setMultiBmatn(e.target.value.toUpperCase())}
                             rows={6}
@@ -3133,7 +3097,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                           </div>
                         ) : (
                           <textarea
-                            placeholder={"CCR00292\n40012\nEC03018"}
+                            placeholder={"RC0402FR-07100KL\nRC0402FR-0710KL\nRC0402FR-071KL"}
                             value={multiMpnInput}
                             onChange={e => setMultiMpnInput(e.target.value.toUpperCase())}
                             rows={6}
