@@ -17,7 +17,8 @@ from requests_ntlm import HttpNtlmAuth
 import os
 
 # ─── Configuracion ────────────────────────────────────────────────────────────
-API_URL = "http://nts5102/SapGeneralApi/api/Financials/PPV"
+API_URL                = "http://nts5102/SapGeneralApi/api/Financials/PPV"
+CURRENCY_RATES_API_URL = "http://nts5102/SapGeneralApi/api/Financials/FetchCurrencyRates"
 
 st.set_page_config(
     page_title="PPV Dashboard",
@@ -119,6 +120,49 @@ def _extract_records(raw) -> list:
                 return raw[key]
         return [raw]
     return []
+
+
+def _fetch_currency_rates(
+    from_curr: str, to_curr: str, from_date, to_date, rate_type: str = "M"
+):
+    """
+    Fetch exchange rates from SAP FetchCurrencyRates endpoint for a date range.
+    Returns (DataFrame[Date, Rate_num], error_str | None).
+    Rate_num is always positive (abs value of SAP-formatted rate).
+    """
+    payload = {
+        "RateType":    rate_type,
+        "FromCurrency": from_curr.strip().upper(),
+        "ToCurrency":   to_curr.strip().upper(),
+        "FromDate": from_date.strftime("%Y-%m-%dT00:00:00"),
+        "ToDate":   to_date.strftime("%Y-%m-%dT00:00:00"),
+    }
+    try:
+        auth = HttpNtlmAuth("", "")
+        resp = requests.post(CURRENCY_RATES_API_URL, json=payload, auth=auth, timeout=30)
+        resp.raise_for_status()
+        raw = resp.json()
+    except requests.exceptions.ConnectionError:
+        return pd.DataFrame(), "Cannot connect to nts5102 (currency rates)"
+    except Exception as exc:
+        return pd.DataFrame(), str(exc)
+
+    records = _extract_records(raw)
+    if not records:
+        return pd.DataFrame(), "No currency rate records returned"
+
+    rdf = pd.DataFrame(records)
+    if "CurrencyRate" not in rdf.columns or "CurrencyDate" not in rdf.columns:
+        return pd.DataFrame(), f"Unexpected response format (columns: {list(rdf.columns)})"
+
+    rdf["Rate_num"] = rdf["CurrencyRate"].apply(lambda v: abs(_sap_amount(v)))
+    rdf["Date"]     = pd.to_datetime(rdf["CurrencyDate"], errors="coerce").dt.normalize()
+    rdf = rdf.dropna(subset=["Date"]).query("Rate_num > 0").copy()
+    if rdf.empty:
+        return pd.DataFrame(), "No valid rates after parsing"
+
+    rdf = rdf.sort_values("Date").drop_duplicates("Date", keep="last")
+    return rdf[["Date", "Rate_num"]].reset_index(drop=True), None
 
 
 # ─── Colores corporativos ──────────────────────────────────────────────────────
@@ -254,6 +298,27 @@ with st.form("ppv_form"):
         st.markdown("&nbsp;", unsafe_allow_html=True)
         submitted = st.form_submit_button("Query", use_container_width=True, type="primary")
 
+    st.markdown("**Currency Conversion** *(for Trend section)*")
+    cr1, cr2, cr3, _ = st.columns([0.8, 0.8, 0.8, 2.0])
+    with cr1:
+        st.markdown("From Currency")
+        from_curr = st.text_input(
+            " ", value="THB", key="fx_from",
+            label_visibility="collapsed", placeholder="THB",
+        )
+    with cr2:
+        st.markdown("To Currency")
+        to_curr = st.text_input(
+            " ", value="USD", key="fx_to",
+            label_visibility="collapsed", placeholder="USD",
+        )
+    with cr3:
+        st.markdown("Rate Type")
+        rate_type_fx = st.text_input(
+            " ", value="M", key="fx_rate_type",
+            label_visibility="collapsed", placeholder="M",
+        )
+
 # ─── Consulta & carga ─────────────────────────────────────────────────────────
 if submitted:
     if not plant.strip():
@@ -294,6 +359,54 @@ if submitted:
         st.stop()
 
     df = _parse_df(records)
+
+    # ── Fetch currency rates & compute PPDifference(currency) ─────────────────
+    with st.spinner(f"Fetching currency rates ({from_curr} → {to_curr})…"):
+        rates_df, rates_err = _fetch_currency_rates(
+            from_curr, to_curr, start_date, end_date, rate_type_fx
+        )
+
+    if rates_df.empty:
+        st.warning(
+            f"⚠️ Currency rates unavailable ({rates_err}). "
+            "PPDifference(currency) will equal raw P_Price_difference."
+        )
+        df["PPDifference_currency_num"] = (
+            df["P_Price_difference_num"].copy()
+            if "P_Price_difference_num" in df.columns
+            else pd.Series(0.0, index=df.index)
+        )
+    elif "Posting_Date" not in df.columns:
+        st.warning("Posting_Date column not found — currency rates could not be applied.")
+        df["PPDifference_currency_num"] = df.get("P_Price_difference_num", 0)
+    else:
+        # Build a daily rate series covering the full query period (ffill gaps)
+        date_range  = pd.date_range(start_date, end_date, freq="D")
+        rate_series = (
+            rates_df.set_index("Date")["Rate_num"]
+            .reindex(date_range)
+            .ffill()
+            .bfill()
+        )
+        fallback_rate = float(rate_series.median()) if len(rate_series) else 1.0
+
+        posting_dates = df["Posting_Date"].dt.normalize()
+        df["_rate"] = posting_dates.map(rate_series).fillna(fallback_rate)
+
+        price_col = "P_Price_difference_num" if "P_Price_difference_num" in df.columns else None
+        if price_col:
+            df["PPDifference_currency_num"] = (
+                df[price_col] / df["_rate"].replace(0, np.nan)
+            ).fillna(0.0)
+        else:
+            df["PPDifference_currency_num"] = 0.0
+
+        df.drop(columns=["_rate"], errors="ignore", inplace=True)
+
+    payload["fx_from"]      = from_curr
+    payload["fx_to"]        = to_curr
+    payload["fx_rate_type"] = rate_type_fx
+
     st.session_state["ppv_df"]     = df
     st.session_state["ppv_params"] = payload
 
@@ -304,9 +417,10 @@ if "ppv_df" not in st.session_state:
 df: pd.DataFrame = st.session_state["ppv_df"]
 params            = st.session_state["ppv_params"]
 
-PPV   = "Total_Variance_Amount_num"
-PRICE = "P_Price_difference_num"
-FX    = "Exchange_rate_difference_num"
+PPV        = "Total_Variance_Amount_num"
+PRICE      = "P_Price_difference_num"
+FX         = "Exchange_rate_difference_num"
+PP_CURRENCY = "PPDifference_currency_num"
 
 # ─── Filtros laterales ─────────────────────────────────────────────────────────
 with st.sidebar:
@@ -341,6 +455,9 @@ with st.sidebar:
     st.markdown("---")
     st.caption(f"Plant: {params['Plant']}")
     st.caption(f"Period: {params['PostingStartDate']} > {params['PostingEndDate']}")
+    fx_from = params.get("fx_from", "?")
+    fx_to   = params.get("fx_to", "USD")
+    st.caption(f"Currency: {fx_from} → {fx_to}")
 
 # Aplicar filtros
 mask = pd.Series([True] * len(df), index=df.index)
@@ -406,89 +523,213 @@ tabs = st.tabs([
 
 # ── Tab 1: Tendencia temporal ─────────────────────────────────────────────────
 with tabs[0]:
-    has_dates = "YearMonth" in dff.columns and PPV in dff.columns
-    ts_data   = dff[dff["YearMonth"] != ""].copy() if has_dates else pd.DataFrame()
+    # Determine which value column to use for Trend charts
+    _use_currency = PP_CURRENCY in dff.columns
+    _val_col   = PP_CURRENCY if _use_currency else PPV
+    _val_label = (
+        f"PPDifference ({params.get('fx_from','?')}→{params.get('fx_to','USD')})"
+        if _use_currency else "Net PPV"
+    )
+    _curr_sfx = params.get("fx_to", "USD") if _use_currency else "USD"
 
-    if ts_data.empty:
+    # Identify plant column (SAP naming varies)
+    _plant_col = next(
+        (c for c in ("Plant", "Valuation_Area", "Purchasing_Plant") if c in dff.columns),
+        None,
+    )
+
+    has_dates = "YearMonth" in dff.columns and _val_col in dff.columns
+
+    if not has_dates:
         st.info("No date data available or all dates are invalid.")
     else:
-        unique_months = ts_data["YearMonth"].nunique()
-
-        if unique_months <= 1 and "PostingDay" in ts_data.columns:
-            # Short range: group by day
-            ts = (
-                ts_data[ts_data["PostingDay"].notna()]
-                .groupby("PostingDay")[PPV]
-                .sum().reset_index()
-                .rename(columns={"PostingDay": "Date", PPV: "PPV_Total"})
-                .sort_values("Date")
-            )
-            ts["Date"] = ts["Date"].astype(str)
-            x_col       = "Date"
-            lbl_detail  = "Daily detail"
-            title_line  = "Net PPV by Day"
-            title_area  = "Cumulative PPV by Day"
+        ts_data = dff[dff["YearMonth"] != ""].copy()
+        if ts_data.empty:
+            st.info("No date data with current filters.")
         else:
-            # Long range: group by month
-            ts = (
-                ts_data.groupby("YearMonth")[PPV]
-                .sum().reset_index()
-                .rename(columns={"YearMonth": "Month", PPV: "PPV_Total"})
+            # ── Section 1: Net PPV + Cumulative — Monthly Granularity ──────────────
+            st.markdown(
+                '<div class="section-title">Net PPV + Cumulative — Monthly Granularity</div>',
+                unsafe_allow_html=True,
+            )
+
+            ts_monthly = (
+                ts_data.groupby("YearMonth")[_val_col]
+                .sum()
+                .reset_index()
+                .rename(columns={"YearMonth": "Month", _val_col: "PPV_Total"})
                 .sort_values("Month")
             )
-            x_col      = "Month"
-            lbl_detail = "Monthly detail"
-            title_line = "Net PPV by Month"
-            title_area = "Cumulative PPV"
+            ts_monthly["PPV_Acumulado"] = ts_monthly["PPV_Total"].cumsum()
+            _bar_colors = ["#ef4444" if v > 0 else "#22c55e" for v in ts_monthly["PPV_Total"]]
 
-        ts["PPV_Acumulado"] = ts["PPV_Total"].cumsum()
-        _bar_colors = ["#ef4444" if v > 0 else "#22c55e" for v in ts["PPV_Total"]]
+            fig_combined = make_subplots(specs=[[{"secondary_y": True}]])
+            fig_combined.add_trace(
+                go.Bar(
+                    x=ts_monthly["Month"], y=ts_monthly["PPV_Total"],
+                    name=f"Net PPV ({_curr_sfx})",
+                    marker_color=_bar_colors,
+                    opacity=0.85,
+                ),
+                secondary_y=False,
+            )
+            fig_combined.add_trace(
+                go.Scatter(
+                    x=ts_monthly["Month"], y=ts_monthly["PPV_Acumulado"],
+                    name=f"Cumulative ({_curr_sfx})",
+                    mode="lines+markers",
+                    line=dict(color=COLOR_NEUTRAL, width=2),
+                    marker=dict(size=6),
+                    fill="tozeroy",
+                    fillcolor="rgba(107,114,128,0.12)",
+                ),
+                secondary_y=True,
+            )
+            fig_combined.add_hline(y=0, line_dash="dash", line_color="#9ca3af", line_width=1)
+            fig_combined.update_layout(
+                title=f"{_val_label} — Net + Cumulative (Monthly)",
+                plot_bgcolor="white", paper_bgcolor="white",
+                margin=dict(t=40, b=10, l=10, r=10),
+                title_font_size=14,
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                bargap=0.25,
+            )
+            fig_combined.update_yaxes(
+                title_text=f"Net PPV ({_curr_sfx})", secondary_y=False,
+                showgrid=True, gridcolor="#f3f4f6",
+            )
+            fig_combined.update_yaxes(
+                title_text=f"Cumulative ({_curr_sfx})", secondary_y=True, showgrid=False,
+            )
+            st.plotly_chart(fig_combined, use_container_width=True)
 
-        fig_combined = make_subplots(specs=[[{"secondary_y": True}]])
+            with st.expander("Monthly detail", expanded=False):
+                _ts_fmt = ts_monthly.copy()
+                _ts_fmt["PPV_Total"]     = _ts_fmt["PPV_Total"].map(f"${{:,.2f}}".format)
+                _ts_fmt["PPV_Acumulado"] = _ts_fmt["PPV_Acumulado"].map(f"${{:,.2f}}".format)
+                st.dataframe(_ts_fmt, use_container_width=True, hide_index=True)
 
-        # Bars Net PPV (left axis)
-        fig_combined.add_trace(
-            go.Bar(
-                x=ts[x_col], y=ts["PPV_Total"],
-                name="Net PPV",
-                marker_color=_bar_colors,
-                opacity=0.85,
-            ),
-            secondary_y=False,
-        )
+            # ── Section 2: Plant Ranking ───────────────────────────────────────────
+            st.markdown(
+                '<div class="section-title">Plant Ranking</div>',
+                unsafe_allow_html=True,
+            )
 
-        # Line + area Cumulative PPV (right axis)
-        fig_combined.add_trace(
-            go.Scatter(
-                x=ts[x_col], y=ts["PPV_Acumulado"],
-                name="Cumulative PPV",
-                mode="lines+markers",
-                line=dict(color=COLOR_NEUTRAL, width=2),
-                marker=dict(size=6),
-                fill="tozeroy",
-                fillcolor="rgba(107,114,128,0.12)",
-            ),
-            secondary_y=True,
-        )
+            if _plant_col:
+                plant_rank = (
+                    ts_data.groupby(_plant_col)[_val_col]
+                    .sum()
+                    .reset_index()
+                    .rename(columns={_plant_col: "Plant", _val_col: "PPV_Total"})
+                    .sort_values("PPV_Total", ascending=True)   # ascending → worst at top
+                )
+                _rank_colors = ["#ef4444" if v > 0 else "#22c55e" for v in plant_rank["PPV_Total"]]
+                fig_rank = go.Figure(
+                    go.Bar(
+                        x=plant_rank["PPV_Total"],
+                        y=plant_rank["Plant"].astype(str),
+                        orientation="h",
+                        marker_color=_rank_colors,
+                        text=[f"${v:,.0f}" for v in plant_rank["PPV_Total"]],
+                        textposition="outside",
+                    )
+                )
+                fig_rank.update_layout(
+                    title=f"Plant Ranking by {_val_label}",
+                    plot_bgcolor="white", paper_bgcolor="white",
+                    margin=dict(t=40, b=10, l=10, r=40),
+                    xaxis_title=f"{_val_label} ({_curr_sfx})",
+                    yaxis_title="Plant",
+                    title_font_size=14,
+                    height=max(200, 50 * len(plant_rank)),
+                )
+                fig_rank.add_vline(x=0, line_dash="dash", line_color="#9ca3af", line_width=1)
+                st.plotly_chart(fig_rank, use_container_width=True)
+            else:
+                st.info("No plant column found in data (checked: Plant, Valuation_Area, Purchasing_Plant).")
 
-        fig_combined.add_hline(y=0, line_dash="dash", line_color="#9ca3af", line_width=1)
-        fig_combined.update_layout(
-            title=title_line + " + " + title_area,
-            plot_bgcolor="white",
-            paper_bgcolor="white",
-            margin=dict(t=40, b=10, l=10, r=10),
-            title_font_size=14,
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            bargap=0.25,
-        )
-        fig_combined.update_yaxes(title_text="Net PPV (USD)", secondary_y=False, showgrid=True, gridcolor="#f3f4f6")
-        fig_combined.update_yaxes(title_text="Cumulative PPV (USD)", secondary_y=True, showgrid=False)
-        st.plotly_chart(fig_combined, use_container_width=True)
-        with st.expander(f"{lbl_detail}", expanded=False):
-            ts_fmt = ts.copy()
-            ts_fmt["PPV_Total"]     = ts_fmt["PPV_Total"].map("${:,.2f}".format)
-            ts_fmt["PPV_Acumulado"] = ts_fmt["PPV_Acumulado"].map("${:,.2f}".format)
-            st.dataframe(ts_fmt, use_container_width=True, hide_index=True)
+            # ── Section 3: Monthly Breakdown by Plant ─────────────────────────────
+            st.markdown(
+                '<div class="section-title">Monthly Breakdown by Plant</div>',
+                unsafe_allow_html=True,
+            )
+
+            if _plant_col:
+                plant_month = (
+                    ts_data.groupby(["YearMonth", _plant_col])[_val_col]
+                    .sum()
+                    .reset_index()
+                    .rename(columns={"YearMonth": "Month", _plant_col: "Plant", _val_col: "PPV_Total"})
+                    .sort_values("Month")
+                )
+                plants_list = sorted(plant_month["Plant"].unique())
+
+                # Grouped bar chart
+                fig_breakdown = go.Figure()
+                for _plant in plants_list:
+                    _pdata = plant_month[plant_month["Plant"] == _plant]
+                    _c = "#" + format(abs(hash(str(_plant))) % 0xFFFFFF, "06x")
+                    fig_breakdown.add_trace(
+                        go.Bar(
+                            x=_pdata["Month"],
+                            y=_pdata["PPV_Total"],
+                            name=str(_plant),
+                            marker_color=_c,
+                            opacity=0.85,
+                        )
+                    )
+                fig_breakdown.add_hline(y=0, line_dash="dash", line_color="#9ca3af", line_width=1)
+                fig_breakdown.update_layout(
+                    title=f"Monthly {_val_label} by Plant",
+                    barmode="group",
+                    plot_bgcolor="white", paper_bgcolor="white",
+                    margin=dict(t=40, b=10, l=10, r=10),
+                    title_font_size=14,
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    bargap=0.2,
+                    xaxis_title="Month",
+                    yaxis_title=f"{_val_label} ({_curr_sfx})",
+                )
+                st.plotly_chart(fig_breakdown, use_container_width=True)
+
+                # Multi-line cumulative by plant
+                fig_cumul = go.Figure()
+                for _plant in plants_list:
+                    _pdata = (
+                        plant_month[plant_month["Plant"] == _plant]
+                        .sort_values("Month")
+                        .copy()
+                    )
+                    _pdata["Cumulative"] = _pdata["PPV_Total"].cumsum()
+                    _c = "#" + format(abs(hash(str(_plant))) % 0xFFFFFF, "06x")
+                    fig_cumul.add_trace(
+                        go.Scatter(
+                            x=_pdata["Month"],
+                            y=_pdata["Cumulative"],
+                            name=str(_plant),
+                            mode="lines+markers",
+                            line=dict(color=_c, width=2),
+                            marker=dict(size=6),
+                        )
+                    )
+                fig_cumul.add_hline(y=0, line_dash="dash", line_color="#9ca3af", line_width=1)
+                fig_cumul.update_layout(
+                    title=f"Cumulative {_val_label} by Plant",
+                    plot_bgcolor="white", paper_bgcolor="white",
+                    margin=dict(t=40, b=10, l=10, r=10),
+                    title_font_size=14,
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    xaxis_title="Month",
+                    yaxis_title=f"Cumulative ({_curr_sfx})",
+                )
+                st.plotly_chart(fig_cumul, use_container_width=True)
+
+                with st.expander("Monthly breakdown detail", expanded=False):
+                    _bp_fmt = plant_month.copy()
+                    _bp_fmt["PPV_Total"] = _bp_fmt["PPV_Total"].map(f"${{:,.2f}}".format)
+                    st.dataframe(_bp_fmt, use_container_width=True, hide_index=True)
+            else:
+                st.info("No plant column found — breakdown by plant unavailable.")
 
 # ── Tab 2: Material Group ─────────────────────────────────────────────────────
 with tabs[1]:
