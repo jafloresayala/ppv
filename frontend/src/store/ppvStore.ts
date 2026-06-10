@@ -13,8 +13,10 @@ interface PPVState {
   rowCount:      number
 
   // Filters
-  selectedGroups:  string[]
-  selectedVendors: string[]
+  selectedGroups:    string[]
+  selectedVendors:   string[]
+  selectedPlants:    string[]
+  selectedDateRange: { start: string; end: string } | null
 
   // Data
   analytics:  Analytics | null
@@ -27,6 +29,9 @@ interface PPVState {
   forecastLoading: boolean
   searchLoading:   boolean
   error:           string | null
+  errorType:       'connection' | 'timeout' | 'auth' | 'api' | null
+  partialWarning:  { message: string; failedMonths: string[] } | null
+  lastQueryParams: { plants: string[]; start: string; end: string } | null
   activeTab:       number
 
   // Fetch progress (SAP month-by-month streaming)
@@ -46,10 +51,12 @@ interface PPVState {
   applyFilters:   () => Promise<void>
   loadForecast:   (scale?: string) => Promise<void>
   search:         (q: string) => Promise<void>
-  setGroups:      (groups: string[]) => void
-  setVendors:     (vendors: string[]) => void
-  setTab:         (tab: number) => void
-  clearError:     () => void
+  setGroups:     (groups: string[]) => void
+  setVendors:    (vendors: string[]) => void
+  setPlants:     (plants: string[]) => void
+  setDateRange:  (range: { start: string; end: string } | null) => void
+  setTab:        (tab: number) => void
+  clearError:    () => void
   sendMessage:    (content: string) => Promise<void>
   clearChat:      () => void
 }
@@ -59,8 +66,10 @@ export const usePPV = create<PPVState>((set, get) => ({
   params:          null,
   filterOptions:   null,
   rowCount:        0,
-  selectedGroups:  [],
-  selectedVendors: [],
+  selectedGroups:    [],
+  selectedVendors:   [],
+  selectedPlants:    [],
+  selectedDateRange: null,
   analytics:       null,
   forecast:        null,
   searchResult:    null,
@@ -69,6 +78,9 @@ export const usePPV = create<PPVState>((set, get) => ({
   forecastLoading: false,
   searchLoading:   false,
   error:           null,
+  errorType:       null,
+  partialWarning:  null,
+  lastQueryParams: null,
   activeTab:       0,
   chatHistory:     [],
   chatLoading:     false,
@@ -85,6 +97,9 @@ export const usePPV = create<PPVState>((set, get) => ({
       loading: true,
       loadingPhase: 'Fetching SAP data…',
       error: null,
+      errorType: null,
+      partialWarning: null,
+      lastQueryParams: { plants, start, end },
       analytics: null,
       forecast: null,
       fetchProgress: 0,
@@ -136,10 +151,19 @@ export const usePPV = create<PPVState>((set, get) => ({
               fetchTotalMonths: event.total_months ?? 0,
               fetchRowsSoFar:   event.rows_so_far  ?? 0,
             })
+          } else if (event.phase === 'partial_warning') {
+            set({
+              partialWarning: {
+                message:      event.message      ?? '',
+                failedMonths: event.failed_labels ?? [],
+              },
+            })
           } else if (event.phase === 'done') {
             doneData = event
           } else if (event.phase === 'error') {
-            throw new Error(event.message ?? 'Unknown server error')
+            const err: any = new Error(event.message ?? 'Unknown server error')
+            err.errorType = event.error_type ?? 'api'
+            throw err
           }
         }
       }
@@ -147,34 +171,44 @@ export const usePPV = create<PPVState>((set, get) => ({
       if (!doneData) throw new Error('No response received from server.')
 
       set({
-        sessionId:       doneData.session_id,
-        params:          doneData.params,
-        filterOptions:   doneData.filter_options,
-        rowCount:        doneData.row_count,
-        selectedGroups:  doneData.filter_options.material_groups,
-        selectedVendors: doneData.filter_options.vendors,
-        loadingPhase:    'Computing analytics…',
-        fetchProgress:   100,
+        sessionId:         doneData.session_id,
+        params:            doneData.params,
+        filterOptions:     doneData.filter_options,
+        rowCount:          doneData.row_count,
+        selectedGroups:    doneData.filter_options.material_groups,
+        selectedVendors:   doneData.filter_options.vendors,
+        selectedPlants:    doneData.params.Plants ?? [],
+        selectedDateRange: null,
+        loadingPhase:      'Computing analytics…',
+        fetchProgress:     100,
       })
 
       const ana = await getAnalytics(doneData.session_id, {
         material_groups: doneData.filter_options.material_groups,
         vendors:         doneData.filter_options.vendors,
+        plants:          doneData.params.Plants ?? [],
       })
       set({ analytics: ana, loading: false, loadingPhase: null })
     } catch (e: any) {
-      set({ loading: false, loadingPhase: null, error: e.message ?? String(e) })
+      set({
+        loading: false,
+        loadingPhase: null,
+        error: e.message ?? String(e),
+        errorType: (e.errorType ?? 'api') as 'connection' | 'timeout' | 'auth' | 'api',
+      })
     }
   },
 
   applyFilters: async () => {
-    const { sessionId, selectedGroups, selectedVendors } = get()
+    const { sessionId, selectedGroups, selectedVendors, selectedPlants, selectedDateRange } = get()
     if (!sessionId) return
     set({ loading: true, error: null })
     try {
       const ana = await getAnalytics(sessionId, {
         material_groups: selectedGroups,
         vendors:         selectedVendors,
+        plants:          selectedPlants,
+        ...(selectedDateRange ? { date_start: selectedDateRange.start, date_end: selectedDateRange.end } : {}),
       })
       set({ analytics: ana, loading: false, forecast: null })
     } catch (e: any) {
@@ -183,11 +217,16 @@ export const usePPV = create<PPVState>((set, get) => ({
   },
 
   loadForecast: async (scale = 'StandardScaler') => {
-    const { sessionId, selectedGroups, selectedVendors } = get()
+    const { sessionId, selectedGroups, selectedVendors, selectedPlants, selectedDateRange } = get()
     if (!sessionId) return
     set({ forecastLoading: true })
     try {
-      const fc = await getForecast(sessionId, { material_groups: selectedGroups, vendors: selectedVendors }, scale)
+      const fc = await getForecast(sessionId, {
+        material_groups: selectedGroups,
+        vendors:         selectedVendors,
+        plants:          selectedPlants,
+        ...(selectedDateRange ? { date_start: selectedDateRange.start, date_end: selectedDateRange.end } : {}),
+      }, scale)
       set({ forecast: fc, forecastLoading: false })
     } catch (e: any) {
       set({ forecastLoading: false, error: e.response?.data?.detail ?? e.message })
@@ -206,10 +245,13 @@ export const usePPV = create<PPVState>((set, get) => ({
     }
   },
 
-  setGroups:  (groups)  => set({ selectedGroups:  groups }),
-  setVendors: (vendors) => set({ selectedVendors: vendors }),
-  setTab:     (tab)     => set({ activeTab: tab }),
-  clearError: ()        => set({ error: null }),
+  setGroups:    (groups)  => set({ selectedGroups:    groups }),
+  setVendors:   (vendors) => set({ selectedVendors:   vendors }),
+  setPlants:    (plants)  => set({ selectedPlants:    plants }),
+  setDateRange: (range)   => set({ selectedDateRange: range }),
+  setTab:       (tab)     => set({ activeTab: tab }),
+  clearError:          () => set({ error: null, errorType: null }),
+  clearPartialWarning: () => set({ partialWarning: null }),
 
   sendMessage: async (content) => {
     const { chatHistory, analytics, sessionId, selectedGroups, selectedVendors } = get()

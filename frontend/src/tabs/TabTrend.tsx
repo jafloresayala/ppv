@@ -1,16 +1,43 @@
 // src/tabs/TabTrend.tsx
 import { useState } from 'react'
+import { X } from 'lucide-react'
 import TrendChart      from '../components/charts/TrendChart'
 import StackedBarChart from '../components/charts/StackedBarChart'
 import { usePPV } from '../store/ppvStore'
 import { PLANT_FLAGS, PLANT_NAMES, PLANT_COLORS } from '../utils/plants'
+import { getTrendDetail } from '../api/client'
+import type { TrendDetailRow } from '../types/api.types'
 
 const fmt = (v: number) => `$${v.toLocaleString(undefined, { minimumFractionDigits: 2 })}`
 
 export default function TabTrend() {
-  const { analytics }      = usePPV()
+  const { analytics, sessionId, selectedGroups, selectedVendors, selectedPlants, selectedDateRange } = usePPV()
   const data               = analytics?.trend
   const [split, setSplit]  = useState(false)
+
+  // Drill-down modal
+  const [drillLabel,   setDrillLabel]   = useState<string | null>(null)
+  const [drillRows,    setDrillRows]    = useState<TrendDetailRow[]>([])
+  const [drillLoading, setDrillLoading] = useState(false)
+
+  async function handleBarClick(label: string) {
+    if (!sessionId || !data) return
+    setDrillLabel(label)
+    setDrillRows([])
+    setDrillLoading(true)
+    try {
+      const filters = {
+        material_groups: selectedGroups,
+        vendors:         selectedVendors,
+        plants:          selectedPlants,
+        ...(selectedDateRange ? { date_start: selectedDateRange.start, date_end: selectedDateRange.end } : {}),
+      }
+      const result = await getTrendDetail(sessionId, filters, label, data.granularity)
+      setDrillRows(result.rows)
+    } finally {
+      setDrillLoading(false)
+    }
+  }
 
   if (!data || !data.labels.length)
     return <p className="text-sm text-slate-400 italic">No date/time data available in this dataset.</p>
@@ -63,7 +90,7 @@ export default function TabTrend() {
 
         {showSplit
           ? <StackedBarChart labels={data.labels} byPlant={data.by_plant!} height={360} />
-          : <TrendChart data={data} height={360} />
+          : <TrendChart data={data} height={360} onBarClick={handleBarClick} />
         }
       </div>
 
@@ -208,6 +235,85 @@ export default function TabTrend() {
             </table>
           </div>
         </details>
+      )}
+
+      {/* ── Drill-down modal ── */}
+      {drillLabel !== null && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm p-4"
+          onClick={() => setDrillLabel(null)}
+        >
+          <div
+            className="bg-white rounded-2xl shadow-2xl flex flex-col w-full max-w-5xl max-h-[85vh]"
+            onClick={e => e.stopPropagation()}
+          >
+            {/* Modal header */}
+            <div className="flex items-center justify-between px-5 py-4 border-b border-slate-100 shrink-0">
+              <div>
+                <p className="text-sm font-bold text-slate-700">
+                  Records — {drillLabel.length >= 10 ? drillLabel.slice(0, 10) : drillLabel}
+                </p>
+                {!drillLoading && (
+                  <p className="text-xs text-slate-400 mt-0.5">
+                    {drillRows.length} record{drillRows.length !== 1 ? 's' : ''} ·{' '}
+                    Total PPV:{' '}
+                    <span className={drillRows.reduce((s, r) => s + r.ppv, 0) > 0 ? 'text-danger font-semibold' : 'text-success font-semibold'}>
+                      {fmt(drillRows.reduce((s, r) => s + r.ppv, 0))}
+                    </span>
+                  </p>
+                )}
+              </div>
+              <button
+                className="w-7 h-7 rounded-full flex items-center justify-center hover:bg-slate-100 transition-colors"
+                onClick={() => setDrillLabel(null)}
+              >
+                <X className="w-4 h-4 text-slate-400" />
+              </button>
+            </div>
+
+            {/* Table */}
+            <div className="flex-1 overflow-auto">
+              {drillLoading ? (
+                <div className="flex items-center justify-center h-40 text-slate-400 text-sm">Loading…</div>
+              ) : drillRows.length === 0 ? (
+                <div className="flex items-center justify-center h-40 text-slate-400 text-sm italic">No records found</div>
+              ) : (
+                <table className="tbl w-full text-xs">
+                  <thead className="sticky top-0 bg-white z-10 shadow-[0_1px_0_0_#e2e8f0]">
+                    <tr>
+                      <th className="text-left">Date</th>
+                      <th className="text-left">Material</th>
+                      <th className="text-left">Group</th>
+                      <th className="text-left">Vendor</th>
+                      <th className="text-left">Plant</th>
+                      <th className="text-right">Qty</th>
+                      <th className="text-right">PO /1k</th>
+                      <th className="text-right">Std /1k</th>
+                      <th className="text-right">PPV</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {drillRows.map((r, i) => (
+                      <tr key={i}>
+                        <td className="font-mono whitespace-nowrap">{r.date}</td>
+                        <td className="font-mono whitespace-nowrap">{r.material || '—'}</td>
+                        <td className="max-w-[160px] truncate">{r.group || '—'}</td>
+                        <td className="max-w-[160px] truncate">{r.vendor || '—'}</td>
+                        <td className="whitespace-nowrap">{r.plant || '—'}</td>
+                        <td className="text-right tabular-nums">{r.quantity !== 0 ? r.quantity.toLocaleString() : '—'}</td>
+                        <td className="text-right tabular-nums">{r.po_price_k  !== 0 ? fmt(r.po_price_k)  : '—'}</td>
+                        <td className="text-right tabular-nums">{r.std_price_k !== 0 ? fmt(r.std_price_k) : '—'}</td>
+                        <td className={`text-right font-semibold tabular-nums ${r.ppv > 0 ? 'text-danger' : 'text-success'}`}>
+                          {fmt(r.ppv)}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          </div>
+        </div>
       )}
     </div>
   )

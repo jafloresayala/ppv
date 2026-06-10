@@ -5,6 +5,7 @@ Serves as the proxy between the React frontend and SAP API.
 import asyncio
 import calendar
 import json as _json
+import time
 import uuid
 import requests
 from datetime import datetime, timedelta
@@ -20,7 +21,7 @@ from pydantic import BaseModel
 import pandas as pd
 
 from config import SAP_API_URL, COL_PPV, COL_PRICE, COL_FX, ALLOWED_ORIGINS, AZ_INF_ENDPOINT, AZ_INF_API_KEY, AZ_INF_API_VER, AZ_INF_MODEL, PRICECALC_API_URL
-from data_service import parse_df, extract_records, get_filter_options, apply_filters
+from data_service import parse_df, extract_records, get_filter_options, apply_filters, enrich_with_currency
 from analytics import compute_all_analytics, compute_forecast, search_material, compute_mg_plant_components
 import cache
 from sourcing import router as sourcing_router
@@ -46,11 +47,21 @@ def _get_session(session_id: str) -> tuple[pd.DataFrame, dict]:
     """Return (DataFrame, params). Checks Redis first, then in-memory fallback."""
     data = cache.get_pickle(cache.make_key("ses", session_id))
     if data is not None:
-        return data["df"], data["params"]
-    # In-memory fallback (e.g. when Redis was unavailable at startup)
-    if session_id in _sessions:
-        return _sessions[session_id], _session_params[session_id]
-    raise HTTPException(status_code=404, detail="Session expired — please run a new query.")
+        df, params = data["df"], data["params"]
+    elif session_id in _sessions:
+        df, params = _sessions[session_id], _session_params[session_id]
+    else:
+        raise HTTPException(status_code=404, detail="Session expired — please run a new query.")
+
+    # Patch sessions that predate the currency-enrichment step (v7+).
+    # Old pickles have P_Price_difference_num but no PPDifference_currency.
+    if "PPDifference_currency" not in df.columns:
+        df = df.copy()
+        df["PPDifference_currency"] = (
+            df["P_Price_difference_num"] if "P_Price_difference_num" in df.columns else 0.0
+        )
+
+    return df, params
 
 
 def _save_session(sid: str, df: pd.DataFrame, params: dict) -> None:
@@ -111,8 +122,9 @@ _CHAT_COL_MAP: dict[str, str] = {
     "Standard_Price_for_1000_num":    "StdPrice/1k",
     "MExtended_PO_Price_num":         "POAmount",
     "M_Extended__Std_Amount_num":     "StdAmount",
-    "Total_Variance_Amount_num":      "PPV",
-    "P_Price_difference_num":         "PriceDiff",
+    "PPDifference_currency":          "PPV(USD)",
+    "Total_Variance_Amount_num":      "TotalVarLocal",
+    "P_Price_difference_num":         "PriceDiffLocal",
     "Exchange_rate_difference_num":   "FXDiff",
     "YearMonth":                      "YearMonth",
     "Purchase_Order":                 "PO",
@@ -286,6 +298,12 @@ class VendorMonthRequest(BaseModel):
     vendor:     str
     yearmonth:  str
 
+class TrendDetailRequest(BaseModel):
+    session_id:  str
+    filters:     dict = {}
+    label:       str   # the exact label string from TrendData.labels
+    granularity: str   # 'daily' or 'monthly'
+
 class HierarchyDrillRequest(BaseModel):
     session_id:     str
     filters:        dict = {}
@@ -334,14 +352,16 @@ def _fetch_sap(plant: str, start: str, end: str) -> list:
         resp.raise_for_status()
         raw = resp.json()
     except requests.exceptions.ConnectionError:
-        raise HTTPException(status_code=503, detail="Cannot connect to SAP server. Check network/VPN.")
+        raise HTTPException(status_code=503, detail="Cannot connect to SAP server. Verify VPN/network.")
     except requests.exceptions.Timeout:
-        raise HTTPException(status_code=504, detail="SAP API timeout (300 s).")
+        raise HTTPException(status_code=504, detail="SAP API timed out (300 s). The server may be overloaded.")
     except requests.exceptions.HTTPError as exc:
-        raise HTTPException(status_code=exc.response.status_code,
-                            detail=f"SAP HTTP error: {exc.response.text[:300]}")
+        code = exc.response.status_code
+        if code == 401:
+            raise HTTPException(status_code=401, detail="SAP authentication failed (HTTP 401). Check Windows credentials.")
+        raise HTTPException(status_code=code, detail=f"SAP HTTP error {code}: {exc.response.text[:200]}")
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=f"Unexpected SAP error: {exc}")
     return extract_records(raw)
 
 
@@ -353,14 +373,16 @@ def _fetch_sap_with_session(s: requests.Session, plant: str, start: str, end: st
         resp.raise_for_status()
         raw = resp.json()
     except requests.exceptions.ConnectionError:
-        raise HTTPException(status_code=503, detail="Cannot connect to SAP server. Check network/VPN.")
+        raise HTTPException(status_code=503, detail="Cannot connect to SAP server. Verify VPN/network.")
     except requests.exceptions.Timeout:
-        raise HTTPException(status_code=504, detail="SAP API timeout (300 s).")
+        raise HTTPException(status_code=504, detail="SAP API timed out (300 s). The server may be overloaded.")
     except requests.exceptions.HTTPError as exc:
-        raise HTTPException(status_code=exc.response.status_code,
-                            detail=f"SAP HTTP error: {exc.response.text[:300]}")
+        code = exc.response.status_code
+        if code == 401:
+            raise HTTPException(status_code=401, detail="SAP authentication failed (HTTP 401). Check Windows credentials.")
+        raise HTTPException(status_code=code, detail=f"SAP HTTP error {code}: {exc.response.text[:200]}")
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=f"Unexpected SAP error: {exc}")
     return extract_records(raw)
 
 
@@ -478,77 +500,182 @@ async def query_sap(req: QueryRequest):
                 "cached": True,
             })
 
-        # ── Fetch delta months per plant (sequential, shared NTLM session) ──
+        # ── Fetch delta months in parallel across all plants ───────────────
+        # Each task gets its own requests.Session (NTLM is not thread-safe on
+        # a shared session).  A semaphore caps concurrent SAP connections so
+        # we don't overwhelm the server.
         plant_dfs: dict[str, pd.DataFrame] = {}
         months_done_global = total_cached_months
         rows_so_far_global = rows_from_cache
-        sap_session        = requests.Session()
-        sap_session.auth   = HttpNtlmAuth("", "")
+        _sem = asyncio.Semaphore(3)  # 3 concurrent SAP calls — NTLM is more stable with fewer parallel connections
 
+        async def _fetch_one(plant: str, ms: str, me: str, label: str):
+            """Fetch one (plant, month) with retry. Returns (..., records, err_detail).
+            Never raises — errors are returned as err_detail string so callers can decide
+            whether to abort or continue with partial data."""
+            async with _sem:
+                def _do() -> tuple[list | None, str | None]:
+                    max_att = 4  # initial attempt + 3 retries
+                    last_err: str | None = None
+                    for att in range(1, max_att + 1):
+                        s = requests.Session()
+                        s.auth = HttpNtlmAuth("", "")
+                        try:
+                            recs = _fetch_sap_with_session(s, plant, ms, me)
+                            return recs, None
+                        except HTTPException as exc:
+                            last_err = exc.detail
+                            if exc.status_code in (503, 504) and att < max_att:
+                                time.sleep(2 ** (att - 1))   # 1 s → 2 s → 4 s
+                                continue
+                            return None, exc.detail
+                        except Exception as exc:
+                            last_err = str(exc)
+                            if att < max_att:
+                                time.sleep(2 ** (att - 1))
+                                continue
+                            return None, last_err
+                        finally:
+                            s.close()
+                    return None, last_err
+                records, err = await loop.run_in_executor(None, _do)
+            return plant, ms, me, label, records, err
+
+        # Handle cache-hit plants immediately; build tasks for the rest
+        for plan in plans:
+            if plan["fetch_mode"] == "hit":
+                plant_dfs[plan["plant"]] = _filter_df_by_dates(
+                    plan["existing_df"], start_date, end_date
+                )
+
+        fetch_tasks = [
+            asyncio.create_task(_fetch_one(plan["plant"], ms, me, label))
+            for plan in plans
+            if plan["fetch_mode"] != "hit"
+            for ms, me, label in plan["delta_months"]
+        ]
+
+        # Accumulate raw results keyed by plant
+        raw_results: dict[str, list[tuple[str, pd.DataFrame]]] = {p: [] for p in plants}
+        failed_months: list[dict] = []   # {label, plant, error}
         try:
-            for plan in plans:
-                plant        = plan["plant"]
-                fetch_mode   = plan["fetch_mode"]
-                delta_months = plan["delta_months"]
-                existing_df  = plan["existing_df"]
-
-                if fetch_mode == "hit":
-                    plant_dfs[plant] = _filter_df_by_dates(existing_df, start_date, end_date)
+            for fut in asyncio.as_completed(fetch_tasks):
+                try:
+                    plant, ms, me, label, records, err_detail = await fut
+                except Exception as exc:
+                    # Unexpected (e.g. task cancelled) — treat as a failed month, keep going
+                    failed_months.append({"label": "unknown", "plant": "?", "error": str(exc)})
+                    months_done_global += 1
                     continue
 
-                new_dfs: list[pd.DataFrame] = []
-
-                for ms, me, label in delta_months:
-                    try:
-                        records = await loop.run_in_executor(
-                            None,
-                            lambda s=ms, e=me, pl=plant: _fetch_sap_with_session(sap_session, pl, s, e),
-                        )
-                    except HTTPException as exc:
-                        yield _sse({"phase": "error", "message": exc.detail})
-                        return
-                    except Exception as exc:
-                        yield _sse({"phase": "error", "message": str(exc)})
-                        return
-
-                    if records:
-                        month_df = parse_df(records)
-                        new_dfs.append(month_df)
-                        rows_so_far_global += len(month_df)
-
+                if err_detail is not None:
+                    failed_months.append({"label": label, "plant": plant, "error": err_detail})
                     months_done_global += 1
-                    month_label = f"{plant} · {label}" if len(plants) > 1 else label
+                    warn_lbl = f"\u26a0 {plant} \u00b7 {label}" if len(plants) > 1 else f"\u26a0 {label}"
                     yield _sse({
                         "phase": "fetching",
                         "progress": int(months_done_global / total_months_all * 100),
                         "months_done": months_done_global, "total_months": total_months_all,
-                        "rows_so_far": rows_so_far_global, "month_label": month_label,
-                        "cached": False,
+                        "rows_so_far": rows_so_far_global, "month_label": warn_lbl,
+                        "cached": False, "warning": True,
                     })
+                    continue
 
-                # Merge and update master cache for this plant
-                new_combined = pd.concat(new_dfs, ignore_index=True) if new_dfs else pd.DataFrame()
+                if records:
+                    month_df = parse_df(records)
+                    raw_results[plant].append((ms, month_df))
+                    rows_so_far_global += len(month_df)
 
-                if fetch_mode == "extend_end":
-                    full_df = pd.concat([existing_df, new_combined], ignore_index=True) if not new_combined.empty else existing_df
-                    cache.set_master(plant, plan["new_master_start"], plan["new_master_end"], full_df)
+                months_done_global += 1
+                month_label = f"{plant} \u00b7 {label}" if len(plants) > 1 else label
+                yield _sse({
+                    "phase": "fetching",
+                    "progress": int(months_done_global / total_months_all * 100),
+                    "months_done": months_done_global, "total_months": total_months_all,
+                    "rows_so_far": rows_so_far_global, "month_label": month_label,
+                    "cached": False,
+                })
+        except Exception as exc:
+            yield _sse({"phase": "error", "message": str(exc)})
+            return
 
-                elif fetch_mode == "extend_start":
-                    full_df = pd.concat([new_combined, existing_df], ignore_index=True) if not new_combined.empty else existing_df
-                    cache.set_master(plant, plan["new_master_start"], plan["new_master_end"], full_df)
+        # ── Determine overall outcome before merging ──────────────────────
+        total_new_rows  = sum(len(v) for v in raw_results.values())
+        has_cache_hits  = any(p["fetch_mode"] == "hit" for p in plans)
+        if total_new_rows == 0 and not has_cache_hits and failed_months:
+            # Total failure — surface a helpful, actionable error
+            first_err = failed_months[0]["error"]
+            if "Verify VPN" in first_err or "Cannot connect" in first_err:
+                err_type = "connection"
+                err_msg  = (
+                    "Cannot connect to SAP server after multiple retries. "
+                    "Please check: VPN is connected \u00b7 you are on the corporate network "
+                    "\u00b7 SAP host nts5102 is reachable."
+                )
+            elif "timed out" in first_err.lower() or "overloaded" in first_err.lower():
+                err_type = "timeout"
+                err_msg  = (
+                    "SAP API is not responding (timeout). "
+                    "The server may be overloaded — wait a few minutes and try again."
+                )
+            elif "401" in first_err or "authentication" in first_err.lower():
+                err_type = "auth"
+                err_msg  = "SAP authentication failed. Verify your Windows credentials and try again."
+            else:
+                err_type = "api"
+                err_msg  = f"SAP API error: {first_err}"
+            yield _sse({"phase": "error", "error_type": err_type, "message": err_msg})
+            return
 
-                else:  # full fetch
-                    if new_combined.empty:
-                        # No records for this plant — skip gracefully
-                        plant_dfs[plant] = pd.DataFrame()
-                        continue
-                    full_df = new_combined
-                    cache.set_master(plant, start_date, end_date, full_df)
+        if failed_months:
+            failed_labels = [
+                f"{m['plant']} \u00b7 {m['label']}" if len(plants) > 1 else m["label"]
+                for m in failed_months
+            ]
+            preview = ", ".join(failed_labels[:5]) + ("\u2026" if len(failed_labels) > 5 else "")
+            yield _sse({
+                "phase": "partial_warning",
+                "failed_count":  len(failed_months),
+                "failed_labels": failed_labels,
+                "message": (
+                    f"{len(failed_months)} month(s) could not be fetched "
+                    f"({preview}) and will be absent from the analysis."
+                ),
+            })
 
-                plant_dfs[plant] = _filter_df_by_dates(full_df, start_date, end_date)
+        # ── Merge months chronologically and update master cache per plant ──
+        for plan in plans:
+            plant       = plan["plant"]
+            fetch_mode  = plan["fetch_mode"]
+            existing_df = plan["existing_df"]
 
-        finally:
-            sap_session.close()
+            if fetch_mode == "hit":
+                continue  # already placed in plant_dfs above
+
+            # Restore chronological order before concat (as_completed gives any order)
+            sorted_months = sorted(raw_results[plant], key=lambda x: x[0])
+            new_combined = (
+                pd.concat([df for _, df in sorted_months], ignore_index=True)
+                if sorted_months else pd.DataFrame()
+            )
+
+            if fetch_mode == "extend_end":
+                full_df = pd.concat([existing_df, new_combined], ignore_index=True) if not new_combined.empty else existing_df
+                cache.set_master(plant, plan["new_master_start"], plan["new_master_end"], full_df)
+
+            elif fetch_mode == "extend_start":
+                full_df = pd.concat([new_combined, existing_df], ignore_index=True) if not new_combined.empty else existing_df
+                cache.set_master(plant, plan["new_master_start"], plan["new_master_end"], full_df)
+
+            else:  # full fetch
+                if new_combined.empty:
+                    plant_dfs[plant] = pd.DataFrame()
+                    continue
+                full_df = new_combined
+                cache.set_master(plant, start_date, end_date, full_df)
+
+            plant_dfs[plant] = _filter_df_by_dates(full_df, start_date, end_date)
+
 
         # ── Merge all plant DataFrames into one session ─────────────────────
         labeled_dfs: list[pd.DataFrame] = []
@@ -564,6 +691,19 @@ async def query_sap(req: QueryRequest):
 
         df     = pd.concat(labeled_dfs, ignore_index=True)
         params = {"Plants": plants, "PostingStartDate": start_date, "PostingEndDate": end_date}
+
+        # Convert all non-USD amounts to USD using SAP M-rates
+        yield _sse({"phase": "fetching", "progress": 99,
+                    "month_label": "Converting currencies…", "cached": False})
+        try:
+            df = await loop.run_in_executor(None, lambda: enrich_with_currency(df))
+        except Exception:
+            # Enrichment failed — ensure PPDifference_currency still exists as fallback
+            if "PPDifference_currency" not in df.columns:
+                df = df.copy()
+                df["PPDifference_currency"] = (
+                    df["P_Price_difference_num"] if "P_Price_difference_num" in df.columns else 0.0
+                )
 
         try:
             sid = str(uuid.uuid4())
@@ -584,7 +724,7 @@ async def query_sap(req: QueryRequest):
 
 
 # Bump this whenever the analytics schema changes to auto-invalidate cached results
-ANALYTICS_SCHEMA_VERSION = "4"  # added by_plant per-group to material_groups
+ANALYTICS_SCHEMA_VERSION = "8"  # All PPV computations now use PPDifference_currency (USD-converted)
 
 
 def _plant_key(params: dict) -> str:
@@ -635,14 +775,27 @@ class MGPlantComponentsRequest(BaseModel):
 @app.post("/api/mg-plant-components")
 def mg_plant_components(req: MGPlantComponentsRequest):
     """Component breakdown for a specific material group + plant combination."""
+    ck = cache.make_key("drill", "mgplant", req.session_id,
+                        cache.filter_hash(req.filters), req.group, req.plant)
+    hit = cache.get_json(ck)
+    if hit is not None:
+        return hit
     df, _ = _get_session(req.session_id)
     dff   = apply_filters(df, req.filters)
-    return compute_mg_plant_components(dff, COL_PPV, req.group, req.plant)
+    result = jsonable_encoder(compute_mg_plant_components(dff, COL_PPV, req.group, req.plant))
+    cache.set_json(ck, result, cache.TTL_DRILL)
+    return result
 
 
 @app.post("/api/hierarchy-drill")
 def hierarchy_drill(req: HierarchyDrillRequest):
     """Top materials by PPV impact for a specific hierarchy + month."""
+    ck = cache.make_key("drill", "hdrll", req.session_id,
+                        cache.filter_hash(req.filters),
+                        req.hierarchy_code, req.year_month, str(req.top_n))
+    hit = cache.get_json(ck)
+    if hit is not None:
+        return hit
     df, _ = _get_session(req.session_id)
     dff = apply_filters(df, req.filters)
     PH = "Product_Hierarchy"
@@ -670,7 +823,9 @@ def hierarchy_drill(req: HierarchyDrillRequest):
         }
         for _, row in grp.iterrows()
     ]
-    return {"items": items, "hierarchy": req.hierarchy_code, "month": req.year_month}
+    result = {"items": items, "hierarchy": req.hierarchy_code, "month": req.year_month}
+    cache.set_json(ck, result, cache.TTL_DRILL)
+    return result
 
 
 class MaterialTrendRequest(BaseModel):
@@ -687,6 +842,11 @@ class VendorPriceTrendRequest(BaseModel):
 @app.post("/api/material-trend")
 def material_trend(req: MaterialTrendRequest):
     """Monthly Standard Price vs PO Price trend for a single material."""
+    ck = cache.make_key("drill", "mattrend", req.session_id,
+                        cache.filter_hash(req.filters), req.material_number)
+    hit = cache.get_json(ck)
+    if hit is not None:
+        return hit
     import math
     df, _ = _get_session(req.session_id)
     dff   = apply_filters(df, req.filters)
@@ -724,7 +884,7 @@ def material_trend(req: MaterialTrendRequest):
     if "Material_Description" in sub.columns:
         desc = str(sub["Material_Description"].dropna().iloc[0]) if not sub["Material_Description"].dropna().empty else ""
 
-    return {
+    result = {
         "material":  req.material_number,
         "desc":      desc,
         "labels":    grp["YearMonth"].astype(str).tolist(),
@@ -733,11 +893,18 @@ def material_trend(req: MaterialTrendRequest):
         "ppv":       [safe(v) for v in grp["ppv"].tolist()],
         "records":   [int(v) for v in grp["records"].tolist()],
     }
+    cache.set_json(ck, result, cache.TTL_DRILL)
+    return result
 
 
 @app.post("/api/vendor-price-trend")
 def vendor_price_trend(req: VendorPriceTrendRequest):
     """Monthly PO Price /1k per vendor for a single material."""
+    ck = cache.make_key("drill", "vndtrend", req.session_id,
+                        cache.filter_hash(req.filters), req.material_number)
+    hit = cache.get_json(ck)
+    if hit is not None:
+        return hit
     import math
     df, _ = _get_session(req.session_id)
     dff   = apply_filters(df, req.filters)
@@ -775,7 +942,9 @@ def vendor_price_trend(req: VendorPriceTrendRequest):
 
     vendors.sort(key=lambda x: x["name"])
 
-    return {"material": req.material_number, "labels": all_months, "vendors": vendors}
+    result = {"material": req.material_number, "labels": all_months, "vendors": vendors}
+    cache.set_json(ck, result, cache.TTL_DRILL)
+    return result
 
 
 @app.post("/api/forecast")
@@ -819,6 +988,11 @@ def search(req: SearchRequest):
 @app.post("/api/vendor-month")
 def vendor_month_records(req: VendorMonthRequest):
     """Return all individual records for a given vendor + month."""
+    ck = cache.make_key("drill", "vndmon", req.session_id,
+                        cache.filter_hash({"v": req.vendor}), req.yearmonth)
+    hit = cache.get_json(ck)
+    if hit is not None:
+        return hit
     df, _ = _get_session(req.session_id)
     if "Vendor_Name" not in df.columns or "YearMonth" not in df.columns:
         return {"records": [], "columns": []}
@@ -830,7 +1004,7 @@ def vendor_month_records(req: VendorMonthRequest):
         "Material_Number", "Material_Description",
         "Posting_Date", "Quantity",
         "MExtended_PO_Price_num", "M_Extended__Std_Amount_num",
-        "Total_Variance_Amount_num",
+        "PPDifference_currency",
         "PO_Price_per_1000_num", "Standard_Price_for_1000_num",
     ]
     cols = [c for c in want if c in sub.columns]
@@ -843,7 +1017,7 @@ def vendor_month_records(req: VendorMonthRequest):
         "Quantity":                   "Qty",
         "MExtended_PO_Price_num":     "PO Amount",
         "M_Extended__Std_Amount_num": "Std Amount",
-        "Total_Variance_Amount_num":  "PPV",
+        "PPDifference_currency":      "PPV (USD)",
         "PO_Price_per_1000_num":      "PO Price/1k",
         "Standard_Price_for_1000_num":"Std Price/1k",
     }
@@ -851,7 +1025,106 @@ def vendor_month_records(req: VendorMonthRequest):
     if "Date" in sub.columns:
         sub["Date"] = sub["Date"].astype(str).str[:10]
     records = sub.where(sub.notna(), None).to_dict("records")
-    return {"records": records, "columns": list(sub.columns)}
+    result = {"records": records, "columns": list(sub.columns)}
+    cache.set_json(ck, result, cache.TTL_DRILL)
+    return result
+
+
+class RawDataRequest(BaseModel):
+    session_id: str
+    filters:    dict = {}
+    page:       int  = 1     # 1-based
+    page_size:  int  = 100   # rows per page, max 500
+
+@app.post("/api/raw-data")
+def raw_data(req: RawDataRequest):
+    """Return the full session DataFrame as paginated JSON rows with all columns."""
+    page_size = min(max(req.page_size, 1), 500)
+    page      = max(req.page, 1)
+
+    df, _ = _get_session(req.session_id)
+    dff   = apply_filters(df, req.filters)
+
+    total_rows = len(dff)
+    total_pages = max(1, (total_rows + page_size - 1) // page_size)
+    start = (page - 1) * page_size
+    end   = start + page_size
+
+    chunk = dff.iloc[start:end].copy()
+
+    # Serialise safely: timestamps → strings, numpy scalars → native Python
+    import numpy as np
+    records: list[dict] = []
+    for row in chunk.to_dict("records"):
+        safe: dict = {}
+        for k, v in row.items():
+            if isinstance(v, pd.Timestamp):
+                safe[k] = str(v.date())
+            elif isinstance(v, float) and not np.isfinite(v):
+                safe[k] = None
+            elif isinstance(v, (np.integer,)):
+                safe[k] = int(v)
+            elif isinstance(v, (np.floating,)):
+                safe[k] = float(v)
+            else:
+                safe[k] = v
+        records.append(safe)
+
+    return {
+        "columns":     list(dff.columns),
+        "records":     records,
+        "total_rows":  total_rows,
+        "total_pages": total_pages,
+        "page":        page,
+        "page_size":   page_size,
+    }
+
+
+@app.post("/api/trend-detail")
+def trend_detail(req: TrendDetailRequest):
+    """Return all individual records that make up a specific bar in the Trend chart."""
+    ck = cache.make_key("drill", "trenddet", "v2", req.session_id,
+                        cache.filter_hash(req.filters), req.label, req.granularity)
+    hit = cache.get_json(ck)
+    if hit is not None:
+        return hit
+
+    df, _ = _get_session(req.session_id)
+    dff   = apply_filters(df, req.filters)
+
+    if req.granularity == "daily":
+        if "PostingDay" not in dff.columns:
+            return {"label": req.label, "rows": []}
+        # PostingDay is datetime; label is its str() e.g. "2024-01-15 00:00:00"
+        day_prefix = req.label[:10]
+        mask = dff["PostingDay"].astype(str).str.startswith(day_prefix)
+    else:
+        if "YearMonth" not in dff.columns:
+            return {"label": req.label, "rows": []}
+        mask = dff["YearMonth"].astype(str) == req.label
+
+    sub = dff[mask].copy()
+    if sub.empty:
+        return {"label": req.label, "rows": []}
+
+    rows = []
+    for _, row in sub.iterrows():
+        rows.append({
+            "date":           str(row.get("PostingDay", row.get("Posting_Date", "")))[:10],
+            "material":       str(row.get("Material_Number", "")),
+            "group":          str(row.get("Material_Group_Description", "")),
+            "vendor":         str(row.get("Vendor_Name", "")),
+            "plant":          str(row.get("Plant", "")),
+            "ppv":            float(row.get(COL_PPV, 0) or 0),
+            "quantity":       float(row.get("Quantity_num", 0) or 0),
+            "po_price_k":     float(row.get("PO_Price_per_1000_num", 0) or 0),
+            "std_price_k":    float(row.get("Standard_Price_for_1000_num", 0) or 0),
+        })
+
+    rows.sort(key=lambda r: abs(r["ppv"]), reverse=True)
+    result = {"label": req.label, "rows": rows[:1000]}
+    cache.set_json(ck, result, cache.TTL_DRILL)
+    return result
 
 
 # ── Price Calculator proxy (conexion_internalquery) ───────────────────────────
@@ -912,8 +1185,15 @@ def mg_sap_batch(req: MGSapBatchRequest):
     """
     from concurrent.futures import ThreadPoolExecutor
 
+    _mats_sorted = sorted(m.strip().upper() for m in req.materials[:20])
+    ck = cache.make_key("drill", "mgsap", req.loser_plant.upper(),
+                        cache.filter_hash({"mats": _mats_sorted}))
+    hit = cache.get_json(ck)
+    if hit is not None:
+        return hit
+
     loser_sap = _PPV_TO_SAP.get(req.loser_plant, req.loser_plant).upper()
-    mats      = [m.strip().upper() for m in req.materials[:20]]
+    mats      = _mats_sorted
 
     # Step 1 — Parallel AMPL lookups to resolve MPNs
     def fetch_mpns(mat: str) -> tuple[str, list]:
@@ -1007,7 +1287,9 @@ def mg_sap_batch(req: MGSapBatchRequest):
             ),
         })
 
-    return {"results": results}
+    result = {"results": results}
+    cache.set_json(ck, result, cache.TTL_ANALYTIC)  # 1 h — external pricing data
+    return result
 
 
 @app.post("/api/chat")

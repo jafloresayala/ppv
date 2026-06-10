@@ -153,7 +153,9 @@ export default function QueryForm() {
                 />
               </div>
               <div className="flex justify-between text-xs text-slate-400">
-                <span className="truncate max-w-[70%]">{fetchMonthLabel}</span>
+                <span className={`truncate max-w-[70%] ${fetchMonthLabel.startsWith('⚠') ? 'text-amber-500 font-medium' : ''}`}>
+                  {fetchMonthLabel}
+                </span>
                 <span className="font-medium text-brand">{fetchProgress}%</span>
               </div>
             </div>

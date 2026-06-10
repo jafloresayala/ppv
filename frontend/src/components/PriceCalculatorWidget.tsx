@@ -1115,7 +1115,209 @@ async function downloadMcDeepExcelFile(
   URL.revokeObjectURL(url)
 }
 
-// ── Main Widget ───────────────────────────────────────────────────────────────
+// ── CBOM + PPV left-join export ───────────────────────────────────────────────
+async function downloadCbomResultsExcel(
+  cbomHeaders: string[],
+  cbomRows: Array<(string | number | null)[]>,
+  cbomMpnColIdx: number,
+  mpnEntries: Array<{ mpn: string; bestRow: IQItem; allRows: IQItem[] }>,
+  deepAnalysisRows: DeepAnalysisRow[],
+  filename: string,
+): Promise<void> {
+  // ── Lookup maps ─────────────────────────────────────────────────────────────
+  const mpnToEntry = new Map<string, { mpn: string; bestRow: IQItem; allRows: IQItem[] }>()
+  for (const e of mpnEntries) mpnToEntry.set(e.mpn.toUpperCase(), e)
+
+  const ipToDeepRow = new Map<string, DeepAnalysisRow>()
+  for (const dr of deepAnalysisRows.filter(d => d.status === 'done')) ipToDeepRow.set(dr.internalPN, dr)
+
+  const hasDeepAnalysis = ipToDeepRow.size > 0
+
+  // Find Cost #1 (Conv.) column index (0-based); Cost #2 is no longer used for deltas
+  const cost1Idx = cbomHeaders.findIndex(h => h.trim() === 'Cost #1 (Conv.)')
+
+  const toNum = (v: string | number | null): number | null => {
+    if (typeof v === 'number' && isFinite(v)) return v
+    if (typeof v === 'string') { const n = parseFloat(v); return isFinite(n) ? n : null }
+    return null
+  }
+
+  // ── Best-result lookup: uses Deep Analysis winner when available ─────────────
+  type BestResult = {
+    source: string; internalPN: string; mpn: string; plant: string; supplier: string
+    lastPoUsd: number | null; stdUsd: number | null; date: string
+  }
+
+  const getBestForMpn = (mpnRaw: string): BestResult | null => {
+    const entry = mpnToEntry.get(mpnRaw.toUpperCase())
+    if (!entry) return null
+
+    const ip = entry.bestRow.internalPN
+    const dr = ipToDeepRow.get(ip)
+
+    if (dr) {
+      // Replicate the winner logic from the Deep Analysis tab
+      const candidates = mpnEntries.filter(e => e.bestRow.internalPN === ip)
+      const mpnBest    = candidates.reduce<typeof mpnEntries[0] | null>((min, e) => {
+        const p = resolveLastPoPrice(e.bestRow), mp = min ? resolveLastPoPrice(min.bestRow) : null
+        return p == null ? min : mp == null ? e : p < mp ? e : min
+      }, null)
+      const mpnPrice = mpnBest ? resolveLastPoPrice(mpnBest.bestRow) : null
+      const mcPrice  = dr.mcBestPriceUsd
+      const winner   = mpnPrice != null && mcPrice != null
+        ? mpnPrice < mcPrice ? 'Multi-MPN' : mcPrice < mpnPrice ? 'Multi-Comp' : 'Tie'
+        : mpnPrice != null ? 'Multi-MPN' : mcPrice != null ? 'Multi-Comp' : ''
+
+      if (winner === 'Multi-Comp') {
+        return {
+          source: 'Multi-Comp (Int. PN)',
+          internalPN: dr.mcBestInternalPN || ip, mpn: dr.mcBestMpn,
+          plant: dr.mcBestPlant, supplier: dr.mcBestSupplier,
+          lastPoUsd: dr.mcBestPriceUsd, stdUsd: dr.mcStdPriceUsd, date: dr.mcLastPoDate,
+        }
+      }
+      if (mpnBest) {
+        const r = mpnBest.bestRow
+        return {
+          source: winner === 'Tie' ? 'Tie (MPN used)' : 'Multi-MPN',
+          internalPN: r.internalPN, mpn: r.mpn, plant: r.siteName,
+          supplier: r.supplierName || r.englishName || '',
+          lastPoUsd: resolveLastPoPrice(r), stdUsd: r.standardPriceUsd, date: r.lastPoDate,
+        }
+      }
+    }
+
+    // Fallback: no deep analysis — use direct MPN search result
+    const r = entry.bestRow
+    return {
+      source: 'MPN Only',
+      internalPN: r.internalPN, mpn: r.mpn, plant: r.siteName,
+      supplier: r.supplierName || r.englishName || '',
+      lastPoUsd: resolveLastPoPrice(r), stdUsd: r.standardPriceUsd, date: r.lastPoDate,
+    }
+  }
+
+  // ── Build worksheet ─────────────────────────────────────────────────────────
+  const ExcelJS = (await import('exceljs')).default
+  const wb = new ExcelJS.Workbook()
+  wb.creator = 'PPV Dashboard'
+  wb.created = new Date()
+  const ws = wb.addWorksheet('CBOM + PPV Results', { views: [{ state: 'frozen', ySplit: 1 }] })
+
+  const ppvHeaders: string[] = [
+    ...(hasDeepAnalysis ? ['PPV - Source'] : []),
+    'PPV - Internal PN',
+    'PPV - MPN',
+    'PPV - Plant',
+    'PPV - Supplier',
+    'PPV - Last PO (USD)',
+    'PPV - STD (USD)',
+    'PPV - Date',
+    'Δ Last PO - Cost#1',  // Last PO (USD) − Cost #1 (Conv.); negative = favorable (actual < quoted)
+    'Δ STD - Cost#1',      // STD (USD)    − Cost #1 (Conv.); negative = favorable
+  ]
+
+  const colWidth = (h: string) => Math.min(Math.max((h?.length ?? 0) + 4, 10), 40)
+  ws.columns = [
+    ...cbomHeaders.map((h, i) => ({ header: h || `Col${i + 1}`, key: `c${i}`, width: colWidth(h) })),
+    ...ppvHeaders.map(h => ({ header: h, key: h, width: h.startsWith('Δ') ? 24 : 24 })),
+  ]
+
+  const totalCols    = cbomHeaders.length + ppvHeaders.length
+  // 1-based column numbers for the PPV price and delta columns
+  const lpoColNum    = cbomHeaders.length + ppvHeaders.indexOf('PPV - Last PO (USD)') + 1
+  const stdColNum    = cbomHeaders.length + ppvHeaders.indexOf('PPV - STD (USD)') + 1
+  const delta1ColNum = cbomHeaders.length + ppvHeaders.indexOf('Δ Last PO - Cost#1') + 1
+  const delta2ColNum = cbomHeaders.length + ppvHeaders.indexOf('Δ STD - Cost#1') + 1
+
+  const hdr = ws.getRow(1)
+  hdr.height = 24
+  hdr.eachCell({ includeEmpty: true }, (cell, colNum) => {
+    const isCbom  = colNum <= cbomHeaders.length
+    const isDelta = colNum === delta1ColNum || colNum === delta2ColNum
+    cell.fill      = { type: 'pattern', pattern: 'solid', fgColor: { argb: isCbom ? 'FF1E3A5F' : isDelta ? 'FF5B21B6' : 'FF065F46' } }
+    cell.font      = { bold: true, color: { argb: 'FFFFFFFF' }, size: 10, name: 'Calibri' }
+    cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: false }
+    cell.border    = {
+      bottom: { style: 'medium', color: { argb: isCbom ? 'FF2563EB' : isDelta ? 'FF8B5CF6' : 'FF059669' } },
+      right:  { style: 'thin',   color: { argb: 'FF374151' } },
+    }
+  })
+  ws.autoFilter = `A1:${ws.getColumn(totalCols).letter}1`
+
+  cbomRows.forEach((row, i) => {
+    const mpnRaw = String(row[cbomMpnColIdx] ?? '').trim()
+    const best   = getBestForMpn(mpnRaw)
+    const cost1  = cost1Idx >= 0 ? toNum(row[cost1Idx]) : null
+    // Δ = actual price − CBOM quoted price; negative = favorable (actual cheaper than quoted)
+    const delta1 = cost1 != null && best?.lastPoUsd != null ? best.lastPoUsd - cost1 : null
+    const delta2 = cost1 != null && best?.stdUsd    != null ? best.stdUsd    - cost1 : null
+
+    const ppvValues: (string | number | null)[] = best
+      ? [
+          ...(hasDeepAnalysis ? [best.source] : []),
+          best.internalPN || 'Not Found',
+          best.mpn        || 'Not Found',
+          best.plant      || 'Not Found',
+          best.supplier   || 'Not Found',
+          best.lastPoUsd  ?? 'Not Found',
+          best.stdUsd     ?? 'Not Found',
+          best.date       || 'Not Found',
+          delta1          ?? 'N/A',
+          delta2          ?? 'N/A',
+        ]
+      : Array(ppvHeaders.length).fill('Not Found') as string[]
+
+    const dr = ws.addRow([...row.map(v => v ?? ''), ...ppvValues])
+    dr.height = 18
+
+    const notFound = !best
+    // Green row when actual price is below quoted cost (favorable); red when above
+    const isFav    = delta1 != null && delta1 < 0
+    const isUnfav  = delta1 != null && delta1 > 0
+    const bgColor  = notFound ? 'FFFFF9C4' : isFav ? 'FFD1FAE5' : isUnfav ? 'FFFEE2E2' : i % 2 === 0 ? 'FFFFFFFF' : 'FFF8FAFC'
+    dr.eachCell({ includeEmpty: true }, cell => {
+      cell.fill      = { type: 'pattern', pattern: 'solid', fgColor: { argb: bgColor } }
+      cell.font      = { size: 9, name: 'Calibri' }
+      cell.alignment = { vertical: 'middle' }
+      cell.border    = { bottom: { style: 'thin', color: { argb: 'FFE5E7EB' } } }
+    })
+
+    // Format Last PO and STD price columns
+    for (const cn of [lpoColNum, stdColNum]) {
+      const c = dr.getCell(cn)
+      c.alignment = { horizontal: 'right', vertical: 'middle' }
+      if (typeof c.value === 'number') c.numFmt = '#,##0.000000'
+    }
+
+    // Format and colour-code the two delta columns
+    // Negative (−) = green (actual cheaper than quoted); Positive (+) = red (actual costlier)
+    for (const cn of [delta1ColNum, delta2ColNum]) {
+      const c = dr.getCell(cn)
+      c.alignment = { horizontal: 'right', vertical: 'middle' }
+      if (typeof c.value === 'number') {
+        c.numFmt = '#,##0.000000'
+        const v  = c.value as number
+        const argb = v < 0 ? 'FF166534' : v > 0 ? 'FFB91C1C' : 'FF374151'
+        const bg   = v < 0 ? 'FFD1FAE5' : v > 0 ? 'FFFEE2E2' : (bgColor === 'FFFFFFFF' ? 'FFFFFFFF' : 'FFF8FAFC')
+        c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: bg } }
+        c.font = { size: 9, name: 'Calibri', bold: true, color: { argb } }
+      }
+    }
+
+    if (notFound) {
+      for (let j = cbomHeaders.length + 1; j <= totalCols; j++)
+        dr.getCell(j).font = { size: 9, name: 'Calibri', color: { argb: 'FF9CA3AF' }, italic: true }
+    }
+  })
+
+  const buffer = await wb.xlsx.writeBuffer()
+  const blob   = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })
+  const url    = URL.createObjectURL(blob)
+  const a      = document.createElement('a')
+  a.href = url; a.download = filename; a.click()
+  URL.revokeObjectURL(url)
+}
 
 type Status = 'idle' | 'loading-ampl' | 'loading-iq' | 'loading-market' | 'done' | 'error'
 
@@ -1177,6 +1379,12 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
   const [deepAnalysisRows, setDeepAnalysisRows]                       = useState<DeepAnalysisRow[]>([])
   const [deepAnalysisLoading, setDeepAnalysisLoading]                 = useState(false)
   const abortDeepRef = useRef<AbortController | null>(null)
+
+  // ── CBOM upload state ─────────────────────────────────────────────────────
+  const [cbomRows, setCbomRows]           = useState<Array<(string | number | null)[]>>([])
+  const [cbomFileName, setCbomFileName]   = useState<string>('')
+  const [cbomHeaders, setCbomHeaders]     = useState<string[]>([])
+  const [cbomMpnColIdx, setCbomMpnColIdx] = useState<number>(-1)
 
   const reset = useCallback(() => {
     setAmpl(null); setIqRows([]); setPlants([]); setMarket(null)
@@ -1484,6 +1692,117 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
     }
   }, [])
 
+  // ── CBOM upload: reads the "CBOM" sheet, extracts all rows + their MPNs ──
+  const handleCbomUpload = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    e.target.value = ''
+    try {
+      const ExcelJS = (await import('exceljs')).default
+      const wb = new ExcelJS.Workbook()
+      await wb.xlsx.load(await file.arrayBuffer())
+
+      // Find the CBOM sheet (name may have trailing spaces)
+      const ws = wb.worksheets.find(s => s.name.trim().toUpperCase().startsWith('CBOM'))
+      if (!ws) { alert('No sheet starting with "CBOM" found in this file.'); return }
+
+      const resolveCell = (v: unknown): string | number | null => {
+        if (v == null) return null
+        if (v instanceof Date) return v.toISOString().slice(0, 10)
+        if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean')
+          return v as string | number
+        if (typeof v === 'object') {
+          // formula cell: { formula, result } or { richText }
+          const obj = v as Record<string, unknown>
+          if ('result' in obj && obj.result != null) return obj.result as string | number
+          if ('richText' in obj && Array.isArray(obj.richText))
+            return (obj.richText as Array<{ text: string }>).map(rt => rt.text).join('')
+          if ('text' in obj) return String(obj.text)
+        }
+        return String(v)
+      }
+
+      let headers: string[] = []
+      let mpnColIdx = -1
+      const dataRows: Array<(string | number | null)[]> = []
+
+      ws.eachRow((row, _rowNum) => {
+        // row.values is 1-indexed; convert to 0-indexed array
+        const rawVals = row.values as unknown[]
+        const maxCol = rawVals.length - 1
+        const rowArr: (string | number | null)[] = Array.from({ length: maxCol }, (_, i) =>
+          resolveCell(rawVals[i + 1])
+        )
+
+        // Detect header row: any cell contains exactly "Mfg Part Number"
+        const hdrIdx = rowArr.findIndex(v => String(v ?? '').trim() === 'Mfg Part Number')
+        if (hdrIdx !== -1) {
+          if (!headers.length) {
+            // First header row — capture column names and MPN column index
+            headers = rowArr.map(v => String(v ?? '').trim())
+            mpnColIdx = hdrIdx
+          }
+          return // skip header rows from data collection
+        }
+
+        if (mpnColIdx === -1) return // haven't found the header yet
+        const mpnVal = String(rowArr[mpnColIdx] ?? '').trim()
+        if (!mpnVal) return // skip rows without an MPN
+
+        // Normalize to exactly headers.length columns (pad or trim)
+        const normRow: (string | number | null)[] = Array.from(
+          { length: headers.length }, (_, k) => (k < rowArr.length ? rowArr[k] : null)
+        )
+        dataRows.push(normRow)
+      })
+
+      if (!headers.length) { alert('No header row with "Mfg Part Number" found in the CBOM sheet.'); return }
+      if (!dataRows.length) { alert('No data rows found in the CBOM sheet.'); return }
+
+      // Collect unique MPNs in the order they first appear
+      const seen = new Set<string>()
+      const uniqueMpns: string[] = []
+      for (const row of dataRows) {
+        const mpn = String(row[mpnColIdx] ?? '').trim().toUpperCase()
+        if (mpn && !seen.has(mpn)) { seen.add(mpn); uniqueMpns.push(mpn) }
+      }
+
+      // Extract Part Qty (column index 4 = "Part Qty") to pre-fill quantities
+      const partQtyIdx = headers.indexOf('Part Qty')
+      const qtys: Record<string, number> = {}
+      const defaults: Record<string, 'empty' | '0'> = {}
+      for (const row of dataRows) {
+        const mpn = String(row[mpnColIdx] ?? '').trim().toUpperCase()
+        if (!mpn) continue
+        if (partQtyIdx !== -1) {
+          const rawQty = row[partQtyIdx]
+          const isEmpty = rawQty === null || rawQty === undefined || String(rawQty).trim() === ''
+          const parsed = isEmpty ? NaN : Number(rawQty)
+          if (isFinite(parsed) && parsed > 0) {
+            qtys[mpn] = parsed
+          } else {
+            qtys[mpn] = 1000
+            defaults[mpn] = isEmpty ? 'empty' : '0'
+          }
+        } else {
+          if (!(mpn in qtys)) { qtys[mpn] = 1000; defaults[mpn] = 'empty' }
+        }
+      }
+
+      setCbomHeaders(headers)
+      setCbomRows(dataRows)
+      setCbomMpnColIdx(mpnColIdx)
+      setCbomFileName(file.name)
+      // Clear any previously-loaded simple Excel file and populate the textarea
+      setMpnExcelFileName('')
+      setMpnComponentQtys(qtys)
+      setMpnComponentQtyDefaults(defaults)
+      setMultiMpnInput(uniqueMpns.join('\n'))
+    } catch (err) {
+      alert('Error reading CBOM file: ' + (err instanceof Error ? err.message : String(err)))
+    }
+  }, [])
+
   const downloadMpnTemplate = useCallback(async () => {
     const ExcelJS = (await import('exceljs')).default
     const wb = new ExcelJS.Workbook()
@@ -1551,19 +1870,19 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
       const rows = Array.isArray(iqData.data) ? iqData.data : []
       setMultiMpnRawResults(rows)
 
-      // For each unique internalPN found in IQ results, fetch AMPL data in parallel
+      // For each unique internalPN found in IQ results, fetch AMPL data progressively
       const internalPNs = [...new Set(rows.map(r => r.internalPN).filter(Boolean))]
       if (internalPNs.length > 0 && !signal.aborted) {
-        const settled = await Promise.allSettled(
-          internalPNs.map(pn =>
-            apiPostWithRetry<AmplResponse>('/api/pricecalc/ampl', { internal_part_number: pn }, signal)
-          )
+        await Promise.allSettled(
+          internalPNs.map(async pn => {
+            try {
+              const amplData = await apiPostWithRetry<AmplResponse>('/api/pricecalc/ampl', { internal_part_number: pn }, signal)
+              if (!signal.aborted) {
+                setMultiMpnAmplMap(prev => ({ ...prev, [pn]: amplData }))
+              }
+            } catch { /* non-critical */ }
+          })
         )
-        const amplMap: Record<string, AmplResponse> = {}
-        settled.forEach((r, i) => {
-          if (r.status === 'fulfilled') amplMap[internalPNs[i]] = r.value
-        })
-        setMultiMpnAmplMap(amplMap)
       }
 
       // ── Nexar market fetch (per unique MPN) ──────────────────────────
@@ -2690,7 +3009,11 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                             </tr>
                           </thead>
                           <tbody className="divide-y divide-gray-100">
-                            {multiResults.map(r => (
+                            {[...multiResults]
+                              .filter(r => r.status === 'done' && typeof r.bestPriceUsd === 'number')
+                              .sort((a, b) => (a.bestPriceUsd ?? 0) - (b.bestPriceUsd ?? 0))
+                              .concat(multiResults.filter(r => !(r.status === 'done' && typeof r.bestPriceUsd === 'number')))
+                              .map(r => (
                               <tr key={r.bmatn} className={
                                 r.status === 'error'   ? 'bg-red-50' :
                                 r.status === 'loading' ? 'bg-blue-50/40 animate-pulse' :
@@ -3087,10 +3410,26 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                                 >×</button>
                               </span>
                             )}
+                            {cbomFileName && (
+                              <span className="flex items-center gap-1 text-[11px] text-orange-700 bg-orange-50 border border-orange-200 rounded-full px-2 py-0.5">
+                                <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+                                CBOM: {cbomFileName}
+                                <button
+                                  onClick={() => { setCbomFileName(''); setCbomRows([]); setCbomHeaders([]); setCbomMpnColIdx(-1); setMpnComponentQtys({}); setMpnComponentQtyDefaults({}); setMultiMpnInput('') }}
+                                  className="ml-1 text-orange-500 hover:text-red-500 font-bold leading-none"
+                                  title="Clear CBOM data"
+                                >×</button>
+                              </span>
+                            )}
                             <label className="flex items-center gap-1.5 cursor-pointer px-3 py-1 text-xs font-semibold rounded-lg bg-white border border-gray-300 hover:border-blue-400 hover:text-blue-600 text-gray-600 transition-colors">
                               <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" /></svg>
                               Upload Excel
                               <input type="file" accept=".xlsx,.xls" className="hidden" onChange={handleMpnExcelUpload} />
+                            </label>
+                            <label className="flex items-center gap-1.5 cursor-pointer px-3 py-1 text-xs font-semibold rounded-lg bg-white border border-orange-300 hover:border-orange-500 hover:text-orange-600 text-gray-600 transition-colors" title="Upload a Costed BOM (CBOM) Excel — extracts MPNs from the 'CBOM' sheet and generates an enriched export">
+                              <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+                              Upload CBOM
+                              <input type="file" accept=".xlsx,.xls" className="hidden" onChange={handleCbomUpload} />
                             </label>
                             <button
                               onClick={downloadMpnTemplate}
@@ -3381,13 +3720,33 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                                     Export Excel
                                   </button>
                                 )}
+                                {cbomRows.length > 0 && mpnEntries.length > 0 && (
+                                  <button
+                                    onClick={() => downloadCbomResultsExcel(
+                                      cbomHeaders, cbomRows, cbomMpnColIdx, mpnEntries, deepAnalysisRows,
+                                      `CBOM_PPV_${new Date().toISOString().slice(0, 10)}.xlsx`,
+                                    )}
+                                    className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-orange-700 bg-orange-50 hover:bg-orange-100 border border-orange-200 rounded-lg transition-colors whitespace-nowrap"
+                                    title={deepAnalysisRows.some(r => r.status === 'done')
+                                      ? 'Export CBOM enriched with Deep Analysis best-supplier winner (left join)'
+                                      : 'Export CBOM with PPV best-price results. Run Deep Analysis for optimal supplier selection.'}
+                                  >
+                                    <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+                                      <path strokeLinecap="round" strokeLinejoin="round" d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                                    </svg>
+                                    Export CBOM
+                                    {deepAnalysisRows.some(r => r.status === 'done') && (
+                                      <span className="ml-1 text-[10px] bg-indigo-100 text-indigo-700 rounded px-1 font-semibold">Deep</span>
+                                    )}
+                                  </button>
+                                )}
                               </div>
                             )
                           })()}
                         </div>
 
-                        {/* ── IQ Results: loading preview (while bulk API call is in progress) ── */}
-                        {multiMpnSubTab === 'results' && multiMpnLoading && multiMpnSearchedList.length > 0 && (
+                        {/* ── IQ Results: loading skeleton — only while the bulk IQ call is in-flight ── */}
+                        {multiMpnSubTab === 'results' && multiMpnLoading && multiMpnRawResults.length === 0 && multiMpnSearchedList.length > 0 && (
                           <div>
                             <p className="text-[10px] text-gray-400 mb-2">Cheapest Last PO (USD) within a {windowDays}-day window from the latest purchase date — one row per MPN</p>
                             <div className="overflow-x-auto rounded-xl border border-gray-200 shadow-sm">
@@ -3450,8 +3809,8 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                           </div>
                         )}
 
-                        {/* ── IQ Results: one best-price row per MPN ── */}
-                        {multiMpnSubTab === 'results' && !multiMpnLoading && (mpnEntries.length > 0 || multiMpnSearchedList.length > 0) && (
+                        {/* ── IQ Results: one best-price row per MPN — shows as soon as IQ data arrives ── */}
+                        {multiMpnSubTab === 'results' && (mpnEntries.length > 0 || (!multiMpnLoading && multiMpnSearchedList.length > 0)) && (
                           <div>
                             <p className="text-[10px] text-gray-400 mb-2">Cheapest Last PO (USD) within a {windowDays}-day window from the latest purchase date — one row per MPN</p>
                             <div className="overflow-x-auto rounded-xl border border-gray-200 shadow-sm">
@@ -3495,11 +3854,18 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                                     const nexarSeller  = nexarEntry?.nexarSeller ?? ''
                                     const bestInMarket = nexarBestUsd != null && lpoUsd != null && lpoUsd > 0 && nexarBestUsd < lpoUsd
                                     const bgColor    = isLpoGtStd ? 'bg-red-50 hover:bg-red-100/70' : isSwap ? 'bg-green-50 hover:bg-green-100/70' : i % 2 === 0 ? 'hover:bg-gray-50' : 'bg-gray-50/50 hover:bg-gray-100/50'
+                                    const amplStillLoading = multiMpnLoading && !!bestRow.internalPN && !(bestRow.internalPN in multiMpnAmplMap)
+                                    const resolvedAltPn    = multiMpnAmplMap[bestRow.internalPN]?.active.find(a => a.MfgPartNumber === bestRow.mpn)?.MpnPartNumber
                                     return (
                                       <tr key={mpn} className={bgColor}>
                                         <td className="px-2 py-2 text-center text-emerald-500 font-bold"></td>
                                         <td className="px-3 py-2 font-mono font-semibold text-emerald-700 whitespace-nowrap">{bestRow.mpn}</td>
-                                        <td className="px-3 py-2 font-mono text-gray-500 whitespace-nowrap">{(() => { const p = multiMpnAmplMap[bestRow.internalPN]?.active.find(a => a.MfgPartNumber === bestRow.mpn)?.MpnPartNumber; return p && p !== bestRow.mpn ? p : '—' })()}</td>
+                                        <td className="px-3 py-2 font-mono text-gray-500 whitespace-nowrap">
+                                          {amplStillLoading
+                                            ? <span className="inline-flex items-center text-blue-400 animate-pulse"><svg className="h-2.5 w-2.5 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"/></svg></span>
+                                            : (resolvedAltPn && resolvedAltPn !== bestRow.mpn ? resolvedAltPn : '—')
+                                          }
+                                        </td>
                                         <td className="px-3 py-2 text-gray-600 max-w-[180px] truncate" title={bestRow.supplierName || bestRow.englishName || ''}>{bestRow.supplierName || bestRow.englishName || '—'}</td>
                                         <td className="px-3 py-2 font-mono font-semibold text-blue-700 whitespace-nowrap">{mpn}</td>
                                         <td className="px-3 py-2 font-mono text-gray-700 whitespace-nowrap">{bestRow.internalPN || '—'}</td>

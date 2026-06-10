@@ -3,6 +3,7 @@ import { useState } from 'react'
 import type { ReactNode } from 'react'
 import { Filter, X, ChevronDown, Search } from 'lucide-react'
 import { usePPV } from '../store/ppvStore'
+import { PLANT_FLAGS, PLANT_NAMES, PLANT_COLORS } from '../utils/plants'
 
 // â”€â”€ Reusable collapsible filter section â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 interface FilterSectionProps {
@@ -13,14 +14,15 @@ interface FilterSectionProps {
   onToggleAll: () => void
   search: string
   onSearch: (v: string) => void
+  defaultExpanded?: boolean
   children: ReactNode
 }
 
 function FilterSection({
   title, selectedCount, totalCount, allSelected, onToggleAll,
-  search, onSearch, children,
+  search, onSearch, defaultExpanded = true, children,
 }: FilterSectionProps) {
-  const [expanded, setExpanded] = useState(true)
+  const [expanded, setExpanded] = useState(defaultExpanded)
   const deselected = totalCount - selectedCount
 
   return (
@@ -89,14 +91,36 @@ function FilterSection({
 // â”€â”€ Main component â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 export default function Sidebar() {
   const {
-    filterOptions, selectedGroups, selectedVendors,
-    setGroups, setVendors, applyFilters, loading,
+    filterOptions, selectedGroups, selectedVendors, params,
+    setGroups, setVendors, setPlants, setDateRange,
+    selectedPlants, selectedDateRange,
+    applyFilters, loading,
   } = usePPV()
   const [open, setOpen]               = useState(false)
   const [groupSearch, setGroupSearch] = useState('')
   const [vendorSearch, setVendorSearch] = useState('')
 
   if (!filterOptions) return null
+
+  // Plants
+  const availablePlants   = params?.Plants ?? []
+  const allPlantsSelected = availablePlants.length > 0 && selectedPlants.length >= availablePlants.length
+
+  const togglePlant = (p: string) => {
+    const next = selectedPlants.includes(p)
+      ? selectedPlants.filter(x => x !== p)
+      : [...selectedPlants, p]
+    setPlants(next)
+  }
+
+  // Date range
+  const defaultStart = params ? `${params.PostingStartDate.slice(0, 4)}-${params.PostingStartDate.slice(4, 6)}` : ''
+  const defaultEnd   = params ? `${params.PostingEndDate.slice(0, 4)}-${params.PostingEndDate.slice(4, 6)}` : ''
+  const curStart = selectedDateRange?.start ?? defaultStart
+  const curEnd   = selectedDateRange?.end   ?? defaultEnd
+  const dateRangeModified = selectedDateRange !== null && (
+    selectedDateRange.start !== defaultStart || selectedDateRange.end !== defaultEnd
+  )
 
   const toggleGroup = (g: string) => {
     const next = selectedGroups.includes(g)
@@ -119,10 +143,12 @@ export default function Sidebar() {
   const filteredVendors = filterOptions.vendors.filter(v =>
     v.toLowerCase().includes(vendorSearch.toLowerCase()))
 
-  // Badge: total items deselected
+  // Badge: total items deselected/modified
   const activeCount =
-    (allGroups  ? 0 : filterOptions.material_groups.length - selectedGroups.length) +
-    (allVendors ? 0 : filterOptions.vendors.length          - selectedVendors.length)
+    (allGroups         ? 0 : filterOptions.material_groups.length - selectedGroups.length) +
+    (allVendors        ? 0 : filterOptions.vendors.length          - selectedVendors.length) +
+    (allPlantsSelected || selectedPlants.length === 0 ? 0 : availablePlants.length - selectedPlants.length) +
+    (dateRangeModified ? 1 : 0)
 
   function handleApply() {
     applyFilters()
@@ -156,8 +182,8 @@ export default function Sidebar() {
       {/* â”€â”€ Floating panel â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
       {open && (
         <div
-          className="fixed bottom-[10.5rem] right-6 z-50 w-76 bg-white rounded-2xl shadow-2xl border border-slate-200 flex flex-col max-h-[70vh]"
-          style={{ width: '19rem' }}
+          className="fixed bottom-[5.5rem] right-6 z-50 bg-white rounded-2xl shadow-2xl border border-slate-200 flex flex-col"
+          style={{ width: '22rem', maxHeight: 'calc(100vh - 7rem)' }}
           onClick={e => e.stopPropagation()}
         >
           {/* Header */}
@@ -180,7 +206,82 @@ export default function Sidebar() {
           </div>
 
           {/* Scrollable content */}
-          <div className="flex-1 overflow-y-auto p-3 flex flex-col gap-3">
+          <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-3">
+
+            {/* Date Range */}
+            {params && (
+              <div className="flex flex-col border border-slate-200 rounded-xl overflow-hidden">
+                <div className="flex items-center justify-between px-3 py-2.5 bg-slate-50">
+                  <span className="text-xs font-semibold text-slate-600 uppercase tracking-wide">Date Range</span>
+                  {dateRangeModified && (
+                    <button
+                      type="button"
+                      className="text-[11px] text-brand font-medium hover:underline"
+                      onClick={() => setDateRange(null)}
+                    >
+                      Reset
+                    </button>
+                  )}
+                </div>
+                <div className="p-3 flex flex-col gap-2">
+                  <div className="flex items-center gap-3">
+                    <span className="text-[11px] text-slate-400 uppercase tracking-wide w-8 shrink-0">From</span>
+                    <input
+                      type="month"
+                      value={curStart}
+                      min={defaultStart}
+                      max={curEnd}
+                      className="flex-1 text-sm border border-slate-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-1 focus:ring-brand/50"
+                      onChange={e => setDateRange({ start: e.target.value, end: curEnd })}
+                    />
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <span className="text-[11px] text-slate-400 uppercase tracking-wide w-8 shrink-0">To</span>
+                    <input
+                      type="month"
+                      value={curEnd}
+                      min={curStart}
+                      max={defaultEnd}
+                      className="flex-1 text-sm border border-slate-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-1 focus:ring-brand/50"
+                      onChange={e => setDateRange({ start: curStart, end: e.target.value })}
+                    />
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Plants */}
+            {availablePlants.length > 1 && (
+              <div className="flex flex-col border border-slate-200 rounded-xl overflow-hidden">
+                <div className="flex items-center justify-between px-3 py-2.5 bg-slate-50">
+                  <span className="text-xs font-semibold text-slate-600 uppercase tracking-wide">Plant</span>
+                  <button
+                    type="button"
+                    className="text-[11px] text-brand font-medium hover:underline"
+                    onClick={() => setPlants(allPlantsSelected ? [] : availablePlants)}
+                  >
+                    {allPlantsSelected ? 'None' : 'All'}
+                  </button>
+                </div>
+                <div className="flex flex-col gap-1.5 p-3">
+                  {availablePlants.map(code => (
+                    <label key={code} className="flex items-center gap-2 text-xs text-slate-600 cursor-pointer hover:text-slate-900">
+                      <input
+                        type="checkbox"
+                        checked={selectedPlants.includes(code)}
+                        onChange={() => togglePlant(code)}
+                        className="accent-brand rounded"
+                      />
+                      <span className="flex items-center gap-1.5">
+                        <span className="w-2 h-2 rounded-full flex-shrink-0" style={{ background: PLANT_COLORS[code] ?? '#94a3b8' }} />
+                        <span>{PLANT_FLAGS[code] ?? '\u{1F3ED}'}</span>
+                        <span className="font-medium">{PLANT_NAMES[code] ?? code}</span>
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+            )}
 
             {/* Material Groups */}
             <FilterSection
@@ -191,6 +292,7 @@ export default function Sidebar() {
               onToggleAll={() => setGroups(allGroups ? [] : filterOptions.material_groups)}
               search={groupSearch}
               onSearch={setGroupSearch}
+              defaultExpanded={false}
             >
               {filteredGroups.length === 0
                 ? <p className="text-xs text-slate-400 italic py-1">No matches</p>
@@ -217,6 +319,7 @@ export default function Sidebar() {
               onToggleAll={() => setVendors(allVendors ? [] : filterOptions.vendors)}
               search={vendorSearch}
               onSearch={setVendorSearch}
+              defaultExpanded={false}
             >
               {filteredVendors.length === 0
                 ? <p className="text-xs text-slate-400 italic py-1">No matches</p>

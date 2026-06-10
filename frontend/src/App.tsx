@@ -13,10 +13,11 @@ import TabHierarchy     from './tabs/TabHierarchy'
 import TabDistribution  from './tabs/TabDistribution'
 import TabImpact        from './tabs/TabImpact'
 import TabAI            from './tabs/TabAI'
+import TabData          from './tabs/TabData'
 import {
   TrendingUp, Package2, Truck, Boxes,
-  Network, BarChart2, Crosshair, BrainCircuit,
-  AlertCircle, X,
+  Network, BarChart2, Crosshair, BrainCircuit, Table2,
+  AlertCircle, X, RefreshCw,
 } from 'lucide-react'
 
 const TABS = [
@@ -28,6 +29,7 @@ const TABS = [
   { id: 'distribution',  label: 'Distribution',    Icon: BarChart2   },
   { id: 'impact',        label: 'Impact',          Icon: Crosshair   },
   { id: 'ai',            label: 'AI Assistant',    Icon: BrainCircuit},
+  { id: 'data',          label: 'Data',            Icon: Table2      },
 ]
 
 const TAB_CONTENT: JSX.Element[] = [
@@ -39,10 +41,14 @@ const TAB_CONTENT: JSX.Element[] = [
   <TabDistribution />,
   <TabImpact />,
   <TabAI />,
+  <TabData />,
 ]
 
 function MainApp() {
-  const { analytics, activeTab, setTab, error, clearError, loading } = usePPV()
+  const {
+    analytics, activeTab, setTab, error, clearError, loading,
+    errorType, partialWarning, clearPartialWarning, lastQueryParams, query,
+  } = usePPV()
   const hasData = !!analytics
 
   return (
@@ -68,9 +74,54 @@ function MainApp() {
       {error && (
         <div className="fixed top-16 inset-x-0 z-50 flex justify-center pointer-events-none">
           <div className="pointer-events-auto bg-red-600 text-white rounded-xl shadow-lg px-5 py-3 flex items-center gap-3 max-w-xl fade-in">
-            <AlertCircle size={18} />
+            <AlertCircle size={18} className="flex-shrink-0" />
             <span className="text-sm flex-1">{error}</span>
+            {(errorType === 'connection' || errorType === 'timeout') && lastQueryParams && (
+              <button
+                onClick={() => {
+                  clearError()
+                  query(lastQueryParams.plants, lastQueryParams.start, lastQueryParams.end)
+                }}
+                className="flex items-center gap-1.5 text-xs font-semibold bg-white/20 hover:bg-white/30 px-2.5 py-1 rounded-lg whitespace-nowrap transition-colors"
+              >
+                <RefreshCw size={12} />
+                Retry
+              </button>
+            )}
             <button onClick={clearError}><X size={16} /></button>
+          </div>
+        </div>
+      )}
+
+      {/* ── Partial-data warning banner ───────────────────────────── */}
+      {partialWarning && (
+        <div className="bg-amber-50 border-b border-amber-200">
+          <div className="max-w-screen-2xl mx-auto px-4 py-2 flex items-start gap-2">
+            <AlertCircle size={14} className="text-amber-600 mt-0.5 flex-shrink-0" />
+            <p className="text-xs text-amber-800 flex-1">
+              <strong>Partial data —</strong>{' '}
+              {partialWarning.message}
+              {partialWarning.failedMonths.length > 0 && (
+                <span className="ml-1 text-amber-700">
+                  ({partialWarning.failedMonths.slice(0, 5).join(', ')}
+                  {partialWarning.failedMonths.length > 5 ? '…' : ''})
+                </span>
+              )}
+              {lastQueryParams && (
+                <button
+                  onClick={() => {
+                    clearPartialWarning()
+                    query(lastQueryParams.plants, lastQueryParams.start, lastQueryParams.end)
+                  }}
+                  className="ml-2 underline font-medium text-amber-700 hover:text-amber-900"
+                >
+                  Re-fetch missing months
+                </button>
+              )}
+            </p>
+            <button onClick={clearPartialWarning} className="text-amber-400 hover:text-amber-700 flex-shrink-0">
+              <X size={14} />
+            </button>
           </div>
         </div>
       )}

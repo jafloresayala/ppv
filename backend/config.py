@@ -4,8 +4,8 @@
 SAP_API_URL = "http://nts5102/SapGeneralApi/api/Financials/PPV"
 
 # ── Column aliases (must match _parse_df output) ─────────────────────────────
-COL_PPV   = "Total_Variance_Amount_num"
-COL_PRICE = "P_Price_difference_num"
+COL_PPV   = "PPDifference_currency"
+COL_PRICE = "PPDifference_currency"
 COL_FX    = "Exchange_rate_difference_num"
 # ── Redis cache (env vars override, see cache.py) ──────────────────────────
 # REDIS_HOST        = localhost  (env var, default shown)

@@ -231,11 +231,33 @@ def compute_material_groups(df: pd.DataFrame, ppv_col: str) -> dict:
             .agg(total="sum", records="count")
             .reset_index()
         )
+        # Per-material, per-plant totals — enriches drilldown rows with a by_plant map
+        _mat_plant_lookup: dict[tuple, dict] = {}
+        if "Plant" in df.columns:
+            _by_mp = (
+                df.groupby(["Material_Group_Description", "Material_Number", "Plant"])[ppv_col]
+                .sum().reset_index()
+            )
+            for _r in _by_mp.to_dict("records"):
+                _key = (str(_r["Material_Group_Description"]), str(_r["Material_Number"]))
+                _mat_plant_lookup.setdefault(_key, {})[str(_r["Plant"])] = _safe_float(_r[ppv_col])
+
         for gname, gdf in _by_mat.groupby("Material_Group_Description"):
-            srt = gdf.sort_values("total", ascending=False)
+            # Keep both lists explicitly sorted by their own business direction:
+            # unfavorable = highest positive PPV first, favorable = lowest (most negative) first.
+            unf = gdf[gdf["total"] > 0].sort_values("total", ascending=False)
+            fav = gdf[gdf["total"] <= 0].sort_values("total", ascending=True)
+
+            def _enrich(recs: list[dict], _g: str = str(gname)) -> list[dict]:
+                for rec in recs:
+                    bp = _mat_plant_lookup.get((_g, str(rec.get("Material_Number", ""))), {})
+                    if bp:
+                        rec["by_plant"] = bp
+                return recs
+
             drilldown[str(gname)] = {
-                "unfavorable": _to_records(srt[srt["total"] > 0].head(10)),
-                "favorable":   _to_records(srt[srt["total"] <= 0].head(10)),
+                "unfavorable": _enrich(_to_records(unf.head(10))),
+                "favorable":   _enrich(_to_records(fav.head(10))),
             }
 
     # per-group trend

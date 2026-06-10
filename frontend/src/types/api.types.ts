@@ -141,6 +141,23 @@ export interface MaterialsData {
   outliers:  Record<string, { outlier_indices: number[]; model: string }>
 }
 
+export interface TrendDetailRow {
+  date:        string
+  material:    string
+  group:       string
+  vendor:      string
+  plant:       string
+  ppv:         number
+  quantity:    number
+  po_price_k:  number
+  std_price_k: number
+}
+
+export interface TrendDetailData {
+  label: string
+  rows:  TrendDetailRow[]
+}
+
 export interface MaterialTrendData {
   material:  string
   desc:      string

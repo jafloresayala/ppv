@@ -25,6 +25,43 @@ function dominantPlant(by_plant?: Record<string, number>): string | null {
   )[0]
 }
 
+/**
+ * Compact per-plant horizontal mini-bars for a drilldown material row.
+ * Shows each plant’s contribution with a proportional color bar.
+ */
+function PlantMiniBar({ byPlant }: { byPlant: Record<string, number> }) {
+  const entries = Object.entries(byPlant)
+    .filter(([, v]) => v !== 0)
+    .sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]))
+  if (!entries.length) return <span className="text-slate-300 text-xs">—</span>
+  const maxAbs = Math.max(...entries.map(([, v]) => Math.abs(v)))
+  return (
+    <div className="flex flex-col gap-0.5 min-w-[130px]">
+      {entries.map(([plant, val]) => (
+        <div key={plant} className="flex items-center gap-1">
+          <span className="text-[11px] w-5 text-center leading-none flex-shrink-0">
+            {PLANT_FLAGS[plant] ?? '🏭'}
+          </span>
+          <div className="flex-1 h-1.5 bg-slate-100 rounded-full overflow-hidden" style={{ minWidth: 36 }}>
+            <div
+              className="h-full rounded-full"
+              style={{
+                width: `${(Math.abs(val) / maxAbs) * 100}%`,
+                background: PLANT_COLORS[plant] ?? '#94a3b8',
+              }}
+            />
+          </div>
+          <span className={`text-[10px] font-semibold w-11 text-right leading-none flex-shrink-0 ${
+            val > 0 ? 'text-danger' : 'text-success'
+          }`}>
+            {fmtK(val)}
+          </span>
+        </div>
+      ))}
+    </div>
+  )
+}
+
 export default function TabMaterialGroup() {
   const { analytics }     = usePPV()
   const mg                = analytics?.material_groups
@@ -316,27 +353,86 @@ export default function TabMaterialGroup() {
           </div>
 
           {drill && (
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+
+              {/* Unfavorable 🔴 */}
               <div>
                 <p className="text-sm font-semibold text-danger mb-2">Top 10 Unfavorable Components 🔴</p>
                 {drill.unfavorable.length
-                  ? <table className="tbl"><thead><tr><th>Material</th><th>PPV Total</th><th>Records</th></tr></thead>
-                    <tbody>{drill.unfavorable.map((r: any) => (
-                      <tr key={r.Material_Number}><td className="font-mono text-xs">{r.Material_Number}</td>
-                        <td className="text-danger font-medium">{fmt(r.total)}</td><td>{r.records}</td></tr>
-                    ))}</tbody></table>
+                  ? <div className="overflow-x-auto">
+                      <table className="tbl w-full">
+                        <thead>
+                          <tr>
+                            <th className="text-left">Material</th>
+                            <th>PPV Total</th>
+                            <th>Records</th>
+                            {hasPlants && <th className="text-left">Plants</th>}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {drill.unfavorable.map((r: any) => (
+                            <tr key={r.Material_Number}>
+                              <td className="font-mono text-xs">{r.Material_Number}</td>
+                              <td className="text-danger font-medium">{fmt(r.total)}</td>
+                              <td>{r.records}</td>
+                              {hasPlants && (
+                                <td className="py-1.5">
+                                  {r.by_plant && Object.keys(r.by_plant).length > 0
+                                    ? <PlantMiniBar byPlant={r.by_plant} />
+                                    : <span className="text-slate-300 text-xs">—</span>
+                                  }
+                                </td>
+                              )}
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
                   : <p className="text-xs text-slate-400 italic">No unfavorable components.</p>}
               </div>
+
+              {/* Favorable 🟢 */}
               <div>
                 <p className="text-sm font-semibold text-success mb-2">Top 10 Favorable Components 🟢</p>
                 {drill.favorable.length
-                  ? <table className="tbl"><thead><tr><th>Material</th><th>PPV Total</th><th>Records</th></tr></thead>
-                    <tbody>{drill.favorable.map((r: any) => (
-                      <tr key={r.Material_Number}><td className="font-mono text-xs">{r.Material_Number}</td>
-                        <td className="text-success font-medium">{fmt(r.total)}</td><td>{r.records}</td></tr>
-                    ))}</tbody></table>
+                  ? <div className="overflow-x-auto">
+                      <table className="tbl w-full">
+                        <thead>
+                          <tr>
+                            <th className="text-left">Material</th>
+                            <th>PPV Total</th>
+                            <th>Records</th>
+                            {hasPlants && <th className="text-left">Plants</th>}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {[...drill.favorable]
+                            .sort((a: any, b: any) => (a.total ?? 0) - (b.total ?? 0))
+                            .slice(0, 10)
+                            .map((r: any) => (
+                              <tr key={r.Material_Number}>
+                                <td className="font-mono text-xs">{r.Material_Number}</td>
+                                <td className="text-success font-medium">{fmt(r.total)}</td>
+                                <td>{r.records}</td>
+                                {hasPlants && (
+                                  <td className="py-1.5">
+                                    {r.by_plant && Object.keys(r.by_plant).length > 0
+                                      ? <PlantMiniBar byPlant={r.by_plant} />
+                                      : <span className="text-slate-300 text-xs">—</span>
+                                    }
+                                  </td>
+                                )}
+                              </tr>
+                            ))}
+                        </tbody>
+                      </table>
+                    </div>
                   : <p className="text-xs text-slate-400 italic">No favorable components.</p>}
+                <p className="text-[11px] text-slate-400 mt-2">
+                  Note: this list shows only the top 10 favorable materials in the selected group. The Selected Group amount is the net PPV of all materials (favorable + unfavorable) in that group.
+                </p>
               </div>
+
             </div>
           )}
 

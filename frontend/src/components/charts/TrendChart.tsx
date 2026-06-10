@@ -12,7 +12,7 @@ interface TooltipInfo {
   cumulative: number
 }
 
-interface Props { data: TrendData; height?: number }
+interface Props { data: TrendData; height?: number; onBarClick?: (label: string) => void }
 
 const PAD   = { l: 78, r: 76, t: 20, b: 52 }
 const GRID  = 6
@@ -31,7 +31,7 @@ const fmtK = (v: number) => {
 const fmtUSD = (v: number) =>
   `$${v.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`
 
-export default function TrendChart({ data, height = 340 }: Props) {
+export default function TrendChart({ data, height = 340, onBarClick }: Props) {
   const wrapRef   = useRef<HTMLDivElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const [tip, setTip] = useState<TooltipInfo | null>(null)
@@ -169,13 +169,27 @@ export default function TrendChart({ data, height = 340 }: Props) {
     })
   }
 
+  function handleClick(e: React.MouseEvent<HTMLCanvasElement>) {
+    if (!onBarClick) return
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const rect = canvas.getBoundingClientRect()
+    const mx   = e.clientX - rect.left
+    const cW   = rect.width - PAD.l - PAD.r
+    const step = cW / data.labels.length
+    const idx  = Math.floor((mx - PAD.l) / step)
+    if (idx < 0 || idx >= data.labels.length) return
+    onBarClick(data.labels[idx])
+  }
+
   return (
     <div ref={wrapRef} className="relative select-none">
       <canvas
         ref={canvasRef}
-        style={{ display: 'block', cursor: 'crosshair' }}
+        style={{ display: 'block', cursor: onBarClick ? 'pointer' : 'crosshair' }}
         onMouseMove={handleMouseMove}
         onMouseLeave={() => setTip(null)}
+        onClick={handleClick}
       />
 
       {tip && (
@@ -202,6 +216,9 @@ export default function TrendChart({ data, height = 340 }: Props) {
               {fmtUSD(tip.cumulative)}
             </span>
           </div>
+          {onBarClick && (
+            <p className="text-[10px] text-slate-400 mt-1.5 border-t border-slate-100 pt-1">Click to see records</p>
+          )}
         </div>
       )}
 

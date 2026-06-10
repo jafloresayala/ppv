@@ -9,6 +9,12 @@ Cache hierarchy
   ppv:ses:{session_id}                                   → {df, params}  (pickle)    2 h
   ppv:ana:{plant}:{start}:{end}:{filter_hash}            → analytics dict (JSON)     1 h
   ppv:fore:{plant}:{start}:{end}:{filter_hash}:{scale}   → forecast dict  (JSON)     2 h
+  ppv:drill:mgplant:{sid}:{fh}:{group}:{plant}         → mg-plant components (JSON) 2 h
+  ppv:drill:hdrll:{sid}:{fh}:{hier}:{ym}:{n}          → hierarchy drill     (JSON) 2 h
+  ppv:drill:mattrend:{sid}:{fh}:{material}             → material trend      (JSON) 2 h
+  ppv:drill:vndtrend:{sid}:{fh}:{material}             → vendor price trend  (JSON) 2 h
+  ppv:drill:vndmon:{sid}:{vendor_hash}:{yearmonth}     → vendor month records (JSON) 2 h
+  ppv:drill:mgsap:{plant}:{mats_hash}                  → mg-sap batch result (JSON) 1 h
 
 If Redis is unreachable the app falls back to an in-memory dict (same behaviour
 as before) — no errors, no configuration required.
@@ -56,6 +62,7 @@ TTL_SESSION  = int(os.getenv("CACHE_TTL_SESSION",    str(2 * 3600)))  # 2 h
 TTL_ANALYTIC = int(os.getenv("CACHE_TTL_ANALYTICS",  str(1 * 3600)))  # 1 h
 TTL_FORECAST = int(os.getenv("CACHE_TTL_FORECAST",   str(2 * 3600)))  # 2 h
 TTL_MASTER   = int(os.getenv("CACHE_TTL_MASTER",     str(8 * 3600)))  # 8 h — plant master dataset
+TTL_DRILL    = int(os.getenv("CACHE_TTL_DRILL",       str(2 * 3600)))  # 2 h — floating-window drill-downs (matches session lifetime)
 
 # ── In-memory fallback (same TTL is ignored — data lives for process lifetime) 
 _fallback: dict[str, bytes] = {}

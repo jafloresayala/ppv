@@ -3,8 +3,17 @@ import axios from 'axios'
 import type {
   QueryResponse, Analytics, ForecastData, SearchResult, ChatMessage,
   HierarchyDrillData, SourcingResult, MaterialTrendData, MGPlantComponentsData,
-  SapBatchResponse,
+  SapBatchResponse, TrendDetailData,
 } from '../types/api.types'
+
+// Shared filter type for all analytics endpoints
+export type Filters = {
+  material_groups?: string[]
+  vendors?:         string[]
+  plants?:          string[]
+  date_start?:      string    // "YYYY-MM"
+  date_end?:        string    // "YYYY-MM"
+}
 
 // Base instance — long default for all requests
 const http = axios.create({ baseURL: '/api', timeout: 600_000 })
@@ -20,7 +29,7 @@ export async function queryApi(plants: string[], startDate: string, endDate: str
 
 export async function getAnalytics(
   sessionId: string,
-  filters: { material_groups?: string[]; vendors?: string[] },
+  filters: Filters,
 ): Promise<Analytics> {
   const { data } = await http.post<Analytics>('/analytics', {
     session_id: sessionId,
@@ -31,7 +40,7 @@ export async function getAnalytics(
 
 export async function getForecast(
   sessionId: string,
-  filters:   { material_groups?: string[]; vendors?: string[] },
+  filters:   Filters,
   scaleMethod = 'StandardScaler',
 ): Promise<ForecastData> {
   const { data } = await http.post<ForecastData>('/forecast', {
@@ -59,7 +68,7 @@ export async function sendChatStream(
   messages:  ChatMessage[],
   onChunk:   (text: string) => void,
   sessionId?: string,
-  filters?:   { material_groups?: string[]; vendors?: string[] },
+  filters?:   Filters,
 ): Promise<void> {
   const body: Record<string, unknown> = { messages }
   if (sessionId) { body.session_id = sessionId; body.filters = filters ?? {} }
@@ -93,7 +102,7 @@ export async function sendChatStream(
 
 export async function getHierarchyDrill(
   sessionId:     string,
-  filters:       { material_groups?: string[]; vendors?: string[] },
+  filters:       Filters,
   hierarchyCode: string,
   yearMonth:     string,
 ): Promise<HierarchyDrillData> {
@@ -116,7 +125,7 @@ export async function getSourcing(
 
 export async function getMaterialTrend(
   sessionId: string,
-  filters:   { material_groups?: string[]; vendors?: string[] },
+  filters:   Filters,
   materialNumber: string,
 ): Promise<MaterialTrendData> {
   const { data } = await http.post<MaterialTrendData>('/material-trend', {
@@ -140,7 +149,7 @@ export async function getMGSapBatch(
 
 export async function getMGPlantComponents(
   sessionId: string,
-  filters:   { material_groups?: string[]; vendors?: string[] },
+  filters:   Filters,
   group:     string,
   plant:     string,
 ): Promise<MGPlantComponentsData> {
@@ -150,5 +159,44 @@ export async function getMGPlantComponents(
     group,
     plant,
   })
+  return data
+}
+
+export async function getTrendDetail(
+  sessionId:   string,
+  filters:     Filters,
+  label:       string,
+  granularity: string,
+): Promise<TrendDetailData> {
+  const { data } = await http.post<TrendDetailData>('/trend-detail', {
+    session_id:  sessionId,
+    filters,
+    label,
+    granularity,
+  })
+  return data
+}
+
+export interface RawDataResponse {
+  columns:     string[]
+  records:     Record<string, unknown>[]
+  total_rows:  number
+  total_pages: number
+  page:        number
+  page_size:   number
+}
+
+export async function getRawData(
+  sessionId: string,
+  filters:   Filters,
+  page:      number,
+  pageSize:  number,
+): Promise<RawDataResponse> {
+  const { data } = await http.post<RawDataResponse>('/raw-data', {
+    session_id: sessionId,
+    filters,
+    page,
+    page_size: pageSize,
+  }, { timeout: 60_000 })
   return data
 }
