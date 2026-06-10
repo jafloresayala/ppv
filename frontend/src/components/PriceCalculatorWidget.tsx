@@ -1245,13 +1245,38 @@ async function downloadCbomResultsExcel(
   })
   ws.autoFilter = `A1:${ws.getColumn(totalCols).letter}1`
 
+  // ── Analysis accumulators ───────────────────────────────────────────────────
+  type AnalysisRow = {
+    mpn: string; internalPN: string; supplier: string; plant: string
+    cost1: number | null; lastPoUsd: number | null; stdUsd: number | null
+    delta1: number | null; delta2: number | null
+  }
+  let statTotal = 0, statNotFound = 0, statFav = 0, statUnfav = 0, statNeutral = 0
+  const analysisRows: AnalysisRow[] = []
+
   cbomRows.forEach((row, i) => {
     const mpnRaw = String(row[cbomMpnColIdx] ?? '').trim()
     const best   = getBestForMpn(mpnRaw)
     const cost1  = cost1Idx >= 0 ? toNum(row[cost1Idx]) : null
     // Δ = actual price − CBOM quoted price; negative = favorable (actual cheaper than quoted)
-    const delta1 = cost1 != null && best?.lastPoUsd != null ? best.lastPoUsd - cost1 : null
-    const delta2 = cost1 != null && best?.stdUsd    != null ? best.stdUsd    - cost1 : null
+    const delta1 = cost1 != null && best?.lastPoUsd != null ? cost1 - best.lastPoUsd : null
+    const delta2 = cost1 != null && best?.stdUsd    != null ? cost1 - best.stdUsd    : null
+
+    // Accumulate stats
+    statTotal++
+    if (!best) { statNotFound++ }
+    else if (delta1 == null) { statNeutral++ }
+    else if (delta1 < 0) { statFav++ }
+    else if (delta1 > 0) { statUnfav++ }
+    else { statNeutral++ }
+
+    if (best) {
+      analysisRows.push({
+        mpn: best.mpn || mpnRaw, internalPN: best.internalPN || '',
+        supplier: best.supplier || '', plant: best.plant || '',
+        cost1, lastPoUsd: best.lastPoUsd, stdUsd: best.stdUsd, delta1, delta2,
+      })
+    }
 
     const ppvValues: (string | number | null)[] = best
       ? [
@@ -1310,6 +1335,131 @@ async function downloadCbomResultsExcel(
         dr.getCell(j).font = { size: 9, name: 'Calibri', color: { argb: 'FF9CA3AF' }, italic: true }
     }
   })
+
+  // ── Analysis Sheet ───────────────────────────────────────────────────────────
+  const wa = wb.addWorksheet('Analysis', { views: [{ showGridLines: false }] })
+
+  const addCell = (
+    row: number, col: number, value: string | number | Date | null,
+    opts?: { bold?: boolean; bg?: string; font?: string; numFmt?: string; align?: 'left'|'center'|'right'; size?: number; italic?: boolean }
+  ) => {
+    const c = wa.getCell(row, col)
+    c.value = value
+    if (opts?.numFmt) c.numFmt = opts.numFmt
+    c.font = { name: 'Calibri', size: opts?.size ?? 10, bold: opts?.bold, italic: opts?.italic, color: { argb: opts?.font ?? 'FF111827' } }
+    c.alignment = { horizontal: opts?.align ?? 'left', vertical: 'middle' }
+    if (opts?.bg) c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: opts.bg } }
+    c.border = { bottom: { style: 'thin', color: { argb: 'FFE5E7EB' } }, right: { style: 'thin', color: { argb: 'FFE5E7EB' } } }
+    return c
+  }
+
+  const sectionTitle = (row: number, title: string, bgArgb: string) => {
+    wa.mergeCells(row, 1, row, 8)
+    const c = wa.getCell(row, 1)
+    c.value = title
+    c.font      = { name: 'Calibri', size: 12, bold: true, color: { argb: 'FFFFFFFF' } }
+    c.fill      = { type: 'pattern', pattern: 'solid', fgColor: { argb: bgArgb } }
+    c.alignment = { horizontal: 'left', vertical: 'middle', indent: 1 }
+    wa.getRow(row).height = 26
+  }
+
+  // ── Meta header ──────────────────────────────────────────────────────────────
+  let r = 1
+  sectionTitle(r++, '📊  CBOM Analysis Summary', 'FF1E3A5F')
+  addCell(r, 1, 'Generated:', { bold: true, bg: 'FFF1F5F9' })
+  wa.mergeCells(r, 2, r, 5)
+  addCell(r, 2, new Date().toLocaleString(), { bg: 'FFF1F5F9' })
+  wa.getRow(r).height = 18; r++
+  addCell(r, 1, 'File:', { bold: true, bg: 'FFF1F5F9' })
+  wa.mergeCells(r, 2, r, 5)
+  addCell(r, 2, filename, { bg: 'FFF1F5F9' })
+  wa.getRow(r).height = 18; r++
+  r++ // blank row
+
+  // ── Row Classification ───────────────────────────────────────────────────────
+  sectionTitle(r++, '🔢  Row Classification', 'FF1E3A5F')
+  addCell(r, 1, 'Category',   { bold: true, bg: 'FF334155', font: 'FFFFFFFF', align: 'center' })
+  addCell(r, 2, 'Count',      { bold: true, bg: 'FF334155', font: 'FFFFFFFF', align: 'center' })
+  addCell(r, 3, '% of Total', { bold: true, bg: 'FF334155', font: 'FFFFFFFF', align: 'center' })
+  wa.getRow(r).height = 20; r++
+
+  const pct = (n: number) => statTotal > 0 ? `${+(n / statTotal * 100).toFixed(1)}%` : '0%'
+  const summaryRows: [string, number, string][] = [
+    ['Total CBOM rows',      statTotal,    'FF374151'],
+    ['Favorable — green ✅', statFav,      'FF166534'],
+    ['Unfavorable — red ❌', statUnfav,    'FFB91C1C'],
+    ['Not Found ⚪',         statNotFound, 'FF6B7280'],
+    ['No delta (N/A) ➖',   statNeutral,  'FF92400E'],
+  ]
+  for (const [label, count, fontArgb] of summaryRows) {
+    const bg = label.startsWith('Favorable') ? 'FFD1FAE5' : label.startsWith('Unfavorable') ? 'FFFEE2E2' : label.startsWith('Not Found') ? 'FFFFF9C4' : 'FFFFFFFF'
+    addCell(r, 1, label, { bg, font: fontArgb, bold: label === 'Total CBOM rows' })
+    addCell(r, 2, count, { bg, align: 'center', bold: true, font: fontArgb })
+    addCell(r, 3, pct(count), { bg, align: 'center' })
+    wa.getRow(r).height = 18; r++
+  }
+  r++ // blank row
+
+  // ── Critical items builder ───────────────────────────────────────────────────
+  const TOP = 10
+  const critByLpo = [...analysisRows].filter(a => a.delta1 != null).sort((a, b) => b.delta1! - a.delta1!)
+  const critByStd = [...analysisRows].filter(a => a.delta2 != null).sort((a, b) => b.delta2! - a.delta2!)
+
+  const buildCritTable = (
+    startRow: number, title: string, titleBg: string,
+    items: AnalysisRow[], priceLabel: string, deltaLabel: string,
+    getPrice: (a: AnalysisRow) => number | null,
+    getDelta: (a: AnalysisRow) => number | null,
+  ): number => {
+    sectionTitle(startRow++, title, titleBg)
+    const headers: [string, number][] = [
+      ['#', 4], ['MPN', 28], ['Internal PN', 22], ['Supplier', 30],
+      ['Plant', 10], [priceLabel, 18], ['Cost #1 (Conv.)', 18], [deltaLabel, 22],
+    ]
+    headers.forEach(([h, w], ci) => {
+      wa.getColumn(ci + 1).width = Math.max(wa.getColumn(ci + 1).width as number ?? 0, w)
+      addCell(startRow, ci + 1, h, { bold: true, bg: 'FF334155', font: 'FFFFFFFF', align: 'center' })
+    })
+    wa.getRow(startRow).height = 20; startRow++
+
+    items.slice(0, TOP).forEach((item, idx) => {
+      const delta    = getDelta(item)
+      const price    = getPrice(item)
+      const isFav    = delta != null && delta < 0
+      const isUnfav  = delta != null && delta > 0
+      const bg       = isFav ? 'FFD1FAE5' : isUnfav ? 'FFFEE2E2' : 'FFFFFFFF'
+      const fontDelta = isFav ? 'FF166534' : isUnfav ? 'FFB91C1C' : 'FF374151'
+      addCell(startRow, 1, idx + 1,        { bg, align: 'center', bold: true })
+      addCell(startRow, 2, item.mpn,        { bg, font: 'FF1E3A5F', bold: true })
+      addCell(startRow, 3, item.internalPN, { bg })
+      addCell(startRow, 4, item.supplier,   { bg })
+      addCell(startRow, 5, item.plant,      { bg, align: 'center' })
+      const priceC = addCell(startRow, 6, price,      { bg, align: 'right', numFmt: '#,##0.000000' })
+      const cost1C = addCell(startRow, 7, item.cost1, { bg, align: 'right', numFmt: '#,##0.000000' })
+      const deltaC = addCell(startRow, 8, delta,      { bg: isFav ? 'FFD1FAE5' : isUnfav ? 'FFFEE2E2' : bg, align: 'right', numFmt: '#,##0.000000', bold: true, font: fontDelta })
+      if (price == null) priceC.value = 'N/A'
+      if (item.cost1 == null) cost1C.value = 'N/A'
+      if (delta == null) deltaC.value = 'N/A'
+      wa.getRow(startRow).height = 18; startRow++
+    })
+    return startRow
+  }
+
+  r = buildCritTable(
+    r,
+    `⚠️  Top ${TOP} Most Critical — Δ Last PO vs Cost #1 (highest delta first)`,
+    'FF7C2D12',
+    critByLpo, 'Last PO (USD)', 'Δ Last PO - Cost#1',
+    a => a.lastPoUsd, a => a.delta1,
+  )
+  r++
+  r = buildCritTable(
+    r,
+    `⚠️  Top ${TOP} Most Critical — Δ STD vs Cost #1 (highest delta first)`,
+    'FF4C1D95',
+    critByStd, 'STD (USD)', 'Δ STD - Cost#1',
+    a => a.stdUsd, a => a.delta2,
+  )
 
   const buffer = await wb.xlsx.writeBuffer()
   const blob   = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })
