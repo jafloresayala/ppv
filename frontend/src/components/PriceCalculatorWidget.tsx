@@ -691,7 +691,7 @@ async function downloadMpnExcelFile(
   filename: string,
   ctx: {
     mpnComponentQtys: Record<string, number>
-    mpnNexarMap: Record<string, { nexarBestUsd: number | null; nexarSeller: string }>
+    mpnNexarMap: Record<string, { nexarBestUsd: number | null; nexarSeller: string; nexarManufacturer: string; nexarStock: number | null; nexarMoq: number | null; nexarMpn: string }>
     myPlant: string
     qty: number
   },
@@ -1122,6 +1122,8 @@ async function downloadCbomResultsExcel(
   cbomMpnColIdx: number,
   mpnEntries: Array<{ mpn: string; bestRow: IQItem; allRows: IQItem[] }>,
   deepAnalysisRows: DeepAnalysisRow[],
+  mpnNexarMap: Record<string, { nexarBestUsd: number | null; nexarSeller: string; nexarManufacturer: string; nexarStock: number | null; nexarMoq: number | null; nexarMpn: string }>,
+  lyticaMap: Record<string, { mpnMatched: string; manufacturerMatched: string; price90th: number | null }>,
   filename: string,
 ): Promise<void> {
   // ── Lookup maps ─────────────────────────────────────────────────────────────
@@ -1197,6 +1199,14 @@ async function downloadCbomResultsExcel(
     }
   }
 
+  // ── Nexar best for a given MPN (from the map) ────────────────────────────────
+  const hasNexarData = Object.keys(mpnNexarMap).length > 0
+  const getNexarForMpn = (mpnRaw: string) => mpnNexarMap[mpnRaw.toUpperCase()] ?? mpnNexarMap[mpnRaw] ?? null
+
+  // ── Lytica lookup for a given MPN ────────────────────────────────────────────
+  const hasLyticaData = Object.keys(lyticaMap).length > 0
+  const getLyticaForMpn = (mpnRaw: string) => lyticaMap[mpnRaw.toUpperCase()] ?? lyticaMap[mpnRaw] ?? null
+
   // ── Build worksheet ─────────────────────────────────────────────────────────
   const ExcelJS = (await import('exceljs')).default
   const wb = new ExcelJS.Workbook()
@@ -1205,7 +1215,6 @@ async function downloadCbomResultsExcel(
   const ws = wb.addWorksheet('CBOM + PPV Results', { views: [{ state: 'frozen', ySplit: 1 }] })
 
   const ppvHeaders: string[] = [
-    ...(hasDeepAnalysis ? ['PPV - Source'] : []),
     'PPV - Internal PN',
     'PPV - MPN',
     'PPV - Plant',
@@ -1213,41 +1222,63 @@ async function downloadCbomResultsExcel(
     'PPV - Last PO (USD)',
     'PPV - STD (USD)',
     'PPV - Date',
-    'Δ Last PO - Cost#1',  // Last PO (USD) − Cost #1 (Conv.); negative = favorable (actual < quoted)
-    'Δ STD - Cost#1',      // STD (USD)    − Cost #1 (Conv.); negative = favorable
+    ...(hasNexarData ? [
+      'Nexar - MPN',
+      'Nexar - Manufacturer',
+      'Nexar - Supplier',
+      'Nexar - Unit Price (USD)',
+      'Nexar - Stock',
+      'Nexar - MOQ',
+    ] : []),
+    ...(hasLyticaData ? [
+      'Lytica - MPN Searched',
+      'Lytica - MPN Matched',
+      'Lytica - Manufacturer Matched',
+      'Lytica - 90th %tile',
+    ] : []),
+    'PPV - Best Source',
+    'PPV - Best Price',
+    'Δ Last PO - Cost#1',
+    'Δ STD - Cost#1',
   ]
 
   const colWidth = (h: string) => Math.min(Math.max((h?.length ?? 0) + 4, 10), 40)
   ws.columns = [
     ...cbomHeaders.map((h, i) => ({ header: h || `Col${i + 1}`, key: `c${i}`, width: colWidth(h) })),
-    ...ppvHeaders.map(h => ({ header: h, key: h, width: h.startsWith('Δ') ? 24 : 24 })),
+    ...ppvHeaders.map(h => ({ header: h, key: h, width: h.startsWith('Nexar') || h.startsWith('Lytica') ? 26 : 24 })),
   ]
 
   const totalCols    = cbomHeaders.length + ppvHeaders.length
-  // 1-based column numbers for the PPV price and delta columns
-  const lpoColNum    = cbomHeaders.length + ppvHeaders.indexOf('PPV - Last PO (USD)') + 1
-  const stdColNum    = cbomHeaders.length + ppvHeaders.indexOf('PPV - STD (USD)') + 1
-  const delta1ColNum = cbomHeaders.length + ppvHeaders.indexOf('Δ Last PO - Cost#1') + 1
-  const delta2ColNum = cbomHeaders.length + ppvHeaders.indexOf('Δ STD - Cost#1') + 1
+  // 1-based column numbers (calculated from position in ppvHeaders, order-independent)
+  const lpoColNum         = cbomHeaders.length + ppvHeaders.indexOf('PPV - Last PO (USD)') + 1
+  const stdColNum         = cbomHeaders.length + ppvHeaders.indexOf('PPV - STD (USD)') + 1
+  const delta1ColNum      = cbomHeaders.length + ppvHeaders.indexOf('Δ Last PO - Cost#1') + 1
+  const delta2ColNum      = cbomHeaders.length + ppvHeaders.indexOf('Δ STD - Cost#1') + 1
+  const nexarPriceColNum  = hasNexarData  ? cbomHeaders.length + ppvHeaders.indexOf('Nexar - Unit Price (USD)') + 1 : -1
+  const lytica90ColNum    = hasLyticaData ? cbomHeaders.length + ppvHeaders.indexOf('Lytica - 90th %tile') + 1 : -1
+  const bestSourceColNum  = cbomHeaders.length + ppvHeaders.indexOf('PPV - Best Source') + 1
+  const bestPriceColNum   = cbomHeaders.length + ppvHeaders.indexOf('PPV - Best Price') + 1
 
   const hdr = ws.getRow(1)
   hdr.height = 24
   hdr.eachCell({ includeEmpty: true }, (cell, colNum) => {
-    const isCbom  = colNum <= cbomHeaders.length
-    const isDelta = colNum === delta1ColNum || colNum === delta2ColNum
-    cell.fill      = { type: 'pattern', pattern: 'solid', fgColor: { argb: isCbom ? 'FF1E3A5F' : isDelta ? 'FF5B21B6' : 'FF065F46' } }
+    const isCbom      = colNum <= cbomHeaders.length
+    const isDelta     = colNum === delta1ColNum || colNum === delta2ColNum
+    const isNexar     = nexarPriceColNum > 0 && colNum >= nexarPriceColNum - 3 && colNum <= nexarPriceColNum + 2
+    const isLytica    = lytica90ColNum > 0 && colNum >= lytica90ColNum - 3 && colNum <= lytica90ColNum
+    const isBestGroup = colNum === bestSourceColNum || colNum === bestPriceColNum
+    const bg = isCbom ? 'FF1E3A5F' : isDelta ? 'FF5B21B6' : isNexar ? 'FF7C2D12' : isLytica ? 'FF0F766E' : isBestGroup ? 'FF0C4A6E' : 'FF065F46'
+    const border = isCbom ? 'FF2563EB' : isDelta ? 'FF8B5CF6' : isNexar ? 'FFDC2626' : isLytica ? 'FF14B8A6' : isBestGroup ? 'FF0EA5E9' : 'FF059669'
+    cell.fill      = { type: 'pattern', pattern: 'solid', fgColor: { argb: bg } }
     cell.font      = { bold: true, color: { argb: 'FFFFFFFF' }, size: 10, name: 'Calibri' }
     cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: false }
-    cell.border    = {
-      bottom: { style: 'medium', color: { argb: isCbom ? 'FF2563EB' : isDelta ? 'FF8B5CF6' : 'FF059669' } },
-      right:  { style: 'thin',   color: { argb: 'FF374151' } },
-    }
+    cell.border    = { bottom: { style: 'medium', color: { argb: border } }, right: { style: 'thin', color: { argb: 'FF374151' } } }
   })
   ws.autoFilter = `A1:${ws.getColumn(totalCols).letter}1`
 
   // ── Analysis accumulators ───────────────────────────────────────────────────
   type AnalysisRow = {
-    mpn: string; internalPN: string; supplier: string; plant: string
+    mpn: string; internalPN: string; supplier: string; plant: string; bestSource: string
     cost1: number | null; lastPoUsd: number | null; stdUsd: number | null
     delta1: number | null; delta2: number | null
   }
@@ -1255,48 +1286,102 @@ async function downloadCbomResultsExcel(
   const analysisRows: AnalysisRow[] = []
 
   cbomRows.forEach((row, i) => {
-    const mpnRaw = String(row[cbomMpnColIdx] ?? '').trim()
-    const best   = getBestForMpn(mpnRaw)
-    const cost1  = cost1Idx >= 0 ? toNum(row[cost1Idx]) : null
-    // Δ = actual price − CBOM quoted price; negative = favorable (actual cheaper than quoted)
-    const delta1 = cost1 != null && best?.lastPoUsd != null ? cost1 - best.lastPoUsd : null
-    const delta2 = cost1 != null && best?.stdUsd    != null ? cost1 - best.stdUsd    : null
+    const mpnRaw    = String(row[cbomMpnColIdx] ?? '').trim()
+    const sapBest   = getBestForMpn(mpnRaw)                            // SAP winner (null if not found)
+    const cost1     = cost1Idx >= 0 ? toNum(row[cost1Idx]) : null
+
+    // Always look up Nexar / Lytica regardless of SAP result
+    const nexarEntry  = getNexarForMpn(mpnRaw)
+    const lyticaEntry = getLyticaForMpn(mpnRaw)
+
+    // ── Determine overall winner across all sources ──────────────────────────
+    type WinSrc = 'sap' | 'nexar' | 'lytica' | 'tie'
+    const priceCands: Array<[WinSrc, number]> = []
+    if (sapBest?.lastPoUsd != null)       priceCands.push(['sap',    sapBest.lastPoUsd])
+    if (nexarEntry?.nexarBestUsd != null) priceCands.push(['nexar',  nexarEntry.nexarBestUsd])
+    if (lyticaEntry?.price90th != null)   priceCands.push(['lytica', lyticaEntry.price90th])
+
+    let winSrc: WinSrc | null = null
+    let winPrice: number | null = null
+    if (priceCands.length > 0) {
+      const minP = Math.min(...priceCands.map(([, p]) => p))
+      const mins = priceCands.filter(([, p]) => p === minP)
+      winSrc   = mins.length === 1 ? mins[0][0] : 'tie'
+      winPrice = minP
+    }
+
+    // Only SAP exposes a STD price; Nexar/Lytica have no STD
+    const winnerStd = (winSrc === 'sap' || winSrc === 'tie') ? (sapBest?.stdUsd ?? null) : null
+
+    // Deltas: Cost#1 (Conv.) minus the best-market price
+    const delta1 = cost1 != null && winPrice    != null ? cost1 - winPrice    : null
+    const delta2 = cost1 != null && winnerStd   != null ? cost1 - winnerStd   : null
+
+    // Best-source label for the report column
+    const sapSrcLabel  = sapBest?.source || 'SAP'
+    const sapSrcFull   = sapSrcLabel.startsWith('Multi-MPN') ? 'SAP MPN' : sapSrcLabel.startsWith('Multi-Comp') || sapSrcLabel.startsWith('Tie') ? 'SAP COMPONENT' : 'SAP MPN'
+    const bestSourceLabel = winSrc === 'sap'    ? sapSrcFull
+      : winSrc === 'nexar'  ? 'NEXAR MARKET'
+      : winSrc === 'lytica' ? 'LYTICA'
+      : winSrc === 'tie'    ? 'TIE'
+      : 'Not Found'
+
+    // "truly not found" = nothing from any source, OR something returned but zero usable prices
+    const anyFound   = sapBest != null || nexarEntry != null || lyticaEntry != null
+    const noPrice    = winSrc === null   // sources found but none had an actual price
 
     // Accumulate stats
     statTotal++
-    if (!best) { statNotFound++ }
-    else if (delta1 == null) { statNeutral++ }
-    else if (delta1 < 0) { statFav++ }
-    else if (delta1 > 0) { statUnfav++ }
-    else { statNeutral++ }
+    if (!anyFound || noPrice)    { statNotFound++ }
+    else if (delta1 == null)     { statNeutral++  }
+    else if (delta1 < 0)         { statFav++      }
+    else if (delta1 > 0)         { statUnfav++    }
+    else                         { statNeutral++  }
 
-    if (best) {
+    if (anyFound) {
       analysisRows.push({
-        mpn: best.mpn || mpnRaw, internalPN: best.internalPN || '',
-        supplier: best.supplier || '', plant: best.plant || '',
-        cost1, lastPoUsd: best.lastPoUsd, stdUsd: best.stdUsd, delta1, delta2,
+        mpn: sapBest?.mpn || mpnRaw, internalPN: sapBest?.internalPN || '',
+        supplier: sapBest?.supplier || nexarEntry?.nexarSeller || '',
+        plant: sapBest?.plant || '',
+        bestSource: bestSourceLabel,
+        cost1, lastPoUsd: winPrice, stdUsd: winnerStd, delta1, delta2,
       })
     }
 
-    const ppvValues: (string | number | null)[] = best
+    const ppvValues: (string | number | null)[] = anyFound
       ? [
-          ...(hasDeepAnalysis ? [best.source] : []),
-          best.internalPN || 'Not Found',
-          best.mpn        || 'Not Found',
-          best.plant      || 'Not Found',
-          best.supplier   || 'Not Found',
-          best.lastPoUsd  ?? 'Not Found',
-          best.stdUsd     ?? 'Not Found',
-          best.date       || 'Not Found',
-          delta1          ?? 'N/A',
-          delta2          ?? 'N/A',
+          sapBest?.internalPN || 'Not Found',
+          sapBest?.mpn        || mpnRaw,
+          sapBest?.plant      || 'Not Found',
+          sapBest?.supplier   || 'Not Found',
+          sapBest?.lastPoUsd  ?? 'Not Found',
+          sapBest?.stdUsd     ?? 'Not Found',
+          sapBest?.date       || 'Not Found',
+          ...(hasNexarData ? [
+            nexarEntry?.nexarMpn          || 'Not Found',
+            nexarEntry?.nexarManufacturer || 'Not Found',
+            nexarEntry?.nexarSeller       || 'Not Found',
+            nexarEntry?.nexarBestUsd      ?? 'Not Found',
+            nexarEntry?.nexarStock        ?? 'Not Found',
+            nexarEntry?.nexarMoq          ?? 'Not Found',
+          ] : []),
+          ...(hasLyticaData ? [
+            mpnRaw,
+            lyticaEntry?.mpnMatched          || 'Not Found',
+            lyticaEntry?.manufacturerMatched || 'Not Found',
+            lyticaEntry?.price90th           ?? 'Not Found',
+          ] : []),
+          bestSourceLabel,
+          winPrice            ?? 'Not Found',
+          delta1              ?? 'N/A',
+          delta2              ?? 'N/A',
         ]
       : Array(ppvHeaders.length).fill('Not Found') as string[]
 
     const dr = ws.addRow([...row.map(v => v ?? ''), ...ppvValues])
     dr.height = 18
 
-    const notFound = !best
+    const notFound = !anyFound || noPrice   // whole row yellow when no usable price from any source
     // Green row when actual price is below quoted cost (favorable); red when above
     const isFav    = delta1 != null && delta1 < 0
     const isUnfav  = delta1 != null && delta1 > 0
@@ -1327,6 +1412,41 @@ async function downloadCbomResultsExcel(
         const bg   = v < 0 ? 'FFD1FAE5' : v > 0 ? 'FFFEE2E2' : (bgColor === 'FFFFFFFF' ? 'FFFFFFFF' : 'FFF8FAFC')
         c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: bg } }
         c.font = { size: 9, name: 'Calibri', bold: true, color: { argb } }
+      }
+    }
+
+    // Format Nexar unit price column with number format
+    if (nexarPriceColNum > 0) {
+      const c = dr.getCell(nexarPriceColNum)
+      c.alignment = { horizontal: 'right', vertical: 'middle' }
+      if (typeof c.value === 'number') c.numFmt = '#,##0.000000'
+    }
+
+    // Format Lytica 90th %tile column with number format
+    if (lytica90ColNum > 0) {
+      const c = dr.getCell(lytica90ColNum)
+      c.alignment = { horizontal: 'right', vertical: 'middle' }
+      if (typeof c.value === 'number') c.numFmt = '#,##0.000000'
+    }
+
+    // PPV - Best Source: yellow if Not Found
+    {
+      const c = dr.getCell(bestSourceColNum)
+      c.alignment = { horizontal: 'center', vertical: 'middle' }
+      c.font = { size: 9, name: 'Calibri', bold: true }
+      if (c.value === 'Not Found' || !anyFound) {
+        c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFF9C4' } }
+        c.font = { size: 9, name: 'Calibri', bold: true, color: { argb: 'FF92400E' }, italic: true }
+      }
+    }
+
+    // PPV - Best Price: number format
+    {
+      const c = dr.getCell(bestPriceColNum)
+      c.alignment = { horizontal: 'right', vertical: 'middle' }
+      if (typeof c.value === 'number') {
+        c.numFmt = '#,##0.000000'
+        c.font = { size: 9, name: 'Calibri', bold: true, color: { argb: 'FF0C4A6E' } }
       }
     }
 
@@ -1433,7 +1553,7 @@ async function downloadCbomResultsExcel(
       addCell(startRow, 2, item.mpn,        { bg, font: 'FF1E3A5F', bold: true })
       addCell(startRow, 3, item.internalPN, { bg })
       addCell(startRow, 4, item.supplier,   { bg })
-      addCell(startRow, 5, item.plant,      { bg, align: 'center' })
+      addCell(startRow, 5, item.plant || `(${item.bestSource})`, { bg, align: 'center', italic: !item.plant })
       const priceC = addCell(startRow, 6, price,      { bg, align: 'right', numFmt: '#,##0.000000' })
       const cost1C = addCell(startRow, 7, item.cost1, { bg, align: 'right', numFmt: '#,##0.000000' })
       const deltaC = addCell(startRow, 8, delta,      { bg: isFav ? 'FFD1FAE5' : isUnfav ? 'FFFEE2E2' : bg, align: 'right', numFmt: '#,##0.000000', bold: true, font: fontDelta })
@@ -1525,7 +1645,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
   const [multiMpnSubTab, setMultiMpnSubTab]                           = useState<'results' | 'allrecords' | 'blocked' | 'deep'>('results')
   const [multiMpnAmplMap, setMultiMpnAmplMap]                         = useState<Record<string, AmplResponse>>({})
   const [multiMpnExpandedMpns, setMultiMpnExpandedMpns]               = useState<Set<string>>(new Set())
-  const [mpnNexarMap, setMpnNexarMap]                                 = useState<Record<string, { nexarBestUsd: number | null; nexarSeller: string }>>({})
+  const [mpnNexarMap, setMpnNexarMap]                                 = useState<Record<string, { nexarBestUsd: number | null; nexarSeller: string; nexarManufacturer: string; nexarStock: number | null; nexarMoq: number | null; nexarMpn: string }>>({})
   const [deepAnalysisRows, setDeepAnalysisRows]                       = useState<DeepAnalysisRow[]>([])
   const [deepAnalysisLoading, setDeepAnalysisLoading]                 = useState(false)
   const abortDeepRef = useRef<AbortController | null>(null)
@@ -1535,6 +1655,10 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
   const [cbomFileName, setCbomFileName]   = useState<string>('')
   const [cbomHeaders, setCbomHeaders]     = useState<string[]>([])
   const [cbomMpnColIdx, setCbomMpnColIdx] = useState<number>(-1)
+
+  // ── Lytica upload state ───────────────────────────────────────────────────
+  const [lyticaMap, setLyticaMap]         = useState<Record<string, { mpnMatched: string; manufacturerMatched: string; price90th: number | null }>>({})
+  const [lyticaFileName, setLyticaFileName] = useState<string>('')
 
   const reset = useCallback(() => {
     setAmpl(null); setIqRows([]); setPlants([]); setMarket(null)
@@ -1953,43 +2077,62 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
     }
   }, [])
 
-  const downloadMpnTemplate = useCallback(async () => {
-    const ExcelJS = (await import('exceljs')).default
-    const wb = new ExcelJS.Workbook()
-    wb.creator = 'PPV Dashboard'
-    const ws = wb.addWorksheet('MPNs')
-    ws.columns = [
-      { header: 'MPN',      key: 'mpn',      width: 24 },
-      { header: 'Quantity', key: 'quantity', width: 14 },
-    ]
-    const hdr = ws.getRow(1)
-    hdr.height = 22
-    hdr.eachCell(cell => {
-      cell.fill      = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1E3A5F' } }
-      cell.font      = { bold: true, color: { argb: 'FFFFFFFF' }, size: 11, name: 'Calibri' }
-      cell.alignment = { horizontal: 'center', vertical: 'middle' }
-      cell.border    = { bottom: { style: 'medium', color: { argb: 'FF2563EB' } } }
-    })
-    const examples = [{ mpn: 'RC0402FR-07100KL', quantity: 500 }, { mpn: 'RC0402FR-0710KL', quantity: 1000 }, { mpn: 'RC0402FR-071KL', quantity: 250 }]
-    examples.forEach((ex, i) => {
-      const row = ws.addRow(ex)
-      row.height = 18
-      row.eachCell({ includeEmpty: true }, cell => {
-        cell.fill      = { type: 'pattern', pattern: 'solid', fgColor: { argb: i % 2 === 0 ? 'FFFFFFFF' : 'FFF8FAFC' } }
-        cell.font      = { size: 10, name: 'Calibri', italic: true, color: { argb: 'FF9CA3AF' } }
-        cell.alignment = { vertical: 'middle' }
+  // ── Lytica upload: reads flat Excel, extracts MPN Searched / MPN Matched / Manufacturer Matched / 90th percentile ──
+  const handleLyticaUpload = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    e.target.value = ''
+    try {
+      const ExcelJS = (await import('exceljs')).default
+      const wb = new ExcelJS.Workbook()
+      await wb.xlsx.load(await file.arrayBuffer())
+      const ws = wb.worksheets[0]
+      if (!ws) { alert('No sheets found in the Lytica file.'); return }
+
+      // Find header row (first row that contains "MPN Searched")
+      let headerRowNum = -1
+      let headers: string[] = []
+      ws.eachRow({ includeEmpty: false }, (row, rn) => {
+        if (headerRowNum !== -1) return
+        const vals = row.values as (unknown)[]
+        const strs = vals.map(v => String(v ?? '').trim())
+        if (strs.some(s => s.toLowerCase() === 'mpn searched')) {
+          headerRowNum = rn
+          headers = strs.slice(1) // ExcelJS row.values is 1-indexed (index 0 is empty)
+        }
       })
-      row.getCell('quantity').alignment = { horizontal: 'right', vertical: 'middle' }
-    })
-    ws.autoFilter = 'A1:B1'
-    const buffer = await wb.xlsx.writeBuffer()
-    const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })
-    const url  = URL.createObjectURL(blob)
-    const a    = document.createElement('a')
-    a.href     = url
-    a.download = 'PPV_MPN_Template.xlsx'
-    a.click()
-    URL.revokeObjectURL(url)
+      if (headerRowNum === -1) { alert('Could not find "MPN Searched" header in the Lytica file.'); return }
+
+      const normalize = (h: string) => h.toLowerCase().replace(/\s+/g, ' ').trim()
+      const mpnSearchedIdx    = headers.findIndex(h => normalize(h) === 'mpn searched')
+      const mpnMatchedIdx     = headers.findIndex(h => normalize(h) === 'mpn matched')
+      const mfrMatchedIdx     = headers.findIndex(h => normalize(h) === 'manufacturer matched')
+      const price90Idx        = headers.findIndex(h => normalize(h) === '90th percentile' || normalize(h) === '90th %tile' || normalize(h).includes('90th'))
+
+      if (mpnSearchedIdx === -1) { alert('Column "MPN Searched" not found in Lytica file.'); return }
+
+      const map: Record<string, { mpnMatched: string; manufacturerMatched: string; price90th: number | null }> = {}
+      ws.eachRow({ includeEmpty: false }, (row, rn) => {
+        if (rn <= headerRowNum) return
+        const vals = (row.values as unknown[]).slice(1)
+        const mpnSearched = String(vals[mpnSearchedIdx] ?? '').trim()
+        if (!mpnSearched) return
+        const mpnMatched  = mpnMatchedIdx >= 0 ? String(vals[mpnMatchedIdx] ?? '').trim() : ''
+        const mfrMatched  = mfrMatchedIdx >= 0 ? String(vals[mfrMatchedIdx] ?? '').trim() : ''
+        let price90th: number | null = null
+        if (price90Idx >= 0) {
+          const raw = vals[price90Idx]
+          const n = typeof raw === 'number' ? raw : parseFloat(String(raw ?? '').replace(/[$,]/g, ''))
+          if (isFinite(n)) price90th = n
+        }
+        map[mpnSearched.toUpperCase()] = { mpnMatched, manufacturerMatched: mfrMatched, price90th }
+      })
+
+      setLyticaMap(map)
+      setLyticaFileName(file.name)
+    } catch (err) {
+      alert('Error reading Lytica file: ' + (err instanceof Error ? err.message : String(err)))
+    }
   }, [])
 
   // ── Multi-MPN: search handler ─────────────────────────────────────────────
@@ -2035,17 +2178,22 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
         )
       }
 
-      // ── Nexar market fetch (per unique MPN) ──────────────────────────
-      if (searchNexar && rows.length > 0 && !signal.aborted) {
-        const uniqueMpns = [...new Set(rows.map(r => r.mpn).filter(Boolean))]
-        const nexarUpdates: Record<string, { nexarBestUsd: number | null; nexarSeller: string }> = {}
+      // ── Nexar market fetch (all searched MPNs, even those not found in SAP) ──
+      if (searchNexar && mpns.length > 0 && !signal.aborted) {
+        // Include both the original searched list and any SAP-returned MPN variants
+        const uniqueMpns = [...new Set([...mpns, ...rows.map(r => r.mpn).filter(Boolean)])]
+        const nexarUpdates: Record<string, { nexarBestUsd: number | null; nexarSeller: string; nexarManufacturer: string; nexarStock: number | null; nexarMoq: number | null; nexarMpn: string }> = {}
         await Promise.allSettled(uniqueMpns.map(async mpn => {
           try {
             const mpnQty = mpnComponentQtys[mpn] ?? qty
             const mkt = await apiPostWithRetry<MarketResponse>('/api/pricecalc/market-prices', { mpns: [mpn], quantity: mpnQty }, signal)
             const eligible = mkt.offers.filter(o => o.inventory > 0 && o.moq <= mpnQty)
             const best = eligible.sort((a, b) => a.unit_price_usd - b.unit_price_usd)[0] ?? null
-            if (best) nexarUpdates[mpn] = { nexarBestUsd: best.unit_price_usd, nexarSeller: best.seller }
+            if (best) nexarUpdates[mpn] = {
+              nexarBestUsd: best.unit_price_usd, nexarSeller: best.seller,
+              nexarManufacturer: best.manufacturer, nexarStock: best.inventory,
+              nexarMoq: best.moq, nexarMpn: best.mpn,
+            }
           } catch { /* non-critical */ }
         }))
         setMpnNexarMap(nexarUpdates)
@@ -3571,6 +3719,17 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                                 >×</button>
                               </span>
                             )}
+                            {lyticaFileName && (
+                              <span className="flex items-center gap-1 text-[11px] text-teal-700 bg-teal-50 border border-teal-200 rounded-full px-2 py-0.5">
+                                <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" /></svg>
+                                Lytica: {lyticaFileName}
+                                <button
+                                  onClick={() => { setLyticaFileName(''); setLyticaMap({}) }}
+                                  className="ml-1 text-teal-500 hover:text-red-500 font-bold leading-none"
+                                  title="Clear Lytica data"
+                                >×</button>
+                              </span>
+                            )}
                             <label className="flex items-center gap-1.5 cursor-pointer px-3 py-1 text-xs font-semibold rounded-lg bg-white border border-gray-300 hover:border-blue-400 hover:text-blue-600 text-gray-600 transition-colors">
                               <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" /></svg>
                               Upload Excel
@@ -3581,8 +3740,13 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                               Upload CBOM
                               <input type="file" accept=".xlsx,.xls" className="hidden" onChange={handleCbomUpload} />
                             </label>
+                            <label className="flex items-center gap-1.5 cursor-pointer px-3 py-1 text-xs font-semibold rounded-lg bg-white border border-teal-300 hover:border-teal-500 hover:text-teal-600 text-gray-600 transition-colors" title="Upload a Lytica report — matches MPN Searched with 90th percentile price for Deep Analysis comparison">
+                              <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" /></svg>
+                              Upload Lytica
+                              <input type="file" accept=".xlsx,.xls" className="hidden" onChange={handleLyticaUpload} />
+                            </label>
                             <button
-                              onClick={downloadMpnTemplate}
+                              onClick={downloadTemplate}
                               className="flex items-center gap-1.5 px-3 py-1 text-xs font-semibold rounded-lg bg-white border border-gray-300 hover:border-emerald-400 hover:text-emerald-600 text-gray-600 transition-colors"
                               title="Download Excel template with MPN and Quantity columns"
                             >
@@ -3874,6 +4038,8 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                                   <button
                                     onClick={() => downloadCbomResultsExcel(
                                       cbomHeaders, cbomRows, cbomMpnColIdx, mpnEntries, deepAnalysisRows,
+                                      mpnNexarMap,
+                                      lyticaMap,
                                       `CBOM_PPV_${new Date().toISOString().slice(0, 10)}.xlsx`,
                                     )}
                                     className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-orange-700 bg-orange-50 hover:bg-orange-100 border border-orange-200 rounded-lg transition-colors whitespace-nowrap"
@@ -4130,6 +4296,8 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                                         <th className="px-3 py-2.5 text-left border-b border-gray-200 whitespace-nowrap" rowSpan={2}>Internal PN</th>
                                         <th className="px-3 py-2.5 text-center border-b border-gray-200 border-l border-l-blue-200 whitespace-nowrap bg-blue-50/50" colSpan={6}>Multi-MPN</th>
                                         <th className="px-3 py-2.5 text-center border-b border-gray-200 border-l border-l-purple-200 whitespace-nowrap bg-purple-50/50" colSpan={7}>Multi-Component</th>
+                                        <th className="px-3 py-2.5 text-center border-b border-gray-200 border-l border-l-orange-200 whitespace-nowrap bg-orange-50/50" colSpan={6}>Nexar Market</th>
+                                        {Object.keys(lyticaMap).length > 0 && <th className="px-3 py-2.5 text-center border-b border-gray-200 border-l border-l-teal-200 whitespace-nowrap bg-teal-50/50" colSpan={4}>Lytica</th>}
                                         <th className="px-3 py-2.5 text-center border-b border-gray-200 border-l border-l-gray-300 whitespace-nowrap" rowSpan={2}>QTY Inserted</th>
                                         <th className="px-3 py-2.5 text-center border-b border-gray-200 border-l border-l-gray-300 whitespace-nowrap" rowSpan={2}>Total (USD) per QTY</th>
                                         <th className="px-3 py-2.5 text-center border-b border-gray-200 border-l border-l-gray-300 whitespace-nowrap" rowSpan={2}>Winner</th>
@@ -4148,6 +4316,16 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                                         <th className="px-3 py-2 text-right border-b border-gray-200 whitespace-nowrap bg-purple-50/30">Last PO (USD)</th>
                                         <th className="px-3 py-2 text-right border-b border-gray-200 whitespace-nowrap bg-purple-50/30">Std (USD)</th>
                                         <th className="px-3 py-2 text-left border-b border-gray-200 whitespace-nowrap bg-purple-50/30">Date</th>
+                                        <th className="px-3 py-2 text-left border-b border-gray-200 border-l border-l-orange-200 whitespace-nowrap bg-orange-50/30">MPN</th>
+                                        <th className="px-3 py-2 text-left border-b border-gray-200 whitespace-nowrap bg-orange-50/30">Manufacturer</th>
+                                        <th className="px-3 py-2 text-left border-b border-gray-200 whitespace-nowrap bg-orange-50/30">Supplier</th>
+                                        <th className="px-3 py-2 text-right border-b border-gray-200 whitespace-nowrap bg-orange-50/30">Unit Price (USD)</th>
+                                        <th className="px-3 py-2 text-right border-b border-gray-200 whitespace-nowrap bg-orange-50/30">Stock</th>
+                                        <th className="px-3 py-2 text-right border-b border-gray-200 whitespace-nowrap bg-orange-50/30">MOQ</th>
+                                        {Object.keys(lyticaMap).length > 0 && <th className="px-3 py-2 text-left border-b border-gray-200 border-l border-l-teal-200 whitespace-nowrap bg-teal-50/30">MPN Searched</th>}
+                                        {Object.keys(lyticaMap).length > 0 && <th className="px-3 py-2 text-left border-b border-gray-200 whitespace-nowrap bg-teal-50/30">MPN Matched</th>}
+                                        {Object.keys(lyticaMap).length > 0 && <th className="px-3 py-2 text-left border-b border-gray-200 whitespace-nowrap bg-teal-50/30">Manufacturer</th>}
+                                        {Object.keys(lyticaMap).length > 0 && <th className="px-3 py-2 text-right border-b border-gray-200 whitespace-nowrap bg-teal-50/30">90th %tile</th>}
                                       </tr>
                                     </thead>
                                     <tbody className="divide-y divide-gray-100">
@@ -4163,15 +4341,43 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                                         }, null)
                                         const mpnPrice = mpnBestEntry ? resolveLastPoPrice(mpnBestEntry.bestRow) : null
                                         const mcPrice  = dr.mcBestPriceUsd
-                                        let winner: 'mpn' | 'mc' | 'tie' | null = null
-                                        if (mpnPrice != null && mcPrice != null) {
-                                          if (mpnPrice < mcPrice) winner = 'mpn'
-                                          else if (mcPrice < mpnPrice) winner = 'mc'
-                                          else winner = 'tie'
-                                        } else if (mpnPrice != null) winner = 'mpn'
-                                        else if (mcPrice != null) winner = 'mc'
-                                        const winnerPrice = winner === 'mpn' ? mpnPrice : winner === 'mc' ? mcPrice : winner === 'tie' ? (mpnPrice ?? mcPrice) : null
-                                        const winnerStd   = winner === 'mpn' ? (mpnBestEntry?.bestRow.standardPriceUsd ?? null) : winner === 'mc' ? dr.mcStdPriceUsd : winner === 'tie' ? (mpnBestEntry ? mpnBestEntry.bestRow.standardPriceUsd : dr.mcStdPriceUsd) : null
+
+                                        // Lytica: find the best match for any MPN belonging to this internalPN
+                                        const hasLytica = Object.keys(lyticaMap).length > 0
+                                        let lyticaBest: { mpnSearched: string; mpnMatched: string; manufacturerMatched: string; price90th: number | null } | null = null
+                                        if (hasLytica) {
+                                          const candidates = mpnEntries.filter(e => e.bestRow.internalPN === dr.internalPN)
+                                          for (const c of candidates) {
+                                            const entry = lyticaMap[c.mpn.toUpperCase()]
+                                            if (entry && (lyticaBest == null || (entry.price90th != null && (lyticaBest.price90th == null || entry.price90th < lyticaBest.price90th))))
+                                              lyticaBest = { mpnSearched: c.mpn, ...entry }
+                                          }
+                                        }
+                                        const lyticaPrice = lyticaBest?.price90th ?? null
+
+                                        // Winner: compare mpn, mc, nexar, lytica — pick lowest price
+                                        const nexarCandidates = mpnEntries.filter(e => e.bestRow.internalPN === dr.internalPN)
+                                        let nexarBestForWinner: number | null = null
+                                        for (const c of nexarCandidates) {
+                                          const nx = mpnNexarMap[c.mpn]
+                                          if (nx?.nexarBestUsd != null && (nexarBestForWinner == null || nx.nexarBestUsd < nexarBestForWinner))
+                                            nexarBestForWinner = nx.nexarBestUsd
+                                        }
+
+                                        type WinnerType = 'mpn' | 'mc' | 'nexar' | 'lytica' | 'tie' | null
+                                        let winner: WinnerType = null
+                                        const prices: Array<[WinnerType, number]> = []
+                                        if (mpnPrice != null)       prices.push(['mpn', mpnPrice])
+                                        if (mcPrice != null)        prices.push(['mc', mcPrice])
+                                        if (nexarBestForWinner != null) prices.push(['nexar', nexarBestForWinner])
+                                        if (lyticaPrice != null)    prices.push(['lytica', lyticaPrice])
+                                        if (prices.length > 0) {
+                                          const minPrice = Math.min(...prices.map(([, p]) => p))
+                                          const winners = prices.filter(([, p]) => p === minPrice)
+                                          winner = winners.length === 1 ? winners[0][0] : 'tie'
+                                        }
+                                        const winnerPrice = prices.length > 0 ? Math.min(...prices.map(([, p]) => p)) : null
+                                        const winnerStd   = winner === 'mpn' ? (mpnBestEntry?.bestRow.standardPriceUsd ?? null) : winner === 'mc' ? dr.mcStdPriceUsd : null
                                         const lpoGtStd    = winnerPrice != null && winnerStd != null && winnerPrice > winnerStd
                                         const qtyIns      = mpnComponentQtys[mpnBestEntry?.mpn ?? ''] ?? qty
                                         const totalUsd    = winnerPrice != null ? winnerPrice * qtyIns : null
@@ -4209,6 +4415,44 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                                                 <td className="px-3 py-2.5 text-gray-500 whitespace-nowrap">{dr.mcLastPoDate || '—'}</td>
                                               </>
                                             )}
+                                            {/* Nexar Market side */}
+                                            {(() => {
+                                              const candidates = mpnEntries.filter(e => e.bestRow.internalPN === dr.internalPN)
+                                              let nexarBest: (typeof mpnNexarMap)[string] | null = null
+                                              for (const c of candidates) {
+                                                const e = mpnNexarMap[c.mpn]
+                                                if (e && (nexarBest == null || (e.nexarBestUsd != null && (nexarBest.nexarBestUsd == null || e.nexarBestUsd < nexarBest.nexarBestUsd))))
+                                                  nexarBest = e
+                                              }
+                                              if (!nexarBest) return (
+                                                <td colSpan={6} className="px-3 py-2.5 text-center text-gray-300 text-[10px] border-l border-l-orange-100 bg-orange-50/10">
+                                                  {Object.keys(mpnNexarMap).length === 0 ? 'Enable Nexar search' : '—'}
+                                                </td>
+                                              )
+                                              return (
+                                                <>
+                                                  <td className="px-3 py-2.5 font-mono text-orange-700 whitespace-nowrap border-l border-l-orange-100 bg-orange-50/10">{nexarBest.nexarMpn || '—'}</td>
+                                                  <td className="px-3 py-2.5 text-gray-600 max-w-[130px] truncate bg-orange-50/10" title={nexarBest.nexarManufacturer}>{nexarBest.nexarManufacturer || '—'}</td>
+                                                  <td className="px-3 py-2.5 text-gray-600 max-w-[130px] truncate bg-orange-50/10" title={nexarBest.nexarSeller}>{nexarBest.nexarSeller || '—'}</td>
+                                                  <td className={`px-3 py-2.5 text-right font-mono font-semibold whitespace-nowrap bg-orange-50/10 ${winner === 'nexar' ? 'text-emerald-700 text-sm' : 'text-orange-700'}`}>{fmt6(nexarBest.nexarBestUsd)}</td>
+                                                  <td className="px-3 py-2.5 text-right font-mono text-gray-500 whitespace-nowrap bg-orange-50/10">{nexarBest.nexarStock != null ? nexarBest.nexarStock.toLocaleString() : '—'}</td>
+                                                  <td className="px-3 py-2.5 text-right font-mono text-gray-500 whitespace-nowrap bg-orange-50/10">{nexarBest.nexarMoq != null ? nexarBest.nexarMoq.toLocaleString() : '—'}</td>
+                                                </>
+                                              )
+                                            })()}
+                                            {/* Lytica side */}
+                                            {hasLytica && (
+                                              lyticaBest == null ? (
+                                                <td colSpan={4} className="px-3 py-2.5 text-center text-gray-300 text-[10px] border-l border-l-teal-100 bg-teal-50/10">—</td>
+                                              ) : (
+                                                <>
+                                                  <td className="px-3 py-2.5 font-mono text-teal-700 whitespace-nowrap border-l border-l-teal-100 bg-teal-50/10">{lyticaBest.mpnSearched || '—'}</td>
+                                                  <td className="px-3 py-2.5 font-mono text-gray-600 whitespace-nowrap bg-teal-50/10">{lyticaBest.mpnMatched || '—'}</td>
+                                                  <td className="px-3 py-2.5 text-gray-600 max-w-[130px] truncate bg-teal-50/10" title={lyticaBest.manufacturerMatched}>{lyticaBest.manufacturerMatched || '—'}</td>
+                                                  <td className={`px-3 py-2.5 text-right font-mono font-semibold whitespace-nowrap bg-teal-50/10 ${winner === 'lytica' ? 'text-emerald-700 text-sm' : 'text-teal-700'}`}>{fmt6(lyticaPrice)}</td>
+                                                </>
+                                              )
+                                            )}
                                             {/* QTY Inserted */}
                                             <td className="px-3 py-2.5 text-right font-mono text-gray-600 whitespace-nowrap border-l border-l-gray-200">{qtyIns}</td>
                                             {/* Total (USD) per QTY */}
@@ -4216,9 +4460,11 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                                             {/* Winner */}
                                             <td className="px-3 py-2.5 text-center border-l border-l-gray-200">
                                               {dr.status === 'loading' ? null
-                                                : winner === 'mpn' ? <span className="px-2 py-0.5 text-[10px] font-bold rounded-full bg-emerald-100 text-emerald-700">Multi-MPN</span>
-                                                : winner === 'mc'  ? <span className="px-2 py-0.5 text-[10px] font-bold rounded-full bg-purple-100 text-purple-700">Multi-Comp</span>
-                                                : winner === 'tie' ? <span className="px-2 py-0.5 text-[10px] font-bold rounded-full bg-gray-100 text-gray-500">Tie</span>
+                                                : winner === 'mpn'    ? <span className="px-2 py-0.5 text-[10px] font-bold rounded-full bg-emerald-100 text-emerald-700">Multi-MPN</span>
+                                                : winner === 'mc'     ? <span className="px-2 py-0.5 text-[10px] font-bold rounded-full bg-purple-100 text-purple-700">Multi-Comp</span>
+                                                : winner === 'nexar'  ? <span className="px-2 py-0.5 text-[10px] font-bold rounded-full bg-orange-100 text-orange-700">Nexar</span>
+                                                : winner === 'lytica' ? <span className="px-2 py-0.5 text-[10px] font-bold rounded-full bg-teal-100 text-teal-700">Lytica</span>
+                                                : winner === 'tie'    ? <span className="px-2 py-0.5 text-[10px] font-bold rounded-full bg-gray-100 text-gray-500">Tie</span>
                                                 : null
                                               }
                                             </td>
