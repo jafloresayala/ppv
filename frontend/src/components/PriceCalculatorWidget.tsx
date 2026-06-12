@@ -1215,13 +1215,13 @@ async function downloadCbomResultsExcel(
   const ws = wb.addWorksheet('CBOM + PPV Results', { views: [{ state: 'frozen', ySplit: 1 }] })
 
   const ppvHeaders: string[] = [
-    'PPV - Internal PN',
-    'PPV - MPN',
-    'PPV - Plant',
-    'PPV - Supplier',
-    'PPV - Last PO (USD)',
-    'PPV - STD (USD)',
-    'PPV - Date',
+    'SAP - Internal PN',
+    'SAP - MPN',
+    'SAP - Plant',
+    'SAP - Supplier',
+    'SAP - Best Last PO Interplants',
+    'SAP - STD Price',
+    'SAP - Date',
     ...(hasNexarData ? [
       'Nexar - MPN',
       'Nexar - Manufacturer',
@@ -1236,10 +1236,10 @@ async function downloadCbomResultsExcel(
       'Lytica - Manufacturer Matched',
       'Lytica - 90th %tile',
     ] : []),
-    'PPV - Best Source',
-    'PPV - Best Price',
-    'Δ Last PO - Cost#1',
-    'Δ STD - Cost#1',
+    'Best Source',
+    'Best Price',
+    'Δ Cost#1 - Best Price',
+    'Δ Cost#1 - STD',
   ]
 
   const colWidth = (h: string) => Math.min(Math.max((h?.length ?? 0) + 4, 10), 40)
@@ -1250,14 +1250,14 @@ async function downloadCbomResultsExcel(
 
   const totalCols    = cbomHeaders.length + ppvHeaders.length
   // 1-based column numbers (calculated from position in ppvHeaders, order-independent)
-  const lpoColNum         = cbomHeaders.length + ppvHeaders.indexOf('PPV - Last PO (USD)') + 1
-  const stdColNum         = cbomHeaders.length + ppvHeaders.indexOf('PPV - STD (USD)') + 1
-  const delta1ColNum      = cbomHeaders.length + ppvHeaders.indexOf('Δ Last PO - Cost#1') + 1
-  const delta2ColNum      = cbomHeaders.length + ppvHeaders.indexOf('Δ STD - Cost#1') + 1
+  const lpoColNum         = cbomHeaders.length + ppvHeaders.indexOf('SAP - Best Last PO Interplants') + 1
+  const stdColNum         = cbomHeaders.length + ppvHeaders.indexOf('SAP - STD Price') + 1
+  const delta1ColNum      = cbomHeaders.length + ppvHeaders.indexOf('Δ Cost#1 - Best Price') + 1
+  const delta2ColNum      = cbomHeaders.length + ppvHeaders.indexOf('Δ Cost#1 - STD') + 1
   const nexarPriceColNum  = hasNexarData  ? cbomHeaders.length + ppvHeaders.indexOf('Nexar - Unit Price (USD)') + 1 : -1
   const lytica90ColNum    = hasLyticaData ? cbomHeaders.length + ppvHeaders.indexOf('Lytica - 90th %tile') + 1 : -1
-  const bestSourceColNum  = cbomHeaders.length + ppvHeaders.indexOf('PPV - Best Source') + 1
-  const bestPriceColNum   = cbomHeaders.length + ppvHeaders.indexOf('PPV - Best Price') + 1
+  const bestSourceColNum  = cbomHeaders.length + ppvHeaders.indexOf('Best Source') + 1
+  const bestPriceColNum   = cbomHeaders.length + ppvHeaders.indexOf('Best Price') + 1
 
   const hdr = ws.getRow(1)
   hdr.height = 24
@@ -1569,7 +1569,7 @@ async function downloadCbomResultsExcel(
     r,
     `⚠️  Top ${TOP} Most Critical — Δ Last PO vs Cost #1 (highest delta first)`,
     'FF7C2D12',
-    critByLpo, 'Last PO (USD)', 'Δ Last PO - Cost#1',
+    critByLpo, 'SAP - Best Last PO Interplants', 'Δ Cost#1 - Best Price',
     a => a.lastPoUsd, a => a.delta1,
   )
   r++
@@ -1577,7 +1577,7 @@ async function downloadCbomResultsExcel(
     r,
     `⚠️  Top ${TOP} Most Critical — Δ STD vs Cost #1 (highest delta first)`,
     'FF4C1D95',
-    critByStd, 'STD (USD)', 'Δ STD - Cost#1',
+    critByStd, 'SAP - STD Price', 'Δ Cost#1 - STD',
     a => a.stdUsd, a => a.delta2,
   )
 
