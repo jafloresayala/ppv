@@ -1976,6 +1976,8 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
   const [cbomFileName, setCbomFileName]   = useState<string>('')
   const [cbomHeaders, setCbomHeaders]     = useState<string[]>([])
   const [cbomMpnColIdx, setCbomMpnColIdx] = useState<number>(-1)
+  const [cbomMpnList, setCbomMpnList]     = useState<string[]>([])
+  const [showMpnMenu, setShowMpnMenu]     = useState(false)
 
   // ── Lytica upload state ───────────────────────────────────────────────────
   const [lyticaMap, setLyticaMap]         = useState<Record<string, { mpnMatched: string; manufacturerMatched: string; price90th: number | null }>>({})
@@ -1997,6 +1999,22 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
   const [stopAmplDemandHover, setStopAmplDemandHover]         = useState(false)
   const abortAmplDemandRef    = useRef<AbortController | null>(null)
   const abortAmplDemandDeepRef = useRef<AbortController | null>(null)
+  // ── AMPL Demand: multi-sheet picker + missing-cols alert + Lytica export ──
+  const [amplSheetPickerOpen, setAmplSheetPickerOpen]               = useState(false)
+  const [amplSheetNames, setAmplSheetNames]                         = useState<string[]>([])
+  const [amplSheetPickerSelected, setAmplSheetPickerSelected]       = useState('')
+  const [amplMissingColsAlertOpen, setAmplMissingColsAlertOpen]     = useState(false)
+  const [showAmplMenu, setShowAmplMenu]                             = useState(false)
+  const [amplDemandMpnList, setAmplDemandMpnList]                   = useState<string[]>([])
+  const amplPendingWbRef      = useRef<any>(null)
+  const amplPendingFileNameRef = useRef('')
+  const amplPendingDataRef     = useRef<{
+    headers: string[]
+    rows: Array<(string | number | null)[]>
+    mpnColIdx: number
+    mpnList: string[]
+    fileName: string
+  } | null>(null)
 
   const reset = useCallback(() => {
     setAmpl(null); setIqRows([]); setPlants([]); setMarket(null)
@@ -2259,6 +2277,76 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
     URL.revokeObjectURL(url)
   }, [])
 
+  const downloadLyticaTemplate = useCallback(async () => {
+    const ExcelJS = (await import('exceljs')).default
+    const wb = new ExcelJS.Workbook()
+    wb.creator = 'PPV Dashboard'
+    const ws = wb.addWorksheet('MPN List')
+    ws.columns = [{ header: 'MPN', key: 'mpn', width: 28 }]
+    const hdr = ws.getRow(1)
+    hdr.height = 22
+    hdr.eachCell(cell => {
+      cell.fill      = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1E3A5F' } }
+      cell.font      = { bold: true, color: { argb: 'FFFFFFFF' }, size: 11, name: 'Calibri' }
+      cell.alignment = { horizontal: 'center', vertical: 'middle' }
+      cell.border    = { bottom: { style: 'medium', color: { argb: 'FF2563EB' } } }
+    })
+    cbomMpnList.forEach((mpn, i) => {
+      const row = ws.addRow({ mpn })
+      row.height = 18
+      row.eachCell({ includeEmpty: true }, (cell: any) => {
+        cell.fill      = { type: 'pattern', pattern: 'solid', fgColor: { argb: i % 2 === 0 ? 'FFFFFFFF' : 'FFF8FAFC' } }
+        cell.font      = { size: 10, name: 'Calibri' }
+        cell.alignment = { vertical: 'middle' }
+      })
+    })
+    ws.autoFilter = 'A1:A1'
+    const buffer = await wb.xlsx.writeBuffer()
+    const blob   = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })
+    const url    = URL.createObjectURL(blob)
+    const a      = document.createElement('a')
+    a.href     = url
+    a.download = 'Price_Estimator_Upload_Template.xlsx'
+    a.click()
+    URL.revokeObjectURL(url)
+  }, [cbomMpnList])
+
+  /** Download Lytica Upload Template from the loaded AMPL Demand file (unique MPNs) */
+  const downloadAmplLyticaTemplate = useCallback(async () => {
+    if (!amplDemandMpnList.length) return
+    const ExcelJS = (await import('exceljs')).default
+    const wb = new ExcelJS.Workbook()
+    wb.creator = 'PPV Dashboard'
+    const ws = wb.addWorksheet('MPN List')
+    ws.columns = [{ header: 'MPN', key: 'mpn', width: 28 }]
+    const hdr = ws.getRow(1)
+    hdr.height = 22
+    hdr.eachCell((cell: any) => {
+      cell.fill      = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1E3A5F' } }
+      cell.font      = { bold: true, color: { argb: 'FFFFFFFF' }, size: 11, name: 'Calibri' }
+      cell.alignment = { horizontal: 'center', vertical: 'middle' }
+      cell.border    = { bottom: { style: 'medium', color: { argb: 'FF2563EB' } } }
+    })
+    amplDemandMpnList.forEach((mpn, i) => {
+      const row = ws.addRow({ mpn })
+      row.height = 18
+      row.eachCell({ includeEmpty: true }, (cell: any) => {
+        cell.fill      = { type: 'pattern', pattern: 'solid', fgColor: { argb: i % 2 === 0 ? 'FFFFFFFF' : 'FFF8FAFC' } }
+        cell.font      = { size: 10, name: 'Calibri' }
+        cell.alignment = { vertical: 'middle' }
+      })
+    })
+    ws.autoFilter = 'A1:A1'
+    const buffer = await wb.xlsx.writeBuffer()
+    const blob   = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })
+    const url    = URL.createObjectURL(blob)
+    const a      = document.createElement('a')
+    a.href     = url
+    a.download = 'Price_Estimator_Upload_Template.xlsx'
+    a.click()
+    URL.revokeObjectURL(url)
+  }, [amplDemandMpnList])
+
   // ── Multi-MPN: Excel upload ───────────────────────────────────────────────
   const handleMpnExcelUpload = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
@@ -2405,6 +2493,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
       setCbomRows(dataRows)
       setCbomMpnColIdx(mpnColIdx)
       setCbomFileName(file.name)
+      setCbomMpnList(uniqueMpns)
       // Clear any previously-loaded simple Excel file and populate the textarea
       setMpnExcelFileName('')
       setMpnComponentQtys(qtys)
@@ -2474,6 +2563,143 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
   }, [])
 
   // ── AMPL Demand: upload & clean ─────────────────────────────────────────
+
+  /** Commits fully parsed AMPL data into component state */
+  const commitAmplData = useCallback((
+    headers: string[],
+    rows: Array<(string | number | null)[]>,
+    mpnColIdx: number,
+    mpnList: string[],
+    fileName: string,
+  ) => {
+    setAmplDemandHeaders(headers)
+    setAmplDemandRows(rows)
+    setAmplDemandMpnColIdx(mpnColIdx)
+    setAmplDemandMpnList(mpnList)
+    setAmplDemandFileName(fileName)
+    setAmplDemandRawResults([])
+    setAmplDemandAmplMap({})
+    setAmplDemandNexarMap({})
+    setAmplDemandDeepRows([])
+  }, [])
+
+  /** Parse one ExcelJS worksheet; shows alert if filter cols are missing */
+  const doProcessAmplSheet = useCallback((ws: any, fileName: string) => {
+    const resolveCell = (v: unknown): string | number | null => {
+      if (v == null) return null
+      if (v instanceof Date) return v.toISOString().slice(0, 10)
+      if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') return v as string | number
+      if (typeof v === 'object') {
+        const obj = v as Record<string, unknown>
+        if ('result' in obj && obj.result != null) return obj.result as string | number
+        if ('richText' in obj && Array.isArray(obj.richText)) return (obj.richText as Array<{ text: string }>).map(rt => rt.text).join('')
+        if ('text' in obj) return String(obj.text)
+      }
+      return String(v)
+    }
+
+    let headers: string[] = []
+    let mpnColIdx = -1
+    let blkColIdx = -1
+    let dColIdx   = -1
+    let validToColIdx = -1
+    let totalDemandColIdx = -1
+    const dataRows: Array<(string | number | null)[]> = []
+    const today = new Date(); today.setHours(0, 0, 0, 0)
+
+    ws.eachRow((row: any) => {
+      const rawVals = row.values as unknown[]
+      const maxCol = rawVals.length - 1
+      const rowArr: (string | number | null)[] = Array.from({ length: maxCol }, (_, i) => resolveCell(rawVals[i + 1]))
+
+      if (!headers.length) {
+        const mpnIdx = rowArr.findIndex(v => String(v ?? '').trim().toUpperCase() === 'MPN')
+        if (mpnIdx !== -1) {
+          headers = rowArr.map(v => String(v ?? '').trim())
+          mpnColIdx         = mpnIdx
+          blkColIdx         = headers.findIndex(h => h.toUpperCase() === 'BLK')
+          dColIdx           = headers.findIndex(h => h.toUpperCase() === 'D')
+          validToColIdx     = headers.findIndex(h => h.replace(/\s+/g, ' ').toUpperCase() === 'VALID TO')
+          totalDemandColIdx = headers.findIndex(h => h.replace(/\s+/g, ' ').toUpperCase() === 'TOTAL DEMAND')
+        }
+        return
+      }
+
+      if (mpnColIdx === -1) return
+      const mpnVal = String(rowArr[mpnColIdx] ?? '').trim()
+      if (!mpnVal) return
+
+      // Apply filters only when columns exist
+      if (blkColIdx !== -1 && rowArr[blkColIdx] != null && String(rowArr[blkColIdx]).trim() !== '') return
+      if (dColIdx   !== -1 && rowArr[dColIdx]   != null && String(rowArr[dColIdx]).trim()   !== '') return
+      if (validToColIdx !== -1 && rowArr[validToColIdx] != null) {
+        const raw = rowArr[validToColIdx] as unknown
+        const dt  = raw instanceof Date ? raw : new Date(String(raw))
+        if (!isNaN(dt.getTime()) && dt < today) return
+      }
+      if (totalDemandColIdx !== -1) {
+        const td = typeof rowArr[totalDemandColIdx] === 'number'
+          ? rowArr[totalDemandColIdx] as number
+          : parseFloat(String(rowArr[totalDemandColIdx] ?? ''))
+        if (!isNaN(td) && td === 0) return
+      }
+
+      dataRows.push(Array.from({ length: headers.length }, (_, k) => (k < rowArr.length ? rowArr[k] : null)))
+    })
+
+    if (!headers.length || mpnColIdx === -1) {
+      alert('Could not find "MPN" header column in the AMPL Demand file.')
+      return
+    }
+
+    // Build unique MPN list for Lytica template
+    const seen = new Set<string>()
+    const mpnList: string[] = []
+    for (const row of dataRows) {
+      const m = String(row[mpnColIdx] ?? '').trim().toUpperCase()
+      if (m && !seen.has(m)) { seen.add(m); mpnList.push(m) }
+    }
+
+    // Check if none of the filter columns were found
+    const missingFilterCols = blkColIdx === -1 && dColIdx === -1 && validToColIdx === -1 && totalDemandColIdx === -1
+
+    // Store parsed data for possible deferred commit (missing-cols alert)
+    amplPendingDataRef.current = { headers, rows: dataRows, mpnColIdx, mpnList, fileName }
+
+    if (missingFilterCols) {
+      setAmplMissingColsAlertOpen(true)
+    } else {
+      if (!dataRows.length) {
+        alert('No data rows remain after cleaning (check Blk / D / Valid to / Total Demand filters).')
+        return
+      }
+      commitAmplData(headers, dataRows, mpnColIdx, mpnList, fileName)
+      amplPendingDataRef.current = null
+    }
+  }, [commitAmplData])
+
+  /** Called when user confirms sheet selection in the multi-sheet picker */
+  const handleAmplSheetPickerConfirm = useCallback(() => {
+    const wb = amplPendingWbRef.current
+    if (!wb) return
+    const ws = wb.worksheets.find((s: any) => s.name === amplSheetPickerSelected) ?? wb.worksheets[0]
+    setAmplSheetPickerOpen(false)
+    doProcessAmplSheet(ws, amplPendingFileNameRef.current)
+  }, [doProcessAmplSheet, amplSheetPickerSelected])
+
+  /** Called when user clicks "Continue anyway" in the missing-cols alert */
+  const handleAmplMissingColsContinue = useCallback(() => {
+    const pending = amplPendingDataRef.current
+    setAmplMissingColsAlertOpen(false)
+    if (!pending) return
+    if (!pending.rows.length) {
+      alert('No data rows were found in the selected sheet.')
+      return
+    }
+    commitAmplData(pending.headers, pending.rows, pending.mpnColIdx, pending.mpnList, pending.fileName)
+    amplPendingDataRef.current = null
+  }, [commitAmplData])
+
   const handleAmplDemandUpload = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     if (!file) return
@@ -2482,92 +2708,23 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
       const ExcelJS = (await import('exceljs')).default
       const wb = new ExcelJS.Workbook()
       await wb.xlsx.load(await file.arrayBuffer())
-      const ws = wb.worksheets[0]
-      if (!ws) { alert('No sheets found in the AMPL Demand file.'); return }
+      if (!wb.worksheets.length) { alert('No sheets found in the AMPL Demand file.'); return }
 
-      const resolveCell = (v: unknown): string | number | null => {
-        if (v == null) return null
-        if (v instanceof Date) return v.toISOString().slice(0, 10)
-        if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') return v as string | number
-        if (typeof v === 'object') {
-          const obj = v as Record<string, unknown>
-          if ('result' in obj && obj.result != null) return obj.result as string | number
-          if ('richText' in obj && Array.isArray(obj.richText)) return (obj.richText as Array<{ text: string }>).map(rt => rt.text).join('')
-          if ('text' in obj) return String(obj.text)
-        }
-        return String(v)
+      amplPendingWbRef.current      = wb
+      amplPendingFileNameRef.current = file.name
+
+      if (wb.worksheets.length > 1) {
+        // Multiple sheets — let the user pick
+        setAmplSheetNames(wb.worksheets.map((ws: any) => ws.name))
+        setAmplSheetPickerSelected(wb.worksheets[0].name)
+        setAmplSheetPickerOpen(true)
+      } else {
+        doProcessAmplSheet(wb.worksheets[0], file.name)
       }
-
-      let headers: string[] = []
-      let mpnColIdx = -1
-      let blkColIdx = -1
-      let dColIdx   = -1
-      let validToColIdx = -1
-      let totalDemandColIdx = -1
-      const dataRows: Array<(string | number | null)[]> = []
-      const today = new Date(); today.setHours(0, 0, 0, 0)
-
-      ws.eachRow((row, rowNum) => {
-        const rawVals = row.values as unknown[]
-        const maxCol = rawVals.length - 1
-        const rowArr: (string | number | null)[] = Array.from({ length: maxCol }, (_, i) => resolveCell(rawVals[i + 1]))
-
-        // Detect header row: look for "MPN" in col D (idx 3)
-        if (!headers.length) {
-          const mpnIdx = rowArr.findIndex(v => String(v ?? '').trim().toUpperCase() === 'MPN')
-          if (mpnIdx !== -1) {
-            headers = rowArr.map(v => String(v ?? '').trim())
-            mpnColIdx          = mpnIdx
-            blkColIdx          = headers.findIndex(h => h.toUpperCase() === 'BLK')
-            dColIdx            = headers.findIndex(h => h.toUpperCase() === 'D')
-            validToColIdx      = headers.findIndex(h => h.replace(/\s+/g, ' ').toUpperCase() === 'VALID TO')
-            totalDemandColIdx  = headers.findIndex(h => h.replace(/\s+/g, ' ').toUpperCase() === 'TOTAL DEMAND')
-          }
-          return
-        }
-
-        if (mpnColIdx === -1) return
-        const mpnVal = String(rowArr[mpnColIdx] ?? '').trim()
-        if (!mpnVal) return
-
-        // ── Data cleaning ─────────────────────────────────────────
-        // 1. Remove rows where "Blk" has any value
-        if (blkColIdx !== -1 && rowArr[blkColIdx] != null && String(rowArr[blkColIdx]).trim() !== '') return
-        // 2. Remove rows where "D" has any value
-        if (dColIdx !== -1 && rowArr[dColIdx] != null && String(rowArr[dColIdx]).trim() !== '') return
-        // 3. Remove rows where "Valid to" is earlier than today (expired)
-        if (validToColIdx !== -1 && rowArr[validToColIdx] != null) {
-          const raw = rowArr[validToColIdx] as unknown
-          const dt = raw instanceof Date ? raw : new Date(String(raw))
-          if (!isNaN(dt.getTime()) && dt < today) return
-        }
-        // 4. Remove rows where "Total Demand" == 0
-        if (totalDemandColIdx !== -1) {
-          const td = typeof rowArr[totalDemandColIdx] === 'number'
-            ? rowArr[totalDemandColIdx] as number
-            : parseFloat(String(rowArr[totalDemandColIdx] ?? ''))
-          if (!isNaN(td) && td === 0) return
-        }
-
-        const normRow: (string | number | null)[] = Array.from({ length: headers.length }, (_, k) => (k < rowArr.length ? rowArr[k] : null))
-        dataRows.push(normRow)
-      })
-
-      if (!headers.length || mpnColIdx === -1) { alert('Could not find "MPN" header column in the AMPL Demand file.'); return }
-      if (!dataRows.length) { alert('No data rows remain after cleaning (check Blk/D/Valid to/Total Demand filters).'); return }
-
-      setAmplDemandHeaders(headers)
-      setAmplDemandRows(dataRows)
-      setAmplDemandMpnColIdx(mpnColIdx)
-      setAmplDemandFileName(file.name)
-      setAmplDemandRawResults([])
-      setAmplDemandAmplMap({})
-      setAmplDemandNexarMap({})
-      setAmplDemandDeepRows([])
     } catch (err) {
       alert('Error reading AMPL Demand file: ' + (err instanceof Error ? err.message : String(err)))
     }
-  }, [])
+  }, [doProcessAmplSheet])
 
   // ── AMPL Demand: search handler ───────────────────────────────────────────
   const handleAmplDemandSearch = useCallback(async () => {
@@ -3266,7 +3423,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                 <Calculator size={16} />
               </div>
               <div className="flex-1">
-                <h2 className="font-bold text-gray-800 leading-tight">Price Tool</h2>
+                <h2 className="font-bold text-gray-800 leading-tight">KE-SOL Quote Price tool</h2>
                 <p className="text-xs text-gray-400">SAP + Nexar Market + Lytica</p>
               </div>
               {mode !== 'page' && (
@@ -4217,8 +4374,8 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                                           <td className="px-3 py-2.5 text-right font-mono font-semibold text-indigo-700 whitespace-nowrap border-l border-l-gray-200">{totalUsd != null ? fmt6(totalUsd) : '—'}</td>
                                           {/* Winner */}
                                           <td className="px-3 py-2.5 text-center border-l border-l-gray-200 whitespace-nowrap">
-                                            {winner === 'mc'  && <span className="text-xs font-bold px-2 py-0.5 rounded-full bg-purple-100 text-purple-700">MC</span>}
-                                            {winner === 'mpn' && <span className="text-xs font-bold px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700">MPN</span>}
+                                            {winner === 'mc'  && <span className="text-xs font-bold px-2 py-0.5 rounded-full bg-purple-100 text-purple-700">Interplant (IPN)</span>}
+                                            {winner === 'mpn' && <span className="text-xs font-bold px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700">Interplant (MPN)</span>}
                                             {winner === 'tie' && <span className="text-xs text-gray-400">Tie</span>}
                                           </td>
                                         </tr>
@@ -4243,133 +4400,162 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
 
                   {/* Multi-MPN search form */}
                   <div className="bg-gray-50 rounded-xl border border-gray-200 p-5">
-                    <div className="flex gap-4 mb-4">
-                      <div className="flex-1">
-                        <div className="flex items-center justify-between mb-1.5">
-                          <label className="block text-sm font-medium text-gray-600">
-                            MPN Numbers
-                            <span className="text-gray-400 font-normal ml-1">{mpnExcelFileName ? '' : '(one per line or comma-separated)'}</span>
-                          </label>
-                          <div className="flex items-center gap-2">
-                            {mpnExcelFileName && (
-                              <span className="flex items-center gap-1 text-[11px] text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-full px-2 py-0.5">
-                                <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
-                                {mpnExcelFileName}
-                                <button
-                                  onClick={() => { setMpnExcelFileName(''); setMpnComponentQtys({}); setMpnComponentQtyDefaults({}); setMultiMpnInput('') }}
-                                  className="ml-1 text-emerald-500 hover:text-red-500 font-bold leading-none"
-                                  title="Clear Excel data"
-                                >×</button>
-                              </span>
-                            )}
-                            {cbomFileName && (
-                              <span className="flex items-center gap-1 text-[11px] text-orange-700 bg-orange-50 border border-orange-200 rounded-full px-2 py-0.5">
-                                <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
-                                CBOM: {cbomFileName}
-                                <button
-                                  onClick={() => { setCbomFileName(''); setCbomRows([]); setCbomHeaders([]); setCbomMpnColIdx(-1); setMpnComponentQtys({}); setMpnComponentQtyDefaults({}); setMultiMpnInput('') }}
-                                  className="ml-1 text-orange-500 hover:text-red-500 font-bold leading-none"
-                                  title="Clear CBOM data"
-                                >×</button>
-                              </span>
-                            )}
-                            {lyticaFileName && (
-                              <span className="flex items-center gap-1 text-[11px] text-teal-700 bg-teal-50 border border-teal-200 rounded-full px-2 py-0.5">
-                                <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" /></svg>
-                                Lytica: {lyticaFileName}
-                                <button
-                                  onClick={() => { setLyticaFileName(''); setLyticaMap({}) }}
-                                  className="ml-1 text-teal-500 hover:text-red-500 font-bold leading-none"
-                                  title="Clear Lytica data"
-                                >×</button>
-                              </span>
-                            )}
-                            <label className="flex items-center gap-1.5 cursor-pointer px-3 py-1 text-xs font-semibold rounded-lg bg-white border border-gray-300 hover:border-blue-400 hover:text-blue-600 text-gray-600 transition-colors">
-                              <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" /></svg>
-                              Upload Excel
-                              <input type="file" accept=".xlsx,.xls" className="hidden" onChange={handleMpnExcelUpload} />
-                            </label>
-                            <label className="flex items-center gap-1.5 cursor-pointer px-3 py-1 text-xs font-semibold rounded-lg bg-white border border-orange-300 hover:border-orange-500 hover:text-orange-600 text-gray-600 transition-colors" title="Upload a Costed BOM (CBOM) Excel — extracts MPNs from the 'CBOM' sheet and generates an enriched export">
-                              <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
-                              Upload CBOM
-                              <input type="file" accept=".xlsx,.xls" className="hidden" onChange={handleCbomUpload} />
-                            </label>
-                            <label className="flex items-center gap-1.5 cursor-pointer px-3 py-1 text-xs font-semibold rounded-lg bg-white border border-teal-300 hover:border-teal-500 hover:text-teal-600 text-gray-600 transition-colors" title="Upload a Lytica report — matches MPN Searched with 90th percentile price for Deep Analysis comparison">
-                              <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" /></svg>
-                              Upload Lytica
-                              <input type="file" accept=".xlsx,.xls" className="hidden" onChange={handleLyticaUpload} />
-                            </label>
-                            <button
-                              onClick={downloadTemplate}
-                              className="flex items-center gap-1.5 px-3 py-1 text-xs font-semibold rounded-lg bg-white border border-gray-300 hover:border-emerald-400 hover:text-emerald-600 text-gray-600 transition-colors"
-                              title="Download Excel template with MPN and Quantity columns"
-                            >
-                              <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
-                              Template
-                            </button>
-                          </div>
-                        </div>
-                        {mpnExcelFileName ? (
-                          <div className="w-full rounded-lg border border-emerald-200 bg-white overflow-hidden" style={{ height: '172px' }}>
-                            <div className="overflow-y-auto h-full">
-                              <table className="w-full text-xs border-collapse">
-                                <thead className="sticky top-0 bg-emerald-600 text-white text-[10px] uppercase tracking-wide">
-                                  <tr>
-                                    <th className="px-2 py-1.5 text-center w-8 font-semibold">#</th>
-                                    <th className="px-3 py-1.5 text-left font-semibold">MPN</th>
-                                    <th className="px-3 py-1.5 text-right font-semibold">Quantity</th>
-                                  </tr>
-                                </thead>
-                                <tbody>
-                                  {Object.entries(mpnComponentQtys).map(([comp, q], idx) => (
-                                    <tr key={comp} className={idx % 2 === 0 ? 'bg-white' : 'bg-gray-50'}>
-                                      <td className="px-2 py-1 text-center text-gray-400 font-mono">{idx + 1}</td>
-                                      <td className="px-3 py-1 font-mono font-semibold text-gray-800">{comp}</td>
-                                      <td className="px-3 py-1 text-right font-mono text-blue-700">
-                                        {q.toLocaleString()}
-                                        {mpnComponentQtyDefaults[comp] && (
-                                          <span className="ml-1 text-[10px] text-gray-400 font-normal">
-                                            ({mpnComponentQtyDefaults[comp]})
-                                          </span>
-                                        )}
-                                      </td>
-                                    </tr>
-                                  ))}
-                                </tbody>
-                              </table>
-                            </div>
-                            <div className="border-t border-emerald-100 bg-emerald-50 px-3 py-1 text-[10px] text-emerald-700 font-medium">
-                              {Object.keys(mpnComponentQtys).length} MPN{Object.keys(mpnComponentQtys).length !== 1 ? 's' : ''} loaded
-                            </div>
-                          </div>
-                        ) : (
-                          <textarea
-                            placeholder={"RC0402FR-07100KL\nRC0402FR-0710KL\nRC0402FR-071KL"}
-                            value={multiMpnInput}
-                            onChange={e => setMultiMpnInput(e.target.value.toUpperCase())}
-                            rows={6}
-                            className="w-full rounded-lg border border-gray-300 px-4 py-2.5 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-500 resize-y"
-                          />
+
+                    {/* ── Toolbar: file chips + Upload CBOM + Upload Lytica + "..." menu ── */}
+                    <div className="flex items-center justify-between mb-3 gap-2 flex-wrap">
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        <span className="text-sm font-semibold text-gray-700">MPN Numbers</span>
+                        {!mpnExcelFileName && !cbomFileName && (
+                          <span className="text-xs text-gray-400">(one per line or comma-separated)</span>
+                        )}
+                        {mpnExcelFileName && (
+                          <span className="flex items-center gap-1 text-[11px] text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-full px-2 py-0.5">
+                            <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+                            {mpnExcelFileName}
+                            <button onClick={() => { setMpnExcelFileName(''); setMpnComponentQtys({}); setMpnComponentQtyDefaults({}); setMultiMpnInput('') }} className="ml-1 text-emerald-500 hover:text-red-500 font-bold leading-none" title="Clear Excel data">×</button>
+                          </span>
+                        )}
+                        {cbomFileName && (
+                          <span className="flex items-center gap-1 text-[11px] text-orange-700 bg-orange-50 border border-orange-200 rounded-full px-2 py-0.5">
+                            <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+                            CBOM: {cbomFileName}
+                            <button onClick={() => { setCbomFileName(''); setCbomRows([]); setCbomHeaders([]); setCbomMpnColIdx(-1); setCbomMpnList([]); setMpnComponentQtys({}); setMpnComponentQtyDefaults({}); setMultiMpnInput('') }} className="ml-1 text-orange-500 hover:text-red-500 font-bold leading-none" title="Clear CBOM data">×</button>
+                          </span>
+                        )}
+                        {lyticaFileName && (
+                          <span className="flex items-center gap-1 text-[11px] text-teal-700 bg-teal-50 border border-teal-200 rounded-full px-2 py-0.5">
+                            <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" /></svg>
+                            Lytica: {lyticaFileName}
+                            <button onClick={() => { setLyticaFileName(''); setLyticaMap({}) }} className="ml-1 text-teal-500 hover:text-red-500 font-bold leading-none" title="Clear Lytica data">×</button>
+                          </span>
                         )}
                       </div>
+                      <div className="flex items-center gap-2">
+                        {/* Upload CBOM — always visible */}
+                        <label className="flex items-center gap-1.5 cursor-pointer px-3 py-1.5 text-xs font-semibold rounded-lg bg-white border border-orange-300 hover:bg-orange-50 hover:border-orange-500 hover:text-orange-700 text-gray-600 transition-colors shadow-sm" title="Upload a Costed BOM (CBOM) Excel — extracts MPNs and generates an enriched export">
+                          <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+                          Upload CBOM
+                          <input type="file" accept=".xlsx,.xls" className="hidden" onChange={handleCbomUpload} />
+                        </label>
+                        {/* Upload Lytica — always visible */}
+                        <label className="flex items-center gap-1.5 cursor-pointer px-3 py-1.5 text-xs font-semibold rounded-lg bg-white border border-teal-300 hover:bg-teal-50 hover:border-teal-500 hover:text-teal-700 text-gray-600 transition-colors shadow-sm" title="Upload a Lytica report — matches MPN Searched with 90th percentile price">
+                          <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" /></svg>
+                          Upload Lytica
+                          <input type="file" accept=".xlsx,.xls" className="hidden" onChange={handleLyticaUpload} />
+                        </label>
+                        {/* "⋯" more-actions menu */}
+                        <div className="relative">
+                          <button
+                            onClick={() => setShowMpnMenu(v => !v)}
+                            className="flex items-center justify-center w-8 h-8 rounded-lg bg-white border border-gray-300 hover:border-gray-400 hover:bg-gray-50 text-gray-500 hover:text-gray-700 transition-colors shadow-sm text-base font-bold leading-none"
+                            title="More actions"
+                          >
+                            ···
+                          </button>
+                          {showMpnMenu && (
+                            <div
+                              className="absolute right-0 top-9 z-30 w-56 bg-white rounded-xl border border-gray-200 shadow-xl py-1.5"
+                              onMouseLeave={() => setShowMpnMenu(false)}
+                            >
+                              {/* Import section */}
+                              <p className="text-[10px] text-gray-400 px-3 pt-1.5 pb-0.5 uppercase tracking-wider font-semibold">Import</p>
+                              <label className="flex items-center gap-2 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 cursor-pointer rounded-lg mx-1">
+                                <svg className="h-4 w-4 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" /></svg>
+                                Upload Excel
+                                <input type="file" accept=".xlsx,.xls" className="hidden" onChange={e => { handleMpnExcelUpload(e); setShowMpnMenu(false) }} />
+                              </label>
+                              {/* Export section */}
+                              <div className="my-1 border-t border-gray-100" />
+                              <p className="text-[10px] text-gray-400 px-3 pt-1.5 pb-0.5 uppercase tracking-wider font-semibold">Export</p>
+                              <button
+                                onClick={() => { downloadTemplate(); setShowMpnMenu(false) }}
+                                className="flex items-center gap-2 w-full px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 rounded-lg mx-auto"
+                                style={{ textAlign: 'left' }}
+                              >
+                                <svg className="h-4 w-4 text-emerald-500 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+                                Download Template
+                              </button>
+                              <button
+                                onClick={() => { downloadLyticaTemplate(); setShowMpnMenu(false) }}
+                                disabled={cbomMpnList.length === 0}
+                                className="flex items-center gap-2 w-full px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 rounded-lg mx-auto disabled:opacity-40 disabled:cursor-not-allowed"
+                                style={{ textAlign: 'left' }}
+                                title={cbomMpnList.length === 0 ? 'Upload a CBOM first to generate this template' : `Export ${cbomMpnList.length} MPNs from loaded CBOM`}
+                              >
+                                <svg className="h-4 w-4 text-indigo-500 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+                                <span className="leading-tight">
+                                  Download Lytica Template
+                                  <span className="block text-[10px] text-gray-400 font-normal">CBOM List{cbomMpnList.length > 0 ? ` (${cbomMpnList.length} MPNs)` : ''}</span>
+                                </span>
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* ── MPN input area ── */}
+                    {mpnExcelFileName ? (
+                      <div className="w-full rounded-lg border border-emerald-200 bg-white overflow-hidden mb-3" style={{ height: '172px' }}>
+                        <div className="overflow-y-auto h-full">
+                          <table className="w-full text-xs border-collapse">
+                            <thead className="sticky top-0 bg-emerald-600 text-white text-[10px] uppercase tracking-wide">
+                              <tr>
+                                <th className="px-2 py-1.5 text-center w-8 font-semibold">#</th>
+                                <th className="px-3 py-1.5 text-left font-semibold">MPN</th>
+                                <th className="px-3 py-1.5 text-right font-semibold">Quantity</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {Object.entries(mpnComponentQtys).map(([comp, q], idx) => (
+                                <tr key={comp} className={idx % 2 === 0 ? 'bg-white' : 'bg-gray-50'}>
+                                  <td className="px-2 py-1 text-center text-gray-400 font-mono">{idx + 1}</td>
+                                  <td className="px-3 py-1 font-mono font-semibold text-gray-800">{comp}</td>
+                                  <td className="px-3 py-1 text-right font-mono text-blue-700">
+                                    {q.toLocaleString()}
+                                    {mpnComponentQtyDefaults[comp] && (
+                                      <span className="ml-1 text-[10px] text-gray-400 font-normal">({mpnComponentQtyDefaults[comp]})</span>
+                                    )}
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                        <div className="border-t border-emerald-100 bg-emerald-50 px-3 py-1 text-[10px] text-emerald-700 font-medium">
+                          {Object.keys(mpnComponentQtys).length} MPN{Object.keys(mpnComponentQtys).length !== 1 ? 's' : ''} loaded
+                        </div>
+                      </div>
+                    ) : (
+                      <textarea
+                        placeholder={"RC0402FR-07100KL\nRC0402FR-0710KL\nRC0402FR-071KL"}
+                        value={multiMpnInput}
+                        onChange={e => setMultiMpnInput(e.target.value.toUpperCase())}
+                        rows={6}
+                        className="w-full rounded-lg border border-gray-300 px-4 py-2.5 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-500 resize-y mb-3"
+                      />
+                    )}
+
+                    {/* ── Controls + Search row ── */}
+                    <div className="flex items-end gap-3 flex-wrap">
                       {!mpnExcelFileName && (
-                        <div className="w-40">
-                          <label className="block text-sm font-medium text-gray-600 mb-1.5">Quantity</label>
+                        <div>
+                          <label className="block text-xs font-medium text-gray-500 mb-1">Quantity</label>
                           <input
                             type="number" min={0.0001} step="any" value={qty}
                             onChange={e => setQty(Math.max(0.0001, parseFloat(e.target.value) || 0.0001))}
-                            className="w-full rounded-lg border border-gray-300 px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                            className="w-28 rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
                           />
                         </div>
                       )}
-                      <div className="w-40">
-                        <label className="block text-sm font-medium text-gray-600 mb-1.5">My Plant</label>
+                      <div>
+                        <label className="block text-xs font-medium text-gray-500 mb-1">My Plant</label>
                         <select
                           value={myPlant}
                           onChange={e => setMyPlant(e.target.value)}
-                          className="w-full rounded-lg border border-gray-300 px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white"
+                          className="rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white"
                         >
-                          <option value="">- None -</option>
+                          <option value="">— None —</option>
                           <option value="KEMX">KEMX</option>
                           <option value="KEJ">KEJ</option>
                           <option value="KECN">KECN</option>
@@ -4378,37 +4564,16 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                           <option value="KERO">KERO</option>
                         </select>
                       </div>
-                      <div className="w-28">
-                        <label className="block text-sm font-medium text-gray-600 mb-1.5">Window (days)</label>
+                      <div>
+                        <label className="block text-xs font-medium text-gray-500 mb-1">Window (days)</label>
                         <input
                           type="number" min={1} max={365} step={1} value={windowDays}
                           onChange={e => setWindowDays(Math.max(1, Math.min(365, parseInt(e.target.value) || 45)))}
-                          className="w-full rounded-lg border border-gray-300 px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                          className="w-24 rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
                         />
                       </div>
-                    </div>
-                    <div className="flex items-center gap-4">
-                      <button
-                        onClick={multiMpnLoading ? () => abortMpnRef.current?.abort() : handleMultiMpnSearch}
-                        disabled={!multiMpnLoading && !multiMpnInput.trim()}
-                        onMouseEnter={() => { if (multiMpnLoading) setStopMpnHover(true) }}
-                        onMouseLeave={() => setStopMpnHover(false)}
-                        className={`px-6 py-2.5 rounded-lg text-sm font-semibold transition-colors ${
-                          multiMpnLoading && stopMpnHover
-                            ? 'bg-red-600 text-white hover:bg-red-700 cursor-pointer'
-                            : multiMpnLoading
-                            ? 'bg-blue-400 text-white cursor-default'
-                            : 'bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed'
-                        }`}
-                      >
-                        <span className="relative inline-flex items-center justify-center">
-                          <span className="invisible select-none" aria-hidden>Searching…</span>
-                          <span className="absolute inset-0 flex items-center justify-center">
-                            {multiMpnLoading && stopMpnHover ? 'Stop' : multiMpnLoading ? 'Searching…' : 'Search All'}
-                          </span>
-                        </span>
-                      </button>
-                      <label className="flex items-center gap-2 cursor-pointer select-none">
+                      <div className="flex-1" />
+                      <label className="flex items-center gap-2 cursor-pointer select-none pb-0.5">
                         <input
                           type="checkbox"
                           checked={searchNexar}
@@ -4417,6 +4582,27 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                         />
                         <span className="text-sm text-gray-600">Include <span className="font-semibold text-purple-600">Nexar Market</span></span>
                       </label>
+                      <button
+                        onClick={multiMpnLoading ? () => abortMpnRef.current?.abort() : handleMultiMpnSearch}
+                        disabled={!multiMpnLoading && !multiMpnInput.trim()}
+                        onMouseEnter={() => { if (multiMpnLoading) setStopMpnHover(true) }}
+                        onMouseLeave={() => setStopMpnHover(false)}
+                        className={`flex items-center gap-2 px-6 py-2 rounded-lg text-sm font-semibold transition-colors shadow-sm ${
+                          multiMpnLoading && stopMpnHover
+                            ? 'bg-red-600 text-white hover:bg-red-700 cursor-pointer'
+                            : multiMpnLoading
+                            ? 'bg-blue-400 text-white cursor-default'
+                            : 'bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed'
+                        }`}
+                      >
+                        {multiMpnLoading && !stopMpnHover && (
+                          <svg className="animate-spin h-4 w-4" fill="none" viewBox="0 0 24 24">
+                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
+                          </svg>
+                        )}
+                        {multiMpnLoading && stopMpnHover ? 'Stop' : multiMpnLoading ? 'Searching…' : 'Search All'}
+                      </button>
                     </div>
                   </div>
 
@@ -4630,14 +4816,12 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                                     <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">Searched</th>
                                     <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">Internal PN</th>
                                     <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">Plant</th>
-                                    <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200">Qty</th>
+                                    <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200">PO/QTY</th>
                                     <th className="px-3 py-2.5 text-center whitespace-nowrap border-b border-gray-200">Cur</th>
                                     <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200">Last PO (Local)</th>
                                     <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200">Std (Local)</th>
                                     <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200">Last PO (USD)</th>
                                     <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200">Std (USD)</th>
-                                    <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200">QTY Inserted</th>
-                                    <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200">Total Cost (USD) per QTY Inserted</th>
                                     <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">Date</th>
                                     <th className="px-3 py-2.5 text-center whitespace-nowrap border-b border-gray-200">Last PO Price &gt; Std Price</th>
                                     <th className="px-3 py-2.5 text-center whitespace-nowrap border-b border-gray-200">Swap</th>
@@ -4665,8 +4849,6 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                                       <td className="px-3 py-2 text-right font-mono text-gray-500 whitespace-nowrap">—</td>
                                       <td className="px-3 py-2 text-right font-mono text-blue-700 font-semibold whitespace-nowrap">—</td>
                                       <td className="px-3 py-2 text-right font-mono text-gray-500 whitespace-nowrap">—</td>
-                                      <td className="px-3 py-2 text-right font-mono text-gray-700 whitespace-nowrap">—</td>
-                                      <td className="px-3 py-2 text-right font-mono text-gray-700 whitespace-nowrap">—</td>
                                       <td className="px-3 py-2 text-gray-500 whitespace-nowrap">—</td>
                                       <td className="px-3 py-2 text-center whitespace-nowrap" />
                                       <td className="px-3 py-2 text-center whitespace-nowrap" />
@@ -4694,14 +4876,12 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                                     <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">Searched</th>
                                     <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">Internal PN</th>
                                     <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">Plant</th>
-                                    <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200">Qty</th>
+                                    <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200">PO/QTY</th>
                                     <th className="px-3 py-2.5 text-center whitespace-nowrap border-b border-gray-200">Cur</th>
                                     <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200">Last PO (Local)</th>
                                     <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200">Std (Local)</th>
                                     <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200">Last PO (USD)</th>
                                     <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200">Std (USD)</th>
-                                    <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200">QTY Inserted</th>
-                                    <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200">Total Cost (USD) per QTY Inserted</th>
                                     <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">Date</th>
                                     <th className="px-3 py-2.5 text-center whitespace-nowrap border-b border-gray-200">Last PO Price &gt; Std Price</th>
                                     <th className="px-3 py-2.5 text-center whitespace-nowrap border-b border-gray-200">Swap</th>
@@ -4746,8 +4926,6 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                                         <td className="px-3 py-2 text-right font-mono text-gray-500 whitespace-nowrap">{resolveStdLocal(bestRow) != null ? resolveStdLocal(bestRow)!.toLocaleString('en-US', { minimumFractionDigits: 4 }) : '—'}</td>
                                         <td className={`px-3 py-2 text-right font-mono font-semibold whitespace-nowrap ${isLpoGtStd ? 'text-red-700' : 'text-blue-700'}`}>{fmt6(lpoUsd)}</td>
                                         <td className="px-3 py-2 text-right font-mono text-gray-500 whitespace-nowrap">{fmt6(stdUsd)}</td>
-                                        <td className="px-3 py-2 text-right font-mono text-gray-700 whitespace-nowrap">{qtyIns.toLocaleString()}</td>
-                                        <td className="px-3 py-2 text-right font-mono text-gray-700 whitespace-nowrap">{lpoUsd != null && lpoUsd > 0 ? fmt6(lpoUsd * qtyIns) : '—'}</td>
                                         <td className="px-3 py-2 text-gray-500 whitespace-nowrap">{bestRow.lastPoDate || '—'}</td>
                                         <td className="px-3 py-2 text-center whitespace-nowrap">
                                           {isLpoGtStd && <span className="text-[10px] font-bold text-red-700 bg-red-100 px-1.5 py-0.5 rounded">1</span>}
@@ -4783,7 +4961,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                                         <tr key={`missing-${m}`} className={isBlocked ? 'bg-amber-50/60' : 'bg-gray-50/40'}>
                                           <td className="px-2 py-2 text-center text-gray-300">—</td>
                                           <td className="px-3 py-2 font-mono text-gray-500 whitespace-nowrap">{m}</td>
-                                          <td colSpan={Object.keys(mpnNexarMap).length > 0 ? 20 : 17} className={`px-3 py-2 text-xs italic ${isBlocked ? 'text-amber-500' : 'text-gray-400'}`}>{reason}</td>
+                                          <td colSpan={Object.keys(mpnNexarMap).length > 0 ? 18 : 15} className={`px-3 py-2 text-xs italic ${isBlocked ? 'text-amber-500' : 'text-gray-400'}`}>{reason}</td>
                                         </tr>
                                       )
                                     })
@@ -4852,8 +5030,6 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                                         <th className="px-3 py-2.5 text-center border-b border-gray-200 border-l border-l-purple-200 whitespace-nowrap bg-purple-50/50" colSpan={7}>Multi-Component</th>
                                         <th className="px-3 py-2.5 text-center border-b border-gray-200 border-l border-l-orange-200 whitespace-nowrap bg-orange-50/50" colSpan={6}>Nexar Market</th>
                                         {Object.keys(lyticaMap).length > 0 && <th className="px-3 py-2.5 text-center border-b border-gray-200 border-l border-l-teal-200 whitespace-nowrap bg-teal-50/50" colSpan={4}>Lytica</th>}
-                                        <th className="px-3 py-2.5 text-center border-b border-gray-200 border-l border-l-gray-300 whitespace-nowrap" rowSpan={2}>QTY Inserted</th>
-                                        <th className="px-3 py-2.5 text-center border-b border-gray-200 border-l border-l-gray-300 whitespace-nowrap" rowSpan={2}>Total (USD) per QTY</th>
                                         <th className="px-3 py-2.5 text-center border-b border-gray-200 border-l border-l-gray-300 whitespace-nowrap" rowSpan={2}>Winner</th>
                                       </tr>
                                       <tr>
@@ -5007,15 +5183,11 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                                                 </>
                                               )
                                             )}
-                                            {/* QTY Inserted */}
-                                            <td className="px-3 py-2.5 text-right font-mono text-gray-600 whitespace-nowrap border-l border-l-gray-200">{qtyIns}</td>
-                                            {/* Total (USD) per QTY */}
-                                            <td className="px-3 py-2.5 text-right font-mono font-semibold text-indigo-700 whitespace-nowrap border-l border-l-gray-200">{totalUsd != null ? fmt6(totalUsd) : '—'}</td>
                                             {/* Winner */}
                                             <td className="px-3 py-2.5 text-center border-l border-l-gray-200">
                                               {dr.status === 'loading' ? null
-                                                : winner === 'mpn'    ? <span className="px-2 py-0.5 text-[10px] font-bold rounded-full bg-emerald-100 text-emerald-700">Multi-MPN</span>
-                                                : winner === 'mc'     ? <span className="px-2 py-0.5 text-[10px] font-bold rounded-full bg-purple-100 text-purple-700">Multi-Comp</span>
+                                                : winner === 'mpn'    ? <span className="px-2 py-0.5 text-[10px] font-bold rounded-full bg-emerald-100 text-emerald-700">Interplant (MPN)</span>
+                                                : winner === 'mc'     ? <span className="px-2 py-0.5 text-[10px] font-bold rounded-full bg-purple-100 text-purple-700">Interplant (IPN)</span>
                                                 : winner === 'nexar'  ? <span className="px-2 py-0.5 text-[10px] font-bold rounded-full bg-orange-100 text-orange-700">Nexar</span>
                                                 : winner === 'lytica' ? <span className="px-2 py-0.5 text-[10px] font-bold rounded-full bg-teal-100 text-teal-700">Lytica</span>
                                                 : winner === 'tie'    ? <span className="px-2 py-0.5 text-[10px] font-bold rounded-full bg-gray-100 text-gray-500">Tie</span>
@@ -5103,6 +5275,87 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
               {activeTab === 'ampl' && (
                 <div className="space-y-5">
 
+                  {/* ── Sheet picker modal ───────────────────────────────── */}
+                  {amplSheetPickerOpen && (
+                    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm">
+                      <div className="bg-white rounded-2xl shadow-2xl border border-gray-200 w-full max-w-sm mx-4 overflow-hidden">
+                        <div className="px-6 py-4 border-b border-gray-100 flex items-center gap-3">
+                          <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-indigo-100">
+                            <svg className="h-5 w-5 text-indigo-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+                          </span>
+                          <div>
+                            <h3 className="text-sm font-semibold text-gray-800">Multiple Sheets Detected</h3>
+                            <p className="text-xs text-gray-500 mt-0.5">This workbook has {amplSheetNames.length} sheets. Select the one to import.</p>
+                          </div>
+                        </div>
+                        <div className="px-6 py-5">
+                          <label className="block text-xs font-medium text-gray-600 mb-1.5">Sheet</label>
+                          <select
+                            value={amplSheetPickerSelected}
+                            onChange={e => setAmplSheetPickerSelected(e.target.value)}
+                            className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                          >
+                            {amplSheetNames.map(name => (
+                              <option key={name} value={name}>{name}</option>
+                            ))}
+                          </select>
+                        </div>
+                        <div className="px-6 pb-5 flex justify-end gap-2">
+                          <button
+                            onClick={() => { setAmplSheetPickerOpen(false); amplPendingWbRef.current = null }}
+                            className="px-4 py-2 text-sm font-medium rounded-lg border border-gray-300 text-gray-600 hover:bg-gray-50 transition-colors"
+                          >Cancel</button>
+                          <button
+                            onClick={handleAmplSheetPickerConfirm}
+                            className="px-4 py-2 text-sm font-semibold rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white transition-colors shadow-sm"
+                          >Import Sheet</button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* ── Missing filter columns alert ─────────────────────── */}
+                  {amplMissingColsAlertOpen && (
+                    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm">
+                      <div className="bg-white rounded-2xl shadow-2xl border border-gray-200 w-full max-w-md mx-4 overflow-hidden">
+                        <div className="px-6 py-4 border-b border-amber-100 bg-amber-50 flex items-start gap-3">
+                          <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-amber-100 shrink-0 mt-0.5">
+                            <svg className="h-5 w-5 text-amber-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" /></svg>
+                          </span>
+                          <div>
+                            <h3 className="text-sm font-semibold text-amber-800">Filter Columns Not Found</h3>
+                            <p className="text-xs text-amber-700 mt-1 leading-relaxed">
+                              The MPN column was found, but none of the standard filter columns were detected in this file:
+                            </p>
+                          </div>
+                        </div>
+                        <div className="px-6 py-4">
+                          <ul className="space-y-1.5 mb-4">
+                            {['Blk — blocked rows', 'D — discontinued rows', 'Valid to — expired price records', 'Total Demand — zero-demand rows'].map(label => (
+                              <li key={label} className="flex items-center gap-2 text-xs text-gray-600">
+                                <span className="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0" />
+                                {label}
+                              </li>
+                            ))}
+                          </ul>
+                          <p className="text-xs text-gray-500 leading-relaxed">
+                            Without these columns, <strong>no automatic filtering will be applied</strong> and all rows will be imported as-is. Do you want to continue?
+                          </p>
+                        </div>
+                        <div className="px-6 pb-5 flex justify-end gap-2">
+                          <button
+                            onClick={() => { setAmplMissingColsAlertOpen(false); amplPendingDataRef.current = null }}
+                            className="px-4 py-2 text-sm font-medium rounded-lg border border-gray-300 text-gray-600 hover:bg-gray-50 transition-colors"
+                          >Cancel</button>
+                          <button
+                            onClick={handleAmplMissingColsContinue}
+                            className="px-4 py-2 text-sm font-semibold rounded-lg bg-amber-500 hover:bg-amber-600 text-white transition-colors shadow-sm"
+                          >Continue Anyway</button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
                   {/* ── Control card ─────────────────────────────────────────── */}
                   <div className="bg-white rounded-xl border border-gray-200 shadow-sm overflow-hidden">
 
@@ -5148,6 +5401,35 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                         Lytica {lyticaFileName ? '(replace)' : ''}
                         <input type="file" accept=".xlsx,.xls" className="hidden" onChange={handleLyticaUpload} />
                       </label>
+                      {/* "···" more-actions menu */}
+                      <div className="relative">
+                        <button
+                          onClick={() => setShowAmplMenu(v => !v)}
+                          className="flex items-center justify-center w-8 h-8 rounded-lg bg-white border border-gray-300 hover:border-gray-400 hover:bg-gray-50 text-gray-500 hover:text-gray-700 transition-colors shadow-sm text-base font-bold leading-none"
+                          title="More actions"
+                        >···</button>
+                        {showAmplMenu && (
+                          <div
+                            className="absolute left-0 top-9 z-30 w-60 bg-white rounded-xl border border-gray-200 shadow-xl py-1.5"
+                            onMouseLeave={() => setShowAmplMenu(false)}
+                          >
+                            <p className="text-[10px] text-gray-400 px-3 pt-1.5 pb-0.5 uppercase tracking-wider font-semibold">Export</p>
+                            <button
+                              onClick={() => { downloadAmplLyticaTemplate(); setShowAmplMenu(false) }}
+                              disabled={amplDemandMpnList.length === 0}
+                              className="flex items-center gap-2 w-full px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 rounded-lg mx-auto disabled:opacity-40 disabled:cursor-not-allowed"
+                              style={{ textAlign: 'left' }}
+                              title={amplDemandMpnList.length === 0 ? 'Load an AMPL Demand file first' : `Export ${amplDemandMpnList.length} unique MPNs for Lytica`}
+                            >
+                              <svg className="h-4 w-4 text-indigo-500 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+                              <span className="leading-tight">
+                                Download Lytica Template
+                                <span className="block text-[10px] text-gray-400 font-normal">AMPL MPN List{amplDemandMpnList.length > 0 ? ` (${amplDemandMpnList.length} MPNs)` : ''}</span>
+                              </span>
+                            </button>
+                          </div>
+                        )}
+                      </div>
                       {/* Nexar toggle */}
                       <div className="ml-auto flex items-center gap-2">
                         <label className={`flex items-center gap-2 cursor-pointer select-none px-3 py-1.5 rounded-lg border text-xs font-semibold transition-colors ${searchNexar ? 'bg-orange-50 border-orange-300 text-orange-700' : 'bg-white border-gray-200 text-gray-500 hover:border-orange-300'}`}>
