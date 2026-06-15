@@ -1589,6 +1589,327 @@ async function downloadCbomResultsExcel(
   URL.revokeObjectURL(url)
 }
 
+// ── AMPL Demand: Excel export ─────────────────────────────────────────────
+// ── AMPL Demand: Excel export ─────────────────────────────────────────────
+async function downloadAmplResultsExcel(
+  amplHeaders: string[],
+  amplRows: Array<(string | number | null)[]>,
+  amplMpnColIdx: number,
+  amplIqRows: IQItem[],
+  amplDeepRows: DeepAnalysisRow[],
+  amplNexarMap: Record<string, { nexarBestUsd: number | null; nexarSeller: string; nexarManufacturer: string; nexarStock: number | null; nexarMoq: number | null; nexarMpn: string }>,
+  amplLyticaMap: Record<string, { mpnMatched: string; manufacturerMatched: string; price90th: number | null }>,
+  windowDaysVal: number,
+  filename: string,
+): Promise<void> {
+  // Build MPN→best row lookup (same window logic as Multi-MPN)
+  const mpnGroupsMap = new Map<string, IQItem[]>()
+  for (const r of amplIqRows) {
+    if (!mpnGroupsMap.has(r.mpn)) mpnGroupsMap.set(r.mpn, [])
+    mpnGroupsMap.get(r.mpn)!.push(r)
+  }
+  const mpnBestMap = new Map<string, IQItem>()
+  mpnGroupsMap.forEach((rows, mpn) => {
+    const valid = rows.filter(r => r.lastPoDate && !isNaN(new Date(r.lastPoDate).getTime()))
+    if (!valid.length) return
+    const maxT = Math.max(...valid.map(r => new Date(r.lastPoDate).getTime()))
+    const windowStart = new Date(maxT - windowDaysVal * 86400000)
+    const inWindow = valid.filter(r => new Date(r.lastPoDate).getTime() >= windowStart.getTime())
+    const best = inWindow.reduce<IQItem>((min, r) => {
+      const p = resolveLastPoPrice(r), mp = resolveLastPoPrice(min)
+      if (p == null) return min; if (mp == null) return r; return p < mp ? r : min
+    }, inWindow[0])
+    mpnBestMap.set(mpn.toUpperCase(), best)
+  })
+
+  const ipToDeepRow = new Map<string, DeepAnalysisRow>()
+  for (const dr of amplDeepRows.filter(d => d.status === 'done')) ipToDeepRow.set(dr.internalPN, dr)
+
+  const hasNexar  = Object.keys(amplNexarMap).length > 0
+  const hasLytica = Object.keys(amplLyticaMap).length > 0
+
+  const extraHeaders: string[] = [
+    'SAP - Internal PN', 'SAP - MPN', 'SAP - Plant', 'SAP - Supplier',
+    'SAP - Best Last PO Interplants', 'SAP - STD Price', 'SAP - Date',
+    ...(hasNexar  ? ['Nexar - MPN','Nexar - Manufacturer','Nexar - Supplier','Nexar - Unit Price (USD)','Nexar - Stock','Nexar - MOQ'] : []),
+    ...(hasLytica ? ['Lytica - MPN Searched','Lytica - MPN Matched','Lytica - Manufacturer Matched','Lytica - 90th %tile'] : []),
+    'Best Source', 'Best Price',
+  ]
+
+  const ExcelJS = (await import('exceljs')).default
+  const wb = new ExcelJS.Workbook()
+  wb.creator = 'PPV Dashboard'
+  wb.created = new Date()
+  const ws = wb.addWorksheet('AMPL + PPV Results', { views: [{ state: 'frozen', ySplit: 1 }] })
+  const colWidth = (h: string) => Math.min(Math.max((h?.length ?? 0) + 4, 10), 40)
+  ws.columns = [
+    ...amplHeaders.map((h, i) => ({ header: h || `Col${i + 1}`, key: `c${i}`, width: colWidth(h) })),
+    ...extraHeaders.map(h => ({ header: h, key: h, width: h.startsWith('Nexar') || h.startsWith('Lytica') ? 26 : 24 })),
+  ]
+
+  const totalCols      = amplHeaders.length + extraHeaders.length
+  const lpoColN        = amplHeaders.length + extraHeaders.indexOf('SAP - Best Last PO Interplants') + 1
+  const stdColN        = amplHeaders.length + extraHeaders.indexOf('SAP - STD Price') + 1
+  const nexarPriceColN = hasNexar  ? amplHeaders.length + extraHeaders.indexOf('Nexar - Unit Price (USD)') + 1 : -1
+  const lytica90ColN   = hasLytica ? amplHeaders.length + extraHeaders.indexOf('Lytica - 90th %tile') + 1 : -1
+  const bestSrcColN    = amplHeaders.length + extraHeaders.indexOf('Best Source') + 1
+  const bestPriceColN  = amplHeaders.length + extraHeaders.indexOf('Best Price') + 1
+
+  const hdr = ws.getRow(1)
+  hdr.height = 24
+  hdr.eachCell({ includeEmpty: true }, (cell, cn) => {
+    const isAmpl   = cn <= amplHeaders.length
+    const isNexar2 = nexarPriceColN > 0 && cn >= nexarPriceColN - 3 && cn <= nexarPriceColN + 2
+    const isLyt    = lytica90ColN > 0 && cn >= lytica90ColN - 3 && cn <= lytica90ColN
+    const isBest   = cn === bestSrcColN || cn === bestPriceColN
+    const bg     = isAmpl ? 'FF1E3A5F' : isNexar2 ? 'FF7C2D12' : isLyt ? 'FF0F766E' : isBest ? 'FF0C4A6E' : 'FF065F46'
+    const border = isAmpl ? 'FF2563EB' : isNexar2 ? 'FFDC2626' : isLyt ? 'FF14B8A6' : isBest ? 'FF0EA5E9' : 'FF059669'
+    cell.fill      = { type: 'pattern', pattern: 'solid', fgColor: { argb: bg } }
+    cell.font      = { bold: true, color: { argb: 'FFFFFFFF' }, size: 10, name: 'Calibri' }
+    cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: false }
+    cell.border    = { bottom: { style: 'medium', color: { argb: border } }, right: { style: 'thin', color: { argb: 'FF374151' } } }
+  })
+  ws.autoFilter = `A1:${ws.getColumn(totalCols).letter}1`
+
+  // ── Analysis accumulators ────────────────────────────────────────────────
+  type ARow = { mpn: string; internalPN: string; supplier: string; plant: string; bestSource: string; bestPrice: number | null }
+  let statTotal = 0, statNotFound = 0, statSAP = 0, statNexar = 0, statLytica = 0, statTie = 0
+  const analysisRows: ARow[] = []
+
+  amplRows.forEach((row, i) => {
+    const mpnRaw  = String(row[amplMpnColIdx] ?? '').trim()
+    const sapBest = mpnBestMap.get(mpnRaw.toUpperCase()) ?? null
+    const ip      = sapBest?.internalPN ?? ''
+    const deepRow = ip ? ipToDeepRow.get(ip) : null
+
+    // Prefer Deep Analysis winner when available
+    let sapPrice    = sapBest ? resolveLastPoPrice(sapBest) : null
+    let sapStd      = sapBest?.standardPriceUsd ?? null
+    let sapPlant    = sapBest?.siteName ?? ''
+    let sapSupplier = (sapBest?.supplierName || sapBest?.englishName) ?? ''
+    let sapMpn      = sapBest?.mpn ?? ''
+    let sapIP       = sapBest?.internalPN ?? ''
+    let sapDate     = sapBest?.lastPoDate ?? ''
+    if (deepRow) {
+      const mcP = deepRow.mcBestPriceUsd
+      if (mcP != null && (sapPrice == null || mcP < sapPrice)) {
+        sapPrice = mcP; sapStd = deepRow.mcStdPriceUsd; sapPlant = deepRow.mcBestPlant
+        sapSupplier = deepRow.mcBestSupplier; sapMpn = deepRow.mcBestMpn
+        sapIP = deepRow.mcBestInternalPN; sapDate = deepRow.mcLastPoDate
+      }
+    }
+
+    const nexarEntry  = amplNexarMap[mpnRaw.toUpperCase()] ?? amplNexarMap[mpnRaw] ?? null
+    const lyticaEntry = amplLyticaMap[mpnRaw.toUpperCase()] ?? amplLyticaMap[mpnRaw] ?? null
+
+    type WS = 'sap' | 'nexar' | 'lytica' | 'tie'
+    const cands: Array<[WS, number]> = []
+    if (sapPrice != null)                cands.push(['sap', sapPrice])
+    if (nexarEntry?.nexarBestUsd != null) cands.push(['nexar', nexarEntry.nexarBestUsd])
+    if (lyticaEntry?.price90th != null)  cands.push(['lytica', lyticaEntry.price90th])
+
+    let winSrc: WS | null = null; let winPrice: number | null = null
+    if (cands.length > 0) {
+      const minP = Math.min(...cands.map(([, p]) => p))
+      const mins = cands.filter(([, p]) => p === minP)
+      winSrc   = mins.length === 1 ? mins[0][0] : 'tie'
+      winPrice = minP
+    }
+
+    const bestSrcLabel = winSrc === 'sap' ? 'SAP' : winSrc === 'nexar' ? 'NEXAR MARKET' : winSrc === 'lytica' ? 'LYTICA' : winSrc === 'tie' ? 'TIE' : 'Not Found'
+    const anyFound = sapBest != null || nexarEntry != null || lyticaEntry != null
+    const noPrice  = winSrc === null
+
+    // Accumulate stats
+    statTotal++
+    if (!anyFound || noPrice) statNotFound++
+    else if (winSrc === 'sap')    statSAP++
+    else if (winSrc === 'nexar')  statNexar++
+    else if (winSrc === 'lytica') statLytica++
+    else if (winSrc === 'tie')    statTie++
+
+    analysisRows.push({
+      mpn: sapMpn || mpnRaw, internalPN: sapIP,
+      supplier: sapSupplier || nexarEntry?.nexarSeller || '',
+      plant: sapPlant, bestSource: bestSrcLabel, bestPrice: winPrice,
+    })
+
+    const extraValues: (string | number | null)[] = anyFound ? [
+      sapIP || 'Not Found', sapMpn || mpnRaw,
+      sapPlant || 'Not Found', sapSupplier || 'Not Found',
+      sapPrice ?? 'Not Found', sapStd ?? 'Not Found', sapDate || 'Not Found',
+      ...(hasNexar  ? [nexarEntry?.nexarMpn||'Not Found', nexarEntry?.nexarManufacturer||'Not Found', nexarEntry?.nexarSeller||'Not Found', nexarEntry?.nexarBestUsd??'Not Found', nexarEntry?.nexarStock??'Not Found', nexarEntry?.nexarMoq??'Not Found'] : []),
+      ...(hasLytica ? [mpnRaw, lyticaEntry?.mpnMatched||'Not Found', lyticaEntry?.manufacturerMatched||'Not Found', lyticaEntry?.price90th??'Not Found'] : []),
+      bestSrcLabel, winPrice ?? 'Not Found',
+    ] : Array(extraHeaders.length).fill('Not Found') as string[]
+
+    const dr = ws.addRow([...row.map(v => v ?? ''), ...extraValues])
+    dr.height = 18
+    const notFound = !anyFound || noPrice
+    const bgColor  = notFound ? 'FFFFF9C4' : i % 2 === 0 ? 'FFFFFFFF' : 'FFF8FAFC'
+    dr.eachCell({ includeEmpty: true }, cell => {
+      cell.fill      = { type: 'pattern', pattern: 'solid', fgColor: { argb: bgColor } }
+      cell.font      = { size: 9, name: 'Calibri' }
+      cell.alignment = { vertical: 'middle' }
+      cell.border    = { bottom: { style: 'thin', color: { argb: 'FFE5E7EB' } } }
+    })
+    for (const cn of [lpoColN, stdColN]) {
+      const c = dr.getCell(cn); c.alignment = { horizontal: 'right', vertical: 'middle' }
+      if (typeof c.value === 'number') c.numFmt = '#,##0.000000'
+    }
+    if (nexarPriceColN > 0) { const c = dr.getCell(nexarPriceColN); c.alignment = { horizontal: 'right', vertical: 'middle' }; if (typeof c.value === 'number') c.numFmt = '#,##0.000000' }
+    if (lytica90ColN > 0)   { const c = dr.getCell(lytica90ColN);   c.alignment = { horizontal: 'right', vertical: 'middle' }; if (typeof c.value === 'number') c.numFmt = '#,##0.000000' }
+    { const c = dr.getCell(bestSrcColN); c.alignment = { horizontal: 'center', vertical: 'middle' }; c.font = { size: 9, name: 'Calibri', bold: true }
+      if (notFound) { c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFF9C4' } }; c.font = { size: 9, name: 'Calibri', bold: true, color: { argb: 'FF92400E' }, italic: true } } }
+    { const c = dr.getCell(bestPriceColN); c.alignment = { horizontal: 'right', vertical: 'middle' }; if (typeof c.value === 'number') { c.numFmt = '#,##0.000000'; c.font = { size: 9, name: 'Calibri', bold: true, color: { argb: 'FF0C4A6E' } } } }
+    if (notFound) {
+      for (let j = amplHeaders.length + 1; j <= totalCols; j++)
+        dr.getCell(j).font = { size: 9, name: 'Calibri', color: { argb: 'FF9CA3AF' }, italic: true }
+    }
+  })
+
+  // ── Analysis Sheet ────────────────────────────────────────────────────────
+  const wa = wb.addWorksheet('Analysis', { views: [{ showGridLines: false }] })
+
+  const addCell = (
+    row: number, col: number, value: string | number | Date | null,
+    opts?: { bold?: boolean; bg?: string; font?: string; numFmt?: string; align?: 'left'|'center'|'right'; size?: number; italic?: boolean }
+  ) => {
+    const c = wa.getCell(row, col)
+    c.value = value
+    if (opts?.numFmt) c.numFmt = opts.numFmt
+    c.font      = { name: 'Calibri', size: opts?.size ?? 10, bold: opts?.bold, italic: opts?.italic, color: { argb: opts?.font ?? 'FF111827' } }
+    c.alignment = { horizontal: opts?.align ?? 'left', vertical: 'middle' }
+    if (opts?.bg) c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: opts.bg } }
+    c.border = { bottom: { style: 'thin', color: { argb: 'FFE5E7EB' } }, right: { style: 'thin', color: { argb: 'FFE5E7EB' } } }
+    return c
+  }
+
+  const sectionTitle = (row: number, title: string, bgArgb: string) => {
+    wa.mergeCells(row, 1, row, 8)
+    const c = wa.getCell(row, 1)
+    c.value     = title
+    c.font      = { name: 'Calibri', size: 12, bold: true, color: { argb: 'FFFFFFFF' } }
+    c.fill      = { type: 'pattern', pattern: 'solid', fgColor: { argb: bgArgb } }
+    c.alignment = { horizontal: 'left', vertical: 'middle', indent: 1 }
+    wa.getRow(row).height = 26
+  }
+
+  let r = 1
+  sectionTitle(r++, '📊  AMPL Demand Analysis Summary', 'FF1E3A5F')
+  addCell(r, 1, 'Generated:', { bold: true, bg: 'FFF1F5F9' })
+  wa.mergeCells(r, 2, r, 5); addCell(r, 2, new Date().toLocaleString(), { bg: 'FFF1F5F9' })
+  wa.getRow(r).height = 18; r++
+  addCell(r, 1, 'File:', { bold: true, bg: 'FFF1F5F9' })
+  wa.mergeCells(r, 2, r, 5); addCell(r, 2, filename, { bg: 'FFF1F5F9' })
+  wa.getRow(r).height = 18; r++
+  r++
+
+  // ── Row Classification ───────────────────────────────────────────────────
+  sectionTitle(r++, '🔢  Row Classification', 'FF1E3A5F')
+  const statFound = statSAP + statNexar + statLytica + statTie
+  addCell(r, 1, 'Category',   { bold: true, bg: 'FF334155', font: 'FFFFFFFF', align: 'center' })
+  addCell(r, 2, 'Count',      { bold: true, bg: 'FF334155', font: 'FFFFFFFF', align: 'center' })
+  addCell(r, 3, '% of Total', { bold: true, bg: 'FF334155', font: 'FFFFFFFF', align: 'center' })
+  wa.getRow(r).height = 20; r++
+
+  const pct = (n: number) => statTotal > 0 ? `${+(n / statTotal * 100).toFixed(1)}%` : '0%'
+  const classRows: [string, number, string, string][] = [
+    ['Total AMPL rows',  statTotal,    'FF374151', 'FFFFFFFF'],
+    ['Found ✅',         statFound,    'FF166534', 'FFD1FAE5'],
+    ['Not Found ⚪',     statNotFound, 'FF92400E', 'FFFFF9C4'],
+  ]
+  for (const [label, count, fontArgb, bg] of classRows) {
+    addCell(r, 1, label, { bg, font: fontArgb, bold: label === 'Total AMPL rows' })
+    addCell(r, 2, count, { bg, align: 'center', bold: true, font: fontArgb })
+    addCell(r, 3, pct(count), { bg, align: 'center' })
+    wa.getRow(r).height = 18; r++
+  }
+  r++
+
+  // ── Best Source Breakdown ────────────────────────────────────────────────
+  sectionTitle(r++, '🏆  Best Source Breakdown', 'FF065F46')
+  addCell(r, 1, 'Source',     { bold: true, bg: 'FF334155', font: 'FFFFFFFF', align: 'center' })
+  addCell(r, 2, 'Count',      { bold: true, bg: 'FF334155', font: 'FFFFFFFF', align: 'center' })
+  addCell(r, 3, '% of Total', { bold: true, bg: 'FF334155', font: 'FFFFFFFF', align: 'center' })
+  wa.getRow(r).height = 20; r++
+
+  const sourceRows: [string, number, string, string][] = [
+    ['SAP',          statSAP,    'FF065F46', 'FFD1FAE5'],
+    ['Nexar Market', statNexar,  'FF7C2D12', 'FFFEF3C7'],
+    ['Lytica',       statLytica, 'FF0F766E', 'FFCFFAFE'],
+    ['Tie',          statTie,    'FF374151', 'FFF3F4F6'],
+    ['Not Found',    statNotFound,'FF92400E','FFFFF9C4'],
+  ]
+  for (const [label, count, fontArgb, bg] of sourceRows) {
+    if (!hasNexar && label === 'Nexar Market') continue
+    if (!hasLytica && label === 'Lytica') continue
+    addCell(r, 1, label, { bg, font: fontArgb, bold: true })
+    addCell(r, 2, count, { bg, align: 'center', bold: true, font: fontArgb })
+    addCell(r, 3, pct(count), { bg, align: 'center' })
+    wa.getRow(r).height = 18; r++
+  }
+  r++
+
+  // ── Top 10 Best Prices ───────────────────────────────────────────────────
+  const TOP = 10
+  const cheapest = [...analysisRows]
+    .filter(a => a.bestPrice != null)
+    .sort((a, b) => a.bestPrice! - b.bestPrice!)
+
+  sectionTitle(r++, `💰  Top ${TOP} Lowest Best Prices`, 'FF0C4A6E')
+  const priceHdrs: [string, number][] = [
+    ['#', 4], ['MPN', 28], ['Internal PN', 22], ['Supplier', 30],
+    ['Plant', 12], ['Best Source', 16], ['Best Price (USD)', 20],
+  ]
+  priceHdrs.forEach(([h, w], ci) => {
+    wa.getColumn(ci + 1).width = Math.max((wa.getColumn(ci + 1).width as number) ?? 0, w)
+    addCell(r, ci + 1, h, { bold: true, bg: 'FF334155', font: 'FFFFFFFF', align: 'center' })
+  })
+  wa.getRow(r).height = 20; r++
+  cheapest.slice(0, TOP).forEach((item, idx) => {
+    addCell(r, 1, idx + 1,        { bg: 'FFD1FAE5', align: 'center', bold: true })
+    addCell(r, 2, item.mpn,       { bg: 'FFD1FAE5', font: 'FF065F46', bold: true })
+    addCell(r, 3, item.internalPN || '—', { bg: 'FFD1FAE5' })
+    addCell(r, 4, item.supplier || '—',   { bg: 'FFD1FAE5' })
+    addCell(r, 5, item.plant || '—',      { bg: 'FFD1FAE5', align: 'center' })
+    addCell(r, 6, item.bestSource,        { bg: 'FFD1FAE5', align: 'center', bold: true })
+    addCell(r, 7, item.bestPrice,         { bg: 'FFD1FAE5', align: 'right', numFmt: '#,##0.000000', bold: true, font: 'FF0C4A6E' })
+    wa.getRow(r).height = 18; r++
+  })
+  r++
+
+  // ── Not Found list ───────────────────────────────────────────────────────
+  const notFoundRows = analysisRows.filter(a => a.bestSource === 'Not Found')
+  if (notFoundRows.length > 0) {
+    sectionTitle(r++, `⚠️  Not Found MPNs (${notFoundRows.length})`, 'FF92400E')
+    addCell(r, 1, '#',   { bold: true, bg: 'FF334155', font: 'FFFFFFFF', align: 'center' })
+    addCell(r, 2, 'MPN', { bold: true, bg: 'FF334155', font: 'FFFFFFFF' })
+    wa.getRow(r).height = 20; r++
+    notFoundRows.slice(0, 50).forEach((item, idx) => {
+      addCell(r, 1, idx + 1,  { bg: 'FFFFF9C4', align: 'center' })
+      addCell(r, 2, item.mpn, { bg: 'FFFFF9C4', font: 'FF92400E', italic: true })
+      wa.getRow(r).height = 16; r++
+    })
+    if (notFoundRows.length > 50) { addCell(r, 2, `… and ${notFoundRows.length - 50} more`, { italic: true, font: 'FF9CA3AF' }); r++ }
+  }
+
+  wa.getColumn(1).width = 5
+  wa.getColumn(2).width = 30
+  wa.getColumn(3).width = 22
+  wa.getColumn(4).width = 32
+  wa.getColumn(5).width = 14
+  wa.getColumn(6).width = 18
+  wa.getColumn(7).width = 22
+  wa.getColumn(8).width = 22
+
+  const buffer = await wb.xlsx.writeBuffer()
+  const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a'); a.href = url; a.download = filename; a.click()
+  URL.revokeObjectURL(url)
+}
+
 type Status = 'idle' | 'loading-ampl' | 'loading-iq' | 'loading-market' | 'done' | 'error'
 
 export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'widget' | 'page' }) {
@@ -1612,7 +1933,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
   const [pinnedPlant, setPinnedPlant]     = useState<PlantSummary | null>(null)
   const [selectedPlant, setSelectedPlant] = useState<PlantSummary | null>(null)
   const [selectedOffer, setSelectedOffer] = useState<MarketOffer | null>(null)
-  const [activeTab, setActiveTab]         = useState<'single' | 'multi' | 'mpn'>('single')
+  const [activeTab, setActiveTab]         = useState<'single' | 'multi' | 'mpn' | 'ampl'>('single')
   const [multiBmatn, setMultiBmatn]       = useState('')
   const [multiResults, setMultiResults]   = useState<MultiResult[]>([])
   const [multiLoading, setMultiLoading]   = useState(false)
@@ -1659,6 +1980,23 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
   // ── Lytica upload state ───────────────────────────────────────────────────
   const [lyticaMap, setLyticaMap]         = useState<Record<string, { mpnMatched: string; manufacturerMatched: string; price90th: number | null }>>({})
   const [lyticaFileName, setLyticaFileName] = useState<string>('')
+
+  // ── AMPL Demand tab state ─────────────────────────────────────────────────
+  const [amplDemandRows, setAmplDemandRows]           = useState<Array<(string | number | null)[]>>([])
+  const [amplDemandHeaders, setAmplDemandHeaders]     = useState<string[]>([])
+  const [amplDemandFileName, setAmplDemandFileName]   = useState<string>('')
+  const [amplDemandMpnColIdx, setAmplDemandMpnColIdx] = useState<number>(-1)
+  const [amplDemandSearchedList, setAmplDemandSearchedList]   = useState<string[]>([])
+  const [amplDemandRawResults, setAmplDemandRawResults]       = useState<IQItem[]>([])
+  const [amplDemandAmplMap, setAmplDemandAmplMap]             = useState<Record<string, AmplResponse>>({})
+  const [amplDemandNexarMap, setAmplDemandNexarMap]           = useState<Record<string, { nexarBestUsd: number | null; nexarSeller: string; nexarManufacturer: string; nexarStock: number | null; nexarMoq: number | null; nexarMpn: string }>>({})
+  const [amplDemandDeepRows, setAmplDemandDeepRows]           = useState<DeepAnalysisRow[]>([])
+  const [amplDemandLoading, setAmplDemandLoading]             = useState(false)
+  const [amplDemandDeepLoading, setAmplDemandDeepLoading]     = useState(false)
+  const [amplDemandSubTab, setAmplDemandSubTab]               = useState<'results' | 'deep'>('results')
+  const [stopAmplDemandHover, setStopAmplDemandHover]         = useState(false)
+  const abortAmplDemandRef    = useRef<AbortController | null>(null)
+  const abortAmplDemandDeepRef = useRef<AbortController | null>(null)
 
   const reset = useCallback(() => {
     setAmpl(null); setIqRows([]); setPlants([]); setMarket(null)
@@ -2134,6 +2472,216 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
       alert('Error reading Lytica file: ' + (err instanceof Error ? err.message : String(err)))
     }
   }, [])
+
+  // ── AMPL Demand: upload & clean ─────────────────────────────────────────
+  const handleAmplDemandUpload = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    e.target.value = ''
+    try {
+      const ExcelJS = (await import('exceljs')).default
+      const wb = new ExcelJS.Workbook()
+      await wb.xlsx.load(await file.arrayBuffer())
+      const ws = wb.worksheets[0]
+      if (!ws) { alert('No sheets found in the AMPL Demand file.'); return }
+
+      const resolveCell = (v: unknown): string | number | null => {
+        if (v == null) return null
+        if (v instanceof Date) return v.toISOString().slice(0, 10)
+        if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') return v as string | number
+        if (typeof v === 'object') {
+          const obj = v as Record<string, unknown>
+          if ('result' in obj && obj.result != null) return obj.result as string | number
+          if ('richText' in obj && Array.isArray(obj.richText)) return (obj.richText as Array<{ text: string }>).map(rt => rt.text).join('')
+          if ('text' in obj) return String(obj.text)
+        }
+        return String(v)
+      }
+
+      let headers: string[] = []
+      let mpnColIdx = -1
+      let blkColIdx = -1
+      let dColIdx   = -1
+      let validToColIdx = -1
+      let totalDemandColIdx = -1
+      const dataRows: Array<(string | number | null)[]> = []
+      const today = new Date(); today.setHours(0, 0, 0, 0)
+
+      ws.eachRow((row, rowNum) => {
+        const rawVals = row.values as unknown[]
+        const maxCol = rawVals.length - 1
+        const rowArr: (string | number | null)[] = Array.from({ length: maxCol }, (_, i) => resolveCell(rawVals[i + 1]))
+
+        // Detect header row: look for "MPN" in col D (idx 3)
+        if (!headers.length) {
+          const mpnIdx = rowArr.findIndex(v => String(v ?? '').trim().toUpperCase() === 'MPN')
+          if (mpnIdx !== -1) {
+            headers = rowArr.map(v => String(v ?? '').trim())
+            mpnColIdx          = mpnIdx
+            blkColIdx          = headers.findIndex(h => h.toUpperCase() === 'BLK')
+            dColIdx            = headers.findIndex(h => h.toUpperCase() === 'D')
+            validToColIdx      = headers.findIndex(h => h.replace(/\s+/g, ' ').toUpperCase() === 'VALID TO')
+            totalDemandColIdx  = headers.findIndex(h => h.replace(/\s+/g, ' ').toUpperCase() === 'TOTAL DEMAND')
+          }
+          return
+        }
+
+        if (mpnColIdx === -1) return
+        const mpnVal = String(rowArr[mpnColIdx] ?? '').trim()
+        if (!mpnVal) return
+
+        // ── Data cleaning ─────────────────────────────────────────
+        // 1. Remove rows where "Blk" has any value
+        if (blkColIdx !== -1 && rowArr[blkColIdx] != null && String(rowArr[blkColIdx]).trim() !== '') return
+        // 2. Remove rows where "D" has any value
+        if (dColIdx !== -1 && rowArr[dColIdx] != null && String(rowArr[dColIdx]).trim() !== '') return
+        // 3. Remove rows where "Valid to" is earlier than today (expired)
+        if (validToColIdx !== -1 && rowArr[validToColIdx] != null) {
+          const raw = rowArr[validToColIdx] as unknown
+          const dt = raw instanceof Date ? raw : new Date(String(raw))
+          if (!isNaN(dt.getTime()) && dt < today) return
+        }
+        // 4. Remove rows where "Total Demand" == 0
+        if (totalDemandColIdx !== -1) {
+          const td = typeof rowArr[totalDemandColIdx] === 'number'
+            ? rowArr[totalDemandColIdx] as number
+            : parseFloat(String(rowArr[totalDemandColIdx] ?? ''))
+          if (!isNaN(td) && td === 0) return
+        }
+
+        const normRow: (string | number | null)[] = Array.from({ length: headers.length }, (_, k) => (k < rowArr.length ? rowArr[k] : null))
+        dataRows.push(normRow)
+      })
+
+      if (!headers.length || mpnColIdx === -1) { alert('Could not find "MPN" header column in the AMPL Demand file.'); return }
+      if (!dataRows.length) { alert('No data rows remain after cleaning (check Blk/D/Valid to/Total Demand filters).'); return }
+
+      setAmplDemandHeaders(headers)
+      setAmplDemandRows(dataRows)
+      setAmplDemandMpnColIdx(mpnColIdx)
+      setAmplDemandFileName(file.name)
+      setAmplDemandRawResults([])
+      setAmplDemandAmplMap({})
+      setAmplDemandNexarMap({})
+      setAmplDemandDeepRows([])
+    } catch (err) {
+      alert('Error reading AMPL Demand file: ' + (err instanceof Error ? err.message : String(err)))
+    }
+  }, [])
+
+  // ── AMPL Demand: search handler ───────────────────────────────────────────
+  const handleAmplDemandSearch = useCallback(async () => {
+    if (!amplDemandRows.length || amplDemandMpnColIdx === -1) return
+    const seen = new Set<string>()
+    const uniqueMpns: string[] = []
+    for (const row of amplDemandRows) {
+      const m = String(row[amplDemandMpnColIdx] ?? '').trim().toUpperCase()
+      if (m && !seen.has(m)) { seen.add(m); uniqueMpns.push(m) }
+    }
+    if (!uniqueMpns.length) return
+
+    const ctrl = new AbortController()
+    abortAmplDemandRef.current = ctrl
+    const { signal } = ctrl
+    setAmplDemandLoading(true)
+    setStopAmplDemandHover(false)
+    setAmplDemandRawResults([])
+    setAmplDemandSearchedList(uniqueMpns)
+    setAmplDemandAmplMap({})
+    setAmplDemandNexarMap({})
+    setAmplDemandDeepRows([])
+    setAmplDemandSubTab('results')
+
+    try {
+      const iqData = await apiPostWithRetry<{ count: number; data: IQItem[] }>(
+        '/api/pricecalc/internal-query', { mpns: uniqueMpns }, signal
+      )
+      const rows = Array.isArray(iqData.data) ? iqData.data : []
+      setAmplDemandRawResults(rows)
+
+      // Fetch AMPL data for each unique internalPN progressively
+      const internalPNs = [...new Set(rows.map((r: IQItem) => r.internalPN).filter(Boolean))]
+      if (internalPNs.length > 0 && !signal.aborted) {
+        await Promise.allSettled(internalPNs.map(async pn => {
+          try {
+            const amplData = await apiPostWithRetry<AmplResponse>('/api/pricecalc/ampl', { internal_part_number: pn }, signal)
+            if (!signal.aborted) setAmplDemandAmplMap(prev => ({ ...prev, [pn]: amplData }))
+          } catch { /* non-critical */ }
+        }))
+      }
+
+      // Nexar: all searched MPNs plus SAP-returned variants
+      if (searchNexar && !signal.aborted) {
+        const nexarMpns = [...new Set([...uniqueMpns, ...rows.map((r: IQItem) => r.mpn).filter(Boolean)])]
+        const nexarUpdates: typeof amplDemandNexarMap = {}
+        await Promise.allSettled(nexarMpns.map(async (mpn: string) => {
+          try {
+            const mkt = await apiPostWithRetry<MarketResponse>('/api/pricecalc/market-prices', { mpns: [mpn], quantity: qty }, signal)
+            const eligible = mkt.offers.filter((o: MarketOffer) => o.inventory > 0 && o.moq <= qty)
+            const best = eligible.sort((a: MarketOffer, b: MarketOffer) => a.unit_price_usd - b.unit_price_usd)[0] ?? null
+            if (best) nexarUpdates[mpn] = {
+              nexarBestUsd: best.unit_price_usd, nexarSeller: best.seller,
+              nexarManufacturer: best.manufacturer, nexarStock: best.inventory,
+              nexarMoq: best.moq, nexarMpn: best.mpn,
+            }
+          } catch { /* non-critical */ }
+        }))
+        setAmplDemandNexarMap(nexarUpdates)
+      }
+    } catch (e) {
+      const isCancelled = e instanceof DOMException && e.name === 'AbortError'
+      if (!isCancelled) setAmplDemandRawResults([])
+    }
+    setAmplDemandLoading(false)
+    setStopAmplDemandHover(false)
+  }, [amplDemandRows, amplDemandMpnColIdx, searchNexar, qty])
+
+  // ── AMPL Demand: deep analysis ─────────────────────────────────────────────
+  const handleAmplDemandDeep = useCallback(async () => {
+    const internalPNs = [...new Set(amplDemandRawResults.map(r => r.internalPN).filter(Boolean))]
+    if (!internalPNs.length) return
+    abortAmplDemandDeepRef.current?.abort()
+    const ctrl = new AbortController()
+    abortAmplDemandDeepRef.current = ctrl
+    const { signal } = ctrl
+    setAmplDemandDeepLoading(true)
+    setAmplDemandDeepRows(internalPNs.map(ip => ({
+      internalPN: ip, status: 'loading',
+      mcBestPriceUsd: null, mcStdPriceUsd: null, mcBestSupplier: '', mcBestPlant: '',
+      mcBestMpn: '', mcBestInternalPN: '', mcLastPoDate: '',
+    })))
+    setAmplDemandSubTab('deep')
+    await Promise.allSettled(internalPNs.map(async ip => {
+      try {
+        const amplData = await apiPostWithRetry<AmplResponse>('/api/pricecalc/ampl', { internal_part_number: ip }, signal)
+        let queryMpns = amplData.mpns_list
+        if (!queryMpns.length) {
+          queryMpns = [...amplData.blocked.map((i: { MfgPartNumber: string }) => i.MfgPartNumber), ...amplData.deleted.map((i: { MfgPartNumber: string }) => i.MfgPartNumber)].filter(Boolean).filter((v: string, i: number, a: string[]) => a.indexOf(v) === i)
+        }
+        if (!queryMpns.length) {
+          setAmplDemandDeepRows(prev => prev.map(r => r.internalPN === ip ? { ...r, status: 'error', error: 'No MPNs in SAP' } : r))
+          return
+        }
+        const iqData = await apiPostWithRetry<{ count: number; data: IQItem[] }>('/api/pricecalc/internal-query', { mpns: queryMpns }, signal)
+        const rows: IQItem[] = Array.isArray(iqData.data) ? iqData.data : []
+        const bestRow = buildPlantSummaries(rows, windowDays * 86400000)[0]?.bestRow ?? null
+        setAmplDemandDeepRows(prev => prev.map(r => r.internalPN === ip ? {
+          ...r, status: 'done',
+          mcBestPriceUsd: bestRow ? resolveLastPoPrice(bestRow) : null,
+          mcStdPriceUsd: bestRow?.standardPriceUsd ?? null,
+          mcBestSupplier: bestRow?.supplierName || bestRow?.englishName || '—',
+          mcBestPlant: bestRow?.siteName || '—',
+          mcBestMpn: bestRow?.mpn || '—',
+          mcBestInternalPN: bestRow?.internalPN || '—',
+          mcLastPoDate: bestRow?.lastPoDate || '—',
+        } : r))
+      } catch (e) {
+        const isCancelled = e instanceof DOMException && e.name === 'AbortError'
+        setAmplDemandDeepRows(prev => prev.map(r => r.internalPN === ip ? { ...r, status: 'error', error: isCancelled ? 'Cancelled' : e instanceof Error ? e.message : String(e) } : r))
+      }
+    }))
+    setAmplDemandDeepLoading(false)
+  }, [amplDemandRawResults, windowDays])
 
   // ── Multi-MPN: search handler ─────────────────────────────────────────────
   const handleMultiMpnSearch = useCallback(async () => {
@@ -2718,8 +3266,8 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                 <Calculator size={16} />
               </div>
               <div className="flex-1">
-                <h2 className="font-bold text-gray-800 leading-tight">Price Calculator</h2>
-                <p className="text-xs text-gray-400">SAP + EMS InternalQuery + Nexar Market</p>
+                <h2 className="font-bold text-gray-800 leading-tight">Price Tool</h2>
+                <p className="text-xs text-gray-400">SAP + Nexar Market + Lytica</p>
               </div>
               {mode !== 'page' && (
                 <button onClick={() => setOpen(false)} className="text-gray-400 hover:text-gray-700 p-1.5 rounded-lg hover:bg-gray-100">
@@ -2748,6 +3296,12 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                   className={`px-4 py-1.5 text-sm font-medium rounded-lg transition-colors ${activeTab === 'mpn' ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
                 >
                   Multi-MPN
+                </button>
+                <button
+                  onClick={() => setActiveTab('ampl')}
+                  className={`px-4 py-1.5 text-sm font-medium rounded-lg transition-colors ${activeTab === 'ampl' ? 'bg-white text-indigo-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+                >
+                  AMPL Demand
                 </button>
               </div>
             </div>
@@ -4542,6 +5096,403 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                       </div>
                     )
                   })()}
+                </div>
+              )}
+
+              {/* •••••••••••••• AMPL DEMAND TAB •••••••••••••• */}
+              {activeTab === 'ampl' && (
+                <div className="space-y-5">
+
+                  {/* ── Control card ─────────────────────────────────────────── */}
+                  <div className="bg-white rounded-xl border border-gray-200 shadow-sm overflow-hidden">
+
+                    {/* Header */}
+                    <div className="px-5 py-4 border-b border-gray-100 flex items-center justify-between">
+                      <div>
+                        <h3 className="text-sm font-semibold text-gray-800 flex items-center gap-2">
+                          <svg className="h-4 w-4 text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+                          AMPL Demand
+                        </h3>
+                        <p className="text-[11px] text-gray-400 mt-0.5 ml-6">Rows with Blk / D / expired "Valid to" / zero Total Demand are automatically filtered out.</p>
+                      </div>
+                      {/* Status pills */}
+                      <div className="flex items-center gap-2 flex-wrap justify-end">
+                        {amplDemandFileName && (
+                          <span className="flex items-center gap-1.5 text-[11px] font-medium text-indigo-700 bg-indigo-50 border border-indigo-200 rounded-full px-2.5 py-0.5">
+                            <svg className="h-3 w-3 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+                            {amplDemandFileName}
+                            <span className="text-indigo-400">· {amplDemandRows.length} rows</span>
+                            <button onClick={() => { setAmplDemandFileName(''); setAmplDemandRows([]); setAmplDemandHeaders([]); setAmplDemandMpnColIdx(-1); setAmplDemandRawResults([]); setAmplDemandDeepRows([]) }} className="ml-0.5 text-indigo-400 hover:text-red-500 leading-none font-bold" title="Clear file">×</button>
+                          </span>
+                        )}
+                        {lyticaFileName && (
+                          <span className="flex items-center gap-1.5 text-[11px] font-medium text-teal-700 bg-teal-50 border border-teal-200 rounded-full px-2.5 py-0.5">
+                            <svg className="h-3 w-3 text-teal-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" /></svg>
+                            Lytica · {lyticaFileName}
+                            <button onClick={() => { setLyticaFileName(''); setLyticaMap({}) }} className="ml-0.5 text-teal-400 hover:text-red-500 leading-none font-bold" title="Clear Lytica">×</button>
+                          </span>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Row 1 – File uploads */}
+                    <div className="px-5 py-3 flex items-center gap-3 flex-wrap border-b border-gray-100 bg-gray-50/60">
+                      <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide w-16 shrink-0">Upload</span>
+                      <label className="flex items-center gap-1.5 cursor-pointer px-3 py-1.5 text-xs font-semibold rounded-lg bg-white border border-indigo-300 hover:border-indigo-500 hover:text-indigo-600 text-gray-600 transition-colors shadow-sm" title="Upload AMPL Demand Excel file (.xlsx)">
+                        <svg className="h-3.5 w-3.5 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" /></svg>
+                        AMPL Demand {amplDemandFileName ? '(replace)' : ''}
+                        <input type="file" accept=".xlsx,.xls" className="hidden" onChange={handleAmplDemandUpload} />
+                      </label>
+                      <label className="flex items-center gap-1.5 cursor-pointer px-3 py-1.5 text-xs font-semibold rounded-lg bg-white border border-teal-300 hover:border-teal-500 hover:text-teal-600 text-gray-600 transition-colors shadow-sm" title="Upload Lytica report — 90th percentile benchmark">
+                        <svg className="h-3.5 w-3.5 text-teal-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" /></svg>
+                        Lytica {lyticaFileName ? '(replace)' : ''}
+                        <input type="file" accept=".xlsx,.xls" className="hidden" onChange={handleLyticaUpload} />
+                      </label>
+                      {/* Nexar toggle */}
+                      <div className="ml-auto flex items-center gap-2">
+                        <label className={`flex items-center gap-2 cursor-pointer select-none px-3 py-1.5 rounded-lg border text-xs font-semibold transition-colors ${searchNexar ? 'bg-orange-50 border-orange-300 text-orange-700' : 'bg-white border-gray-200 text-gray-500 hover:border-orange-300'}`}>
+                          <input
+                            type="checkbox"
+                            checked={searchNexar}
+                            onChange={e => setSearchNexar(e.target.checked)}
+                            className="w-3.5 h-3.5 accent-orange-500 cursor-pointer"
+                          />
+                          Include <span className="font-bold text-orange-500">Nexar</span> market data
+                        </label>
+                      </div>
+                    </div>
+
+                    {/* Row 2 – Actions (only when file loaded) */}
+                    {amplDemandRows.length > 0 && (
+                      <div className="px-5 py-3 flex items-center gap-3 flex-wrap">
+                        <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide w-16 shrink-0">Actions</span>
+
+                        {/* Step 1 */}
+                        <div className="flex items-center gap-1.5">
+                          <span className="w-5 h-5 rounded-full bg-blue-100 text-blue-600 text-[10px] font-bold flex items-center justify-center shrink-0">1</span>
+                          <button
+                            onClick={handleAmplDemandSearch}
+                            disabled={amplDemandLoading}
+                            className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors shadow-sm ${amplDemandLoading ? 'bg-gray-100 text-gray-400 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700 text-white'}`}
+                          >
+                            {amplDemandLoading
+                              ? <><svg className="animate-spin h-3 w-3" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"/></svg>Searching…</>
+                              : <><svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>Search SAP{searchNexar ? ' + Nexar' : ''}</>
+                            }
+                          </button>
+                        </div>
+
+                        {/* Step 2 – only after results */}
+                        {amplDemandRawResults.length > 0 && !amplDemandLoading && (
+                          <div className="flex items-center gap-1.5">
+                            <span className="w-5 h-5 rounded-full bg-purple-100 text-purple-600 text-[10px] font-bold flex items-center justify-center shrink-0">2</span>
+                            <button
+                              onClick={handleAmplDemandDeep}
+                              disabled={amplDemandDeepLoading}
+                              className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors shadow-sm ${amplDemandDeepLoading ? 'bg-gray-100 text-gray-400 cursor-not-allowed' : 'bg-purple-600 hover:bg-purple-700 text-white'}`}
+                            >
+                              {amplDemandDeepLoading
+                                ? <><svg className="animate-spin h-3 w-3" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"/></svg>Analyzing…</>
+                                : <><svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 3H5a2 2 0 00-2 2v4m6-6h10a2 2 0 012 2v4M9 3v18m0 0h10a2 2 0 002-2V9M9 21H5a2 2 0 01-2-2V9m0 0h18"/></svg>Deep Analysis</>
+                              }
+                            </button>
+                          </div>
+                        )}
+
+                        {/* Export – only after results */}
+                        {(amplDemandRawResults.length > 0 || amplDemandDeepRows.length > 0) && (
+                          <button
+                            onClick={() => downloadAmplResultsExcel(
+                              amplDemandHeaders, amplDemandRows, amplDemandMpnColIdx,
+                              amplDemandRawResults, amplDemandDeepRows,
+                              amplDemandNexarMap, lyticaMap, windowDays,
+                              `AMPL_PPV_${new Date().toISOString().slice(0, 10)}.xlsx`,
+                            )}
+                            className="ml-auto flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-emerald-700 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded-lg transition-colors shadow-sm whitespace-nowrap"
+                            title="Export enriched AMPL report to Excel"
+                          >
+                            <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2"><path strokeLinecap="round" strokeLinejoin="round" d="M12 10v6m0 0l-3-3m3 3l3-3m2 4H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+                            Export AMPL
+                          </button>
+                        )}
+
+                        {/* Summary stats inline */}
+                        {(() => {
+                          const seen = new Set<string>()
+                          for (const r of amplDemandRows) { const m = String(r[amplDemandMpnColIdx] ?? '').trim().toUpperCase(); if (m) seen.add(m) }
+                          return (
+                            <div className="flex items-center gap-2 flex-wrap ml-3 pl-3 border-l border-gray-200">
+                              <span className="text-[11px] text-gray-500">{amplDemandRows.length} rows</span>
+                              <span className="text-[11px] text-indigo-500 font-medium">{seen.size} unique MPNs</span>
+                              {amplDemandRawResults.length > 0 && <span className="text-[11px] text-green-600 font-medium">{[...new Set(amplDemandRawResults.map(r => r.mpn))].length} found in SAP</span>}
+                            </div>
+                          )
+                        })()}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Sub-tab selector */}
+                  {(amplDemandRawResults.length > 0 || amplDemandDeepRows.length > 0) && (
+                    <div className="flex gap-1 bg-gray-100 rounded-lg p-0.5 w-fit">
+                      <button onClick={() => setAmplDemandSubTab('results')} className={`px-3 py-1 text-xs font-medium rounded-md transition-colors ${amplDemandSubTab === 'results' ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}>SAP Results</button>
+                      <button onClick={() => setAmplDemandSubTab('deep')} className={`px-3 py-1 text-xs font-medium rounded-md transition-colors ${amplDemandSubTab === 'deep' ? 'bg-white text-purple-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}>
+                        Deep Analysis
+                        {amplDemandDeepRows.length > 0 && <span className="ml-1.5 text-[10px] bg-purple-100 text-purple-700 rounded px-1">{amplDemandDeepRows.filter(r => r.status === 'done').length}/{amplDemandDeepRows.length}</span>}
+                      </button>
+                    </div>
+                  )}
+
+                  {/* SAP Results sub-tab */}
+                  {amplDemandSubTab === 'results' && amplDemandRawResults.length > 0 && (() => {
+                    const mpnGroupsMap = new Map<string, IQItem[]>()
+                    for (const r of amplDemandRawResults) {
+                      if (!mpnGroupsMap.has(r.mpn)) mpnGroupsMap.set(r.mpn, [])
+                      mpnGroupsMap.get(r.mpn)!.push(r)
+                    }
+                    const entries = [...mpnGroupsMap.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([mpn, rows]) => {
+                      const valid = rows.filter(r => r.lastPoDate && !isNaN(new Date(r.lastPoDate).getTime()))
+                      if (!valid.length) return null
+                      const maxT = Math.max(...valid.map(r => new Date(r.lastPoDate).getTime()))
+                      const inWindow = valid.filter(r => new Date(r.lastPoDate).getTime() >= new Date(maxT - windowDays * 86400000).getTime())
+                      const best = inWindow.reduce<IQItem>((min, r) => { const p = resolveLastPoPrice(r), mp = resolveLastPoPrice(min); return p == null ? min : mp == null ? r : p < mp ? r : min }, inWindow[0])
+                      return { mpn, bestRow: best }
+                    }).filter((x): x is { mpn: string; bestRow: IQItem } => x !== null)
+
+                    return (
+                      <div className="overflow-x-auto rounded-xl border border-gray-200 shadow-sm">
+                        <table className="min-w-max w-full text-xs border-collapse">
+                          <thead className="bg-gray-50 text-[10px] uppercase tracking-wide text-gray-500 sticky top-0">
+                            <tr>
+                              <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">MPN</th>
+                              <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">Internal PN</th>
+                              <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">Plant</th>
+                              <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">Supplier</th>
+                              <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200">Last PO (USD)</th>
+                              <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200">STD (USD)</th>
+                              <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">Date</th>
+                              {Object.keys(amplDemandNexarMap).length > 0 && <>
+                                <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-orange-200 bg-orange-50 text-orange-600">Nexar Price</th>
+                                <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-orange-200 bg-orange-50 text-orange-600">Nexar Seller</th>
+                              </>}
+                              {Object.keys(lyticaMap).length > 0 && <>
+                                <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-teal-200 bg-teal-50 text-teal-600">Lytica 90th</th>
+                              </>}
+                              <th className="px-3 py-2.5 text-center whitespace-nowrap border-b border-gray-200">Best Source</th>
+                              <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200">Best Price</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-gray-100">
+                            {entries.map(({ mpn, bestRow }, idx) => {
+                              const sapP = resolveLastPoPrice(bestRow)
+                              const nexE = amplDemandNexarMap[mpn.toUpperCase()] ?? amplDemandNexarMap[mpn] ?? null
+                              const lytE = lyticaMap[mpn.toUpperCase()] ?? lyticaMap[mpn] ?? null
+                              const cands2: Array<['sap'|'nexar'|'lytica', number]> = []
+                              if (sapP != null) cands2.push(['sap', sapP])
+                              if (nexE?.nexarBestUsd != null) cands2.push(['nexar', nexE.nexarBestUsd])
+                              if (lytE?.price90th != null) cands2.push(['lytica', lytE.price90th])
+                              const minP2 = cands2.length > 0 ? Math.min(...cands2.map(([,p]) => p)) : null
+                              const winS2 = cands2.length > 0 ? (cands2.filter(([,p]) => p === minP2).length === 1 ? cands2.find(([,p]) => p === minP2)![0] : 'tie') : null
+                              return (
+                                <tr key={mpn} className={`hover:bg-gray-50 ${idx % 2 === 0 ? 'bg-white' : 'bg-gray-50/40'}`}>
+                                  <td className="px-3 py-2 font-mono font-semibold text-blue-700 whitespace-nowrap">{mpn}</td>
+                                  <td className="px-3 py-2 font-mono text-gray-600 whitespace-nowrap">{bestRow.internalPN || '—'}</td>
+                                  <td className="px-3 py-2 text-gray-500 whitespace-nowrap">{bestRow.siteName || '—'}</td>
+                                  <td className="px-3 py-2 text-gray-600 max-w-[150px] truncate" title={bestRow.supplierName || ''}>{bestRow.supplierName || bestRow.englishName || '—'}</td>
+                                  <td className="px-3 py-2 text-right font-mono text-gray-700 whitespace-nowrap">{sapP != null ? sapP.toFixed(6) : '—'}</td>
+                                  <td className="px-3 py-2 text-right font-mono text-gray-500 whitespace-nowrap">{bestRow.standardPriceUsd != null ? bestRow.standardPriceUsd.toFixed(6) : '—'}</td>
+                                  <td className="px-3 py-2 text-gray-400 whitespace-nowrap">{bestRow.lastPoDate || '—'}</td>
+                                  {Object.keys(amplDemandNexarMap).length > 0 && <>
+                                    <td className={`px-3 py-2 text-right font-mono whitespace-nowrap bg-orange-50/30 ${winS2 === 'nexar' ? 'font-bold text-emerald-700' : 'text-orange-700'}`}>{nexE?.nexarBestUsd != null ? nexE.nexarBestUsd.toFixed(6) : '—'}</td>
+                                    <td className="px-3 py-2 text-gray-600 whitespace-nowrap bg-orange-50/30">{nexE?.nexarSeller || '—'}</td>
+                                  </>}
+                                  {Object.keys(lyticaMap).length > 0 && <>
+                                    <td className={`px-3 py-2 text-right font-mono whitespace-nowrap bg-teal-50/30 ${winS2 === 'lytica' ? 'font-bold text-emerald-700' : 'text-teal-700'}`}>{lytE?.price90th != null ? lytE.price90th.toFixed(6) : '—'}</td>
+                                  </>}
+                                  <td className="px-3 py-2 text-center whitespace-nowrap">
+                                    {winS2 === 'sap' ? <span className="px-2 py-0.5 text-[10px] font-bold rounded-full bg-emerald-100 text-emerald-700">SAP</span>
+                                    : winS2 === 'nexar' ? <span className="px-2 py-0.5 text-[10px] font-bold rounded-full bg-orange-100 text-orange-700">Nexar</span>
+                                    : winS2 === 'lytica' ? <span className="px-2 py-0.5 text-[10px] font-bold rounded-full bg-teal-100 text-teal-700">Lytica</span>
+                                    : winS2 === 'tie' ? <span className="px-2 py-0.5 text-[10px] font-bold rounded-full bg-gray-100 text-gray-500">Tie</span>
+                                    : <span className="text-[10px] text-gray-300">—</span>}
+                                  </td>
+                                  <td className={`px-3 py-2 text-right font-mono font-bold whitespace-nowrap ${winS2 ? 'text-indigo-700' : 'text-gray-300'}`}>{minP2 != null ? minP2.toFixed(6) : '—'}</td>
+                                </tr>
+                              )
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    )
+                  })()}
+
+                  {/* Deep Analysis sub-tab */}
+                  {amplDemandSubTab === 'deep' && (
+                    <div>
+                      {amplDemandDeepRows.length === 0 ? (
+                        <p className="text-sm text-gray-400 py-8 text-center">Click "Deep Analysis" to search by Internal Part Number for Multi-Component price comparison.</p>
+                      ) : (
+                        <div>
+                          <p className="text-[10px] text-gray-400 mb-3">Comparison of AMPL MPN ({windowDays}-day window best) vs Multi-Component (AMPL active MPNs best) prices per Internal PN</p>
+                          <div className="overflow-x-auto rounded-xl border border-gray-200 shadow-sm">
+                          <table className="min-w-max w-full text-xs border-collapse">
+                            <thead className="bg-gray-50 text-[10px] uppercase tracking-wide text-gray-500">
+                              <tr>
+                                <th className="px-3 py-2.5 text-left border-b border-gray-200 whitespace-nowrap" rowSpan={2}>Internal PN</th>
+                                <th className="px-3 py-2.5 text-center border-b border-gray-200 border-l border-l-blue-200 whitespace-nowrap bg-blue-50/50" colSpan={6}>AMPL MPN</th>
+                                <th className="px-3 py-2.5 text-center border-b border-gray-200 border-l border-l-purple-200 whitespace-nowrap bg-purple-50/50" colSpan={7}>Multi-Component</th>
+                                <th className="px-3 py-2.5 text-center border-b border-gray-200 border-l border-l-orange-200 whitespace-nowrap bg-orange-50/50" colSpan={6}>Nexar Market</th>
+                                {Object.keys(lyticaMap).length > 0 && <th className="px-3 py-2.5 text-center border-b border-gray-200 border-l border-l-teal-200 whitespace-nowrap bg-teal-50/50" colSpan={4}>Lytica</th>}
+                                <th className="px-3 py-2.5 text-center border-b border-gray-200 border-l border-l-gray-300 whitespace-nowrap" rowSpan={2}>Winner</th>
+                              </tr>
+                              <tr>
+                                <th className="px-3 py-2 text-left border-b border-gray-200 border-l border-l-blue-200 whitespace-nowrap bg-blue-50/30">MPN</th>
+                                <th className="px-3 py-2 text-left border-b border-gray-200 whitespace-nowrap bg-blue-50/30">Plant</th>
+                                <th className="px-3 py-2 text-left border-b border-gray-200 whitespace-nowrap bg-blue-50/30">Supplier</th>
+                                <th className="px-3 py-2 text-right border-b border-gray-200 whitespace-nowrap bg-blue-50/30">Last PO (USD)</th>
+                                <th className="px-3 py-2 text-right border-b border-gray-200 whitespace-nowrap bg-blue-50/30">Std (USD)</th>
+                                <th className="px-3 py-2 text-left border-b border-gray-200 whitespace-nowrap bg-blue-50/30">Date</th>
+                                <th className="px-3 py-2 text-left border-b border-gray-200 border-l border-l-purple-200 whitespace-nowrap bg-purple-50/30">Internal PN</th>
+                                <th className="px-3 py-2 text-left border-b border-gray-200 whitespace-nowrap bg-purple-50/30">MPN</th>
+                                <th className="px-3 py-2 text-left border-b border-gray-200 whitespace-nowrap bg-purple-50/30">Plant</th>
+                                <th className="px-3 py-2 text-left border-b border-gray-200 whitespace-nowrap bg-purple-50/30">Supplier</th>
+                                <th className="px-3 py-2 text-right border-b border-gray-200 whitespace-nowrap bg-purple-50/30">Last PO (USD)</th>
+                                <th className="px-3 py-2 text-right border-b border-gray-200 whitespace-nowrap bg-purple-50/30">Std (USD)</th>
+                                <th className="px-3 py-2 text-left border-b border-gray-200 whitespace-nowrap bg-purple-50/30">Date</th>
+                                <th className="px-3 py-2 text-left border-b border-gray-200 border-l border-l-orange-200 whitespace-nowrap bg-orange-50/30">MPN</th>
+                                <th className="px-3 py-2 text-left border-b border-gray-200 whitespace-nowrap bg-orange-50/30">Manufacturer</th>
+                                <th className="px-3 py-2 text-left border-b border-gray-200 whitespace-nowrap bg-orange-50/30">Supplier</th>
+                                <th className="px-3 py-2 text-right border-b border-gray-200 whitespace-nowrap bg-orange-50/30">Unit Price (USD)</th>
+                                <th className="px-3 py-2 text-right border-b border-gray-200 whitespace-nowrap bg-orange-50/30">Stock</th>
+                                <th className="px-3 py-2 text-right border-b border-gray-200 whitespace-nowrap bg-orange-50/30">MOQ</th>
+                                {Object.keys(lyticaMap).length > 0 && <th className="px-3 py-2 text-left border-b border-gray-200 border-l border-l-teal-200 whitespace-nowrap bg-teal-50/30">MPN Searched</th>}
+                                {Object.keys(lyticaMap).length > 0 && <th className="px-3 py-2 text-left border-b border-gray-200 whitespace-nowrap bg-teal-50/30">MPN Matched</th>}
+                                {Object.keys(lyticaMap).length > 0 && <th className="px-3 py-2 text-left border-b border-gray-200 whitespace-nowrap bg-teal-50/30">Manufacturer</th>}
+                                {Object.keys(lyticaMap).length > 0 && <th className="px-3 py-2 text-right border-b border-gray-200 whitespace-nowrap bg-teal-50/30">90th %tile</th>}
+                              </tr>
+                            </thead>
+                            <tbody className="divide-y divide-gray-100">
+                              {amplDemandDeepRows.map((dr) => {
+                                // AMPL MPN side: find best SAP row for this internalPN
+                                const amplCandidates = amplDemandRawResults.filter(r => r.internalPN === dr.internalPN)
+                                const amplBestEntry = amplCandidates.reduce<IQItem | null>((best, r) => {
+                                  const p = resolveLastPoPrice(r), bp = best ? resolveLastPoPrice(best) : null
+                                  if (p == null) return best; if (bp == null) return r; return p < bp ? r : best
+                                }, null)
+                                const amplMpnPrice = amplBestEntry ? resolveLastPoPrice(amplBestEntry) : null
+                                const mcPrice = dr.mcBestPriceUsd
+                                // Lytica: find best match for MPNs in this internalPN group
+                                const hasLytica = Object.keys(lyticaMap).length > 0
+                                let lyticaBest: { mpnSearched: string; mpnMatched: string; manufacturerMatched: string; price90th: number | null } | null = null
+                                if (hasLytica) {
+                                  for (const r of amplCandidates) {
+                                    const entry = lyticaMap[r.mpn.toUpperCase()]
+                                    if (entry && (lyticaBest == null || (entry.price90th != null && (lyticaBest.price90th == null || entry.price90th < lyticaBest.price90th))))
+                                      lyticaBest = { mpnSearched: r.mpn, ...entry }
+                                  }
+                                }
+                                const lyticaPrice = lyticaBest?.price90th ?? null
+                                // Nexar: find best from amplDemandNexarMap for MPNs in this internalPN group
+                                let nexarBest: (typeof amplDemandNexarMap)[string] | null = null
+                                for (const r of amplCandidates) {
+                                  const nx = amplDemandNexarMap[r.mpn.toUpperCase()] ?? amplDemandNexarMap[r.mpn]
+                                  if (nx && (nexarBest == null || (nx.nexarBestUsd != null && (nexarBest.nexarBestUsd == null || nx.nexarBestUsd < nexarBest.nexarBestUsd))))
+                                    nexarBest = nx
+                                }
+                                const nexarPrice = nexarBest?.nexarBestUsd ?? null
+                                // Winner
+                                type WinnerType = 'mpn' | 'mc' | 'nexar' | 'lytica' | 'tie' | null
+                                let winner: WinnerType = null
+                                const prices: Array<[WinnerType, number]> = []
+                                if (amplMpnPrice != null) prices.push(['mpn', amplMpnPrice])
+                                if (mcPrice != null) prices.push(['mc', mcPrice])
+                                if (nexarPrice != null) prices.push(['nexar', nexarPrice])
+                                if (lyticaPrice != null) prices.push(['lytica', lyticaPrice])
+                                if (prices.length > 0) {
+                                  const minPrice = Math.min(...prices.map(([, p]) => p))
+                                  const winners = prices.filter(([, p]) => p === minPrice)
+                                  winner = winners.length === 1 ? winners[0][0] : 'tie'
+                                }
+                                return (
+                                <tr key={dr.internalPN} className="hover:bg-gray-50">
+                                  <td className="px-3 py-2.5 font-mono font-semibold text-blue-700 whitespace-nowrap">{dr.internalPN}</td>
+                                  {/* AMPL MPN side */}
+                                  <td className="px-3 py-2.5 font-mono text-gray-600 whitespace-nowrap border-l border-l-blue-100">{amplBestEntry?.mpn || '—'}</td>
+                                  <td className="px-3 py-2.5 text-gray-500 whitespace-nowrap">{amplBestEntry?.siteName || '—'}</td>
+                                  <td className="px-3 py-2.5 text-gray-600 max-w-[150px] truncate" title={amplBestEntry?.supplierName || ''}>{amplBestEntry ? (amplBestEntry.supplierName || amplBestEntry.englishName || '—') : '—'}</td>
+                                  <td className={`px-3 py-2.5 text-right font-mono font-semibold whitespace-nowrap ${winner === 'mpn' ? 'text-emerald-700 text-sm' : 'text-gray-700'}`}>{fmt6(amplMpnPrice)}</td>
+                                  <td className="px-3 py-2.5 text-right font-mono text-gray-500 whitespace-nowrap">{fmt6(amplBestEntry?.standardPriceUsd ?? null)}</td>
+                                  <td className="px-3 py-2.5 text-gray-500 whitespace-nowrap">{amplBestEntry?.lastPoDate || '—'}</td>
+                                  {/* Multi-Component side */}
+                                  {dr.status === 'loading' ? (
+                                    <td colSpan={7} className="px-3 py-2.5 text-center border-l border-l-purple-100">
+                                      <div className="flex items-center justify-center gap-1.5 text-gray-400">
+                                        <svg className="animate-spin h-3 w-3" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"/></svg>
+                                        Loading...
+                                      </div>
+                                    </td>
+                                  ) : dr.status === 'error' ? (
+                                    <td colSpan={7} className="px-3 py-2.5 text-center text-red-400 border-l border-l-purple-100">{dr.error}</td>
+                                  ) : (
+                                    <>
+                                      <td className="px-3 py-2.5 font-mono font-semibold text-purple-700 whitespace-nowrap border-l border-l-purple-100">{dr.mcBestInternalPN || '—'}</td>
+                                      <td className="px-3 py-2.5 font-mono text-gray-600 whitespace-nowrap">{dr.mcBestMpn || '—'}</td>
+                                      <td className="px-3 py-2.5 text-gray-500 whitespace-nowrap">{dr.mcBestPlant || '—'}</td>
+                                      <td className="px-3 py-2.5 text-gray-600 max-w-[150px] truncate" title={dr.mcBestSupplier}>{dr.mcBestSupplier || '—'}</td>
+                                      <td className={`px-3 py-2.5 text-right font-mono font-semibold whitespace-nowrap ${winner === 'mc' ? 'text-emerald-700 text-sm' : 'text-gray-700'}`}>{fmt6(mcPrice)}</td>
+                                      <td className="px-3 py-2.5 text-right font-mono text-gray-500 whitespace-nowrap">{fmt6(dr.mcStdPriceUsd)}</td>
+                                      <td className="px-3 py-2.5 text-gray-500 whitespace-nowrap">{dr.mcLastPoDate || '—'}</td>
+                                    </>
+                                  )}
+                                  {/* Nexar Market side */}
+                                  {nexarBest == null ? (
+                                    <td colSpan={6} className="px-3 py-2.5 text-center text-gray-300 text-[10px] border-l border-l-orange-100 bg-orange-50/10">
+                                      {Object.keys(amplDemandNexarMap).length === 0 ? 'Enable Nexar search' : '—'}
+                                    </td>
+                                  ) : (
+                                    <>
+                                      <td className="px-3 py-2.5 font-mono text-orange-700 whitespace-nowrap border-l border-l-orange-100 bg-orange-50/10">{nexarBest.nexarMpn || '—'}</td>
+                                      <td className="px-3 py-2.5 text-gray-600 max-w-[130px] truncate bg-orange-50/10" title={nexarBest.nexarManufacturer}>{nexarBest.nexarManufacturer || '—'}</td>
+                                      <td className="px-3 py-2.5 text-gray-600 max-w-[130px] truncate bg-orange-50/10" title={nexarBest.nexarSeller}>{nexarBest.nexarSeller || '—'}</td>
+                                      <td className={`px-3 py-2.5 text-right font-mono font-semibold whitespace-nowrap bg-orange-50/10 ${winner === 'nexar' ? 'text-emerald-700 text-sm' : 'text-orange-700'}`}>{fmt6(nexarBest.nexarBestUsd)}</td>
+                                      <td className="px-3 py-2.5 text-right font-mono text-gray-500 whitespace-nowrap bg-orange-50/10">{nexarBest.nexarStock != null ? nexarBest.nexarStock.toLocaleString() : '—'}</td>
+                                      <td className="px-3 py-2.5 text-right font-mono text-gray-500 whitespace-nowrap bg-orange-50/10">{nexarBest.nexarMoq != null ? nexarBest.nexarMoq.toLocaleString() : '—'}</td>
+                                    </>
+                                  )}
+                                  {/* Lytica side */}
+                                  {hasLytica && (
+                                    lyticaBest == null ? (
+                                      <td colSpan={4} className="px-3 py-2.5 text-center text-gray-300 text-[10px] border-l border-l-teal-100 bg-teal-50/10">—</td>
+                                    ) : (
+                                      <>
+                                        <td className="px-3 py-2.5 font-mono text-teal-700 whitespace-nowrap border-l border-l-teal-100 bg-teal-50/10">{lyticaBest.mpnSearched || '—'}</td>
+                                        <td className="px-3 py-2.5 font-mono text-gray-600 whitespace-nowrap bg-teal-50/10">{lyticaBest.mpnMatched || '—'}</td>
+                                        <td className="px-3 py-2.5 text-gray-600 max-w-[130px] truncate bg-teal-50/10" title={lyticaBest.manufacturerMatched}>{lyticaBest.manufacturerMatched || '—'}</td>
+                                        <td className={`px-3 py-2.5 text-right font-mono font-semibold whitespace-nowrap bg-teal-50/10 ${winner === 'lytica' ? 'text-emerald-700 text-sm' : 'text-teal-700'}`}>{fmt6(lyticaPrice)}</td>
+                                      </>
+                                    )
+                                  )}
+                                  {/* Winner */}
+                                  <td className="px-3 py-2.5 text-center border-l border-l-gray-200">
+                                    {dr.status === 'loading' ? null
+                                      : winner === 'mpn'    ? <span className="px-2 py-0.5 text-[10px] font-bold rounded-full bg-emerald-100 text-emerald-700">AMPL MPN</span>
+                                      : winner === 'mc'     ? <span className="px-2 py-0.5 text-[10px] font-bold rounded-full bg-purple-100 text-purple-700">Multi-Comp</span>
+                                      : winner === 'nexar'  ? <span className="px-2 py-0.5 text-[10px] font-bold rounded-full bg-orange-100 text-orange-700">Nexar</span>
+                                      : winner === 'lytica' ? <span className="px-2 py-0.5 text-[10px] font-bold rounded-full bg-teal-100 text-teal-700">Lytica</span>
+                                      : winner === 'tie'    ? <span className="px-2 py-0.5 text-[10px] font-bold rounded-full bg-gray-100 text-gray-500">Tie</span>
+                                      : null
+                                    }
+                                  </td>
+                                </tr>
+                                )
+                              })}
+                            </tbody>
+                          </table>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
             </div>
