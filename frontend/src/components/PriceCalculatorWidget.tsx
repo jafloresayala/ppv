@@ -931,10 +931,16 @@ async function downloadMpnExcelFile(
       { header: 'Date (Multi-Comp)',        key: 'mcDate',       width: 14 },
       { header: 'QTY Inserted',            key: 'qtyIns',       width: 14 },
       { header: 'Total (USD) per QTY',     key: 'totalUsd',     width: 22 },
+      { header: 'Nexar MPN',               key: 'nexarMpn',     width: 24 },
+      { header: 'Nexar Manufacturer',      key: 'nexarMfr',     width: 28 },
+      { header: 'Nexar Seller',            key: 'nexarSeller',  width: 28 },
+      { header: 'Nexar Price (USD)',        key: 'nexarPrice',   width: 18 },
+      { header: 'Nexar Stock',             key: 'nexarStock',   width: 14 },
+      { header: 'Nexar MOQ',               key: 'nexarMoq',     width: 12 },
       { header: 'Winner',                  key: 'winner',       width: 14 },
     ]
     styleHeader(ws)
-    ws.autoFilter = `A1:Q1`
+    ws.autoFilter = `A1:W1`
     deepAnalysisRows.filter(dr => dr.status === 'done').forEach((dr, i) => {
       const candidates = mpnEntries.filter(e => e.bestRow.internalPN === dr.internalPN)
       const mpnBest    = candidates.reduce<typeof mpnEntries[0] | null>((min, e) => {
@@ -943,11 +949,28 @@ async function downloadMpnExcelFile(
       }, null)
       const mpnPrice = mpnBest ? resolveLastPoPrice(mpnBest.bestRow) : null
       const mcPrice  = dr.mcBestPriceUsd
+      // Best Nexar entry across all MPNs belonging to this internal PN
+      let nexarEntry: (typeof ctx.mpnNexarMap)[string] | null = null
+      for (const cand of candidates) {
+        const nx = ctx.mpnNexarMap[cand.mpn] ?? ctx.mpnNexarMap[cand.mpn.toUpperCase()]
+        if (nx?.nexarBestUsd != null && (nexarEntry?.nexarBestUsd == null || nx.nexarBestUsd < nexarEntry.nexarBestUsd))
+          nexarEntry = nx
+      }
+      const nexarPrice = nexarEntry?.nexarBestUsd ?? null
       const qtyIns   = ctx.mpnComponentQtys[mpnBest?.mpn ?? ''] ?? ctx.qty
-      const winner   = mpnPrice != null && mcPrice != null
-        ? mpnPrice < mcPrice ? 'Multi-MPN' : mcPrice < mpnPrice ? 'Multi-Comp' : 'Tie'
-        : mpnPrice != null ? 'Multi-MPN' : mcPrice != null ? 'Multi-Comp' : ''
-      const winnerPrice = winner === 'Multi-MPN' ? mpnPrice : winner === 'Multi-Comp' ? mcPrice : winner === 'Tie' ? (mpnPrice ?? mcPrice) : null
+      // Winner considers all three sources
+      const priceCands: Array<[string, number]> = []
+      if (mpnPrice   != null) priceCands.push(['Multi-MPN', mpnPrice])
+      if (mcPrice    != null) priceCands.push(['Multi-Comp', mcPrice])
+      if (nexarPrice != null) priceCands.push(['Nexar', nexarPrice])
+      let winner = ''
+      let winnerPrice: number | null = null
+      if (priceCands.length > 0) {
+        const minP = Math.min(...priceCands.map(([, p]) => p))
+        const mins = priceCands.filter(([, p]) => p === minP)
+        winner = mins.length === 1 ? mins[0][0] : 'Tie'
+        winnerPrice = minP
+      }
       const totalUsd = winnerPrice != null && winnerPrice > 0 ? winnerPrice * qtyIns : null
       const row = ws.addRow({
         internalPN:   dr.internalPN,
@@ -966,23 +989,35 @@ async function downloadMpnExcelFile(
         mcDate:       dr.mcLastPoDate || '',
         qtyIns,
         totalUsd:     totalUsd ?? '',
+        nexarMpn:     nexarEntry?.nexarMpn || '',
+        nexarMfr:     nexarEntry?.nexarManufacturer || '',
+        nexarSeller:  nexarEntry?.nexarSeller || '',
+        nexarPrice:   nexarPrice ?? '',
+        nexarStock:   nexarEntry?.nexarStock ?? '',
+        nexarMoq:     nexarEntry?.nexarMoq ?? '',
         winner,
       })
       row.height = 18
-      const bg = winner === 'Multi-MPN' ? 'FFD1FAE5' : winner === 'Multi-Comp' ? 'FFEDE9FE' : i % 2 === 0 ? 'FFFFFFFF' : 'FFF8FAFC'
+      const isNexarWin = winner === 'Nexar'
+      const bg = winner === 'Multi-MPN' ? 'FFD1FAE5' : winner === 'Multi-Comp' ? 'FFEDE9FE' : isNexarWin ? 'FFFEF3C7' : i % 2 === 0 ? 'FFFFFFFF' : 'FFF8FAFC'
       row.eachCell({ includeEmpty: true }, (cell: any) => {
         cell.fill      = { type: 'pattern', pattern: 'solid', fgColor: { argb: bg } }
         cell.font      = { size: 9, name: 'Calibri' }
         cell.alignment = { vertical: 'middle' }
         cell.border    = { bottom: { style: 'thin', color: { argb: 'FFE5E7EB' } } }
       })
-      for (const k of ['mpnPrice', 'mpnStd', 'mcPrice', 'mcStd', 'totalUsd']) {
+      for (const k of ['mpnPrice', 'mpnStd', 'mcPrice', 'mcStd', 'totalUsd', 'nexarPrice']) {
         const c = row.getCell(k)
         c.alignment = { horizontal: 'right', vertical: 'middle' }
         if (c.value !== '' && c.value != null) c.numFmt = '#,##0.000000'
       }
       row.getCell('qtyIns').alignment = { horizontal: 'right', vertical: 'middle' }
       if (row.getCell('qtyIns').value != null) row.getCell('qtyIns').numFmt = '#,##0'
+      for (const k of ['nexarStock', 'nexarMoq']) {
+        const c = row.getCell(k)
+        c.alignment = { horizontal: 'right', vertical: 'middle' }
+        if (c.value !== '' && c.value != null) c.numFmt = '#,##0'
+      }
       const wc = row.getCell('winner')
       wc.alignment = { horizontal: 'center', vertical: 'middle' }
       if (winner === 'Multi-MPN') {
@@ -993,6 +1028,10 @@ async function downloadMpnExcelFile(
         wc.font = { bold: true, size: 9, name: 'Calibri', color: { argb: 'FF7C3AED' } }
         row.getCell('mcPrice').font  = { bold: true, size: 9, name: 'Calibri', color: { argb: 'FF7C3AED' } }
         row.getCell('totalUsd').font = { bold: true, size: 9, name: 'Calibri', color: { argb: 'FF7C3AED' } }
+      } else if (isNexarWin) {
+        wc.font = { bold: true, size: 9, name: 'Calibri', color: { argb: 'FF7C2D12' } }
+        row.getCell('nexarPrice').font = { bold: true, size: 9, name: 'Calibri', color: { argb: 'FF7C2D12' } }
+        row.getCell('totalUsd').font   = { bold: true, size: 9, name: 'Calibri', color: { argb: 'FF7C2D12' } }
       }
     })
   }
@@ -2033,10 +2072,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
         setStatus('loading-iq')
         const iqData = await apiPost<{ count: number; data: IQItem[] }>('/api/pricecalc/internal-query', { mpns: queryMpns })
         const rows: IQItem[] = Array.isArray(iqData.data) ? iqData.data : []
-        if (!rows.length) {
-          setError('No pricing data found for this MPN.')
-          setStatus('error'); return
-        }
+        // Don't bail out when IQ has no results — still fetch market so Nexar prices are shown
         setIqRows(rows)
         setPlants(buildPlantSummaries(rows, windowDays * 86400000))
         setStatus('loading-market')
@@ -2774,8 +2810,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
         await Promise.allSettled(nexarMpns.map(async (mpn: string) => {
           try {
             const mkt = await apiPostWithRetry<MarketResponse>('/api/pricecalc/market-prices', { mpns: [mpn], quantity: qty }, signal)
-            const eligible = mkt.offers.filter((o: MarketOffer) => o.inventory > 0 && o.moq <= qty)
-            const best = eligible.sort((a: MarketOffer, b: MarketOffer) => a.unit_price_usd - b.unit_price_usd)[0] ?? null
+            const best = [...mkt.offers].sort((a: MarketOffer, b: MarketOffer) => a.unit_price_usd - b.unit_price_usd)[0] ?? null
             if (best) nexarUpdates[mpn] = {
               nexarBestUsd: best.unit_price_usd, nexarSeller: best.seller,
               nexarManufacturer: best.manufacturer, nexarStock: best.inventory,
@@ -2892,8 +2927,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
           try {
             const mpnQty = mpnComponentQtys[mpn] ?? qty
             const mkt = await apiPostWithRetry<MarketResponse>('/api/pricecalc/market-prices', { mpns: [mpn], quantity: mpnQty }, signal)
-            const eligible = mkt.offers.filter(o => o.inventory > 0 && o.moq <= mpnQty)
-            const best = eligible.sort((a, b) => a.unit_price_usd - b.unit_price_usd)[0] ?? null
+            const best = [...mkt.offers].sort((a, b) => a.unit_price_usd - b.unit_price_usd)[0] ?? null
             if (best) nexarUpdates[mpn] = {
               nexarBestUsd: best.unit_price_usd, nexarSeller: best.seller,
               nexarManufacturer: best.manufacturer, nexarStock: best.inventory,
@@ -3620,6 +3654,42 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                       }
                     </div>
                   )}
+
+                  {/* Lytica benchmark — shown whenever lyticaMap has data for this part */}
+                  {(() => {
+                    if (Object.keys(lyticaMap).length === 0) return null
+                    const mpnsToCheck: string[] = searchMode === 'mpn'
+                      ? [bmatn]
+                      : (ampl?.mpns_list ?? [bmatn])
+                    const lyticaHits = mpnsToCheck
+                      .map(m => ({ mpn: m, entry: lyticaMap[m.toUpperCase()] ?? lyticaMap[m] ?? null }))
+                      .filter(x => x.entry !== null)
+                    if (!lyticaHits.length) return null
+                    return (
+                      <div className="rounded-xl border border-teal-200 bg-teal-50/40 p-4">
+                        <h4 className="text-xs font-semibold text-teal-700 uppercase tracking-wide mb-3 flex items-center gap-1.5">
+                          <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>
+                          Lytica 90th Percentile Benchmark
+                        </h4>
+                        <div className="flex flex-wrap gap-3">
+                          {lyticaHits.map(({ mpn, entry }) => (
+                            <div key={mpn} className="bg-white rounded-xl border border-teal-200 px-4 py-3 min-w-[160px] shadow-sm">
+                              <p className="text-[10px] text-gray-400 font-medium uppercase tracking-wide mb-0.5">MPN</p>
+                              <p className="text-xs font-mono font-semibold text-gray-800 mb-2">{mpn}</p>
+                              {entry!.mpnMatched && entry!.mpnMatched.toUpperCase() !== mpn.toUpperCase() && (
+                                <p className="text-[10px] text-teal-500 mb-1">Matched: <span className="font-mono">{entry!.mpnMatched}</span></p>
+                              )}
+                              <p className="text-[10px] text-gray-400 uppercase tracking-wide mb-0.5">90th %tile Price</p>
+                              <p className="text-sm font-bold font-mono text-teal-700">{entry!.price90th != null ? fmt6(entry!.price90th) : '—'}</p>
+                              {entry!.manufacturerMatched && (
+                                <p className="text-[10px] text-gray-500 mt-1.5 truncate" title={entry!.manufacturerMatched}>{entry!.manufacturerMatched}</p>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )
+                  })()}
 
                   {/* KPI cards + Plant Summary + Detail — only when SAP data exists */}
                   {globalBest && (
@@ -4889,6 +4959,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                                     {Object.keys(mpnNexarMap).length > 0 && <th className="px-3 py-2.5 text-center whitespace-nowrap border-b border-gray-200 text-purple-600">Best in Market</th>}
                                     {Object.keys(mpnNexarMap).length > 0 && <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200 text-purple-600">Nexar Best (USD)</th>}
                                     {Object.keys(mpnNexarMap).length > 0 && <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200 text-purple-600">Nexar Seller</th>}
+                                    {Object.keys(lyticaMap).length > 0 && <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-teal-200 text-teal-600">Lytica 90th (USD)</th>}
                                   </tr>
                                 </thead>
                                 <tbody className="divide-y divide-gray-100">
@@ -4947,21 +5018,67 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                                         {Object.keys(mpnNexarMap).length > 0 && (
                                           <td className="px-3 py-2 text-left font-mono text-purple-600 whitespace-nowrap max-w-[160px] truncate" title={nexarSeller}>{nexarSeller || '—'}</td>
                                         )}
+                                        {Object.keys(lyticaMap).length > 0 && (() => {
+                                          const lytE = lyticaMap[mpn.toUpperCase()] ?? lyticaMap[mpn] ?? null
+                                          return <td className="px-3 py-2 text-right font-mono text-teal-700 whitespace-nowrap bg-teal-50/30">{lytE?.price90th != null ? fmt6(lytE.price90th) : '—'}</td>
+                                        })()}
                                       </tr>
                                     )
                                   })}
                                   {(() => {
-                                    const foundSet   = new Set(mpnEntries.map(e => e.mpn))
-                                    const rawSet     = new Set(multiMpnRawResults.map(r => r.mpn))
-                                    const blockedSet = new Set(allBlockedItems.map(i => i.mpn))
+                                    const foundSet    = new Set(mpnEntries.map(e => e.mpn))
+                                    const rawSet      = new Set(multiMpnRawResults.map(r => r.mpn))
+                                    const blockedSet  = new Set(allBlockedItems.map(i => i.mpn))
+                                    const hasNexarCols = Object.keys(mpnNexarMap).length > 0
+                                    const hasLyticaCols = Object.keys(lyticaMap).length > 0
                                     return multiMpnSearchedList.filter(m => !foundSet.has(m)).map(m => {
-                                      const reason    = rawSet.has(m) ? 'No valid price data' : blockedSet.has(m) ? 'Blocked / Deleted' : 'No data'
+                                      const reason    = rawSet.has(m) ? 'No valid price data' : blockedSet.has(m) ? 'Blocked / Deleted' : 'No matches'
                                       const isBlocked = reason === 'Blocked / Deleted'
+                                      const nexE = mpnNexarMap[m] ?? mpnNexarMap[m.toUpperCase()] ?? null
+                                      const lytE = lyticaMap[m.toUpperCase()] ?? lyticaMap[m] ?? null
+                                      const hasAltData = (hasNexarCols && nexE?.nexarBestUsd != null) || (hasLyticaCols && lytE?.price90th != null)
+                                      if (hasAltData) {
+                                        return (
+                                          <tr key={`missing-${m}`} className="bg-orange-50/30 hover:bg-orange-50/60">
+                                            <td className="px-2 py-2 text-center">
+                                              <svg className="h-3 w-3 mx-auto text-orange-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/></svg>
+                                            </td>
+                                            <td className="px-3 py-2 font-mono text-orange-700 whitespace-nowrap">
+                                              {m}
+                                              {nexE?.nexarBestUsd != null && lytE?.price90th != null
+                                                ? <span className="ml-1.5 text-[9px] font-semibold bg-purple-100 text-purple-600 px-1.5 py-0.5 rounded uppercase tracking-wide">Nexar/Lytica</span>
+                                                : nexE?.nexarBestUsd != null
+                                                  ? <span className="ml-1.5 text-[9px] font-semibold bg-orange-100 text-orange-500 px-1.5 py-0.5 rounded uppercase tracking-wide">Nexar</span>
+                                                  : <span className="ml-1.5 text-[9px] font-semibold bg-teal-100 text-teal-600 px-1.5 py-0.5 rounded uppercase tracking-wide">Lytica</span>
+                                              }
+                                            </td>
+                                            <td className="px-3 py-2 text-gray-300 whitespace-nowrap">—</td>
+                                            <td className="px-3 py-2 text-gray-300 whitespace-nowrap">—</td>
+                                            <td className="px-3 py-2 font-mono font-semibold text-orange-400 whitespace-nowrap">{m}</td>
+                                            <td className="px-3 py-2 text-gray-300 whitespace-nowrap">—</td>
+                                            <td className="px-3 py-2 text-gray-300 whitespace-nowrap">—</td>
+                                            <td className="px-3 py-2 text-right text-gray-300 whitespace-nowrap">—</td>
+                                            <td className="px-3 py-2 text-center text-gray-300 whitespace-nowrap">—</td>
+                                            <td className="px-3 py-2 text-right text-gray-300 whitespace-nowrap">—</td>
+                                            <td className="px-3 py-2 text-right text-gray-300 whitespace-nowrap">—</td>
+                                            <td className="px-3 py-2 text-right text-gray-300 whitespace-nowrap">—</td>
+                                            <td className="px-3 py-2 text-right text-gray-300 whitespace-nowrap">—</td>
+                                            <td className="px-3 py-2 text-gray-300 whitespace-nowrap">—</td>
+                                            <td className="px-3 py-2 whitespace-nowrap" />
+                                            <td className="px-3 py-2 whitespace-nowrap" />
+                                            <td className="px-3 py-2 whitespace-nowrap" />
+                                            {hasNexarCols && <td className="px-3 py-2 whitespace-nowrap" />}
+                                            {hasNexarCols && <td className="px-3 py-2 text-right font-mono font-semibold text-purple-700 whitespace-nowrap">{nexE?.nexarBestUsd != null ? fmt6(nexE.nexarBestUsd) : '—'}</td>}
+                                            {hasNexarCols && <td className="px-3 py-2 text-left font-mono text-purple-600 whitespace-nowrap max-w-[160px] truncate" title={nexE?.nexarSeller}>{nexE?.nexarSeller || '—'}</td>}
+                                            {hasLyticaCols && <td className="px-3 py-2 text-right font-mono font-semibold text-teal-700 whitespace-nowrap bg-teal-50/30">{lytE?.price90th != null ? fmt6(lytE.price90th) : '—'}</td>}
+                                          </tr>
+                                        )
+                                      }
                                       return (
                                         <tr key={`missing-${m}`} className={isBlocked ? 'bg-amber-50/60' : 'bg-gray-50/40'}>
                                           <td className="px-2 py-2 text-center text-gray-300">—</td>
                                           <td className="px-3 py-2 font-mono text-gray-500 whitespace-nowrap">{m}</td>
-                                          <td colSpan={Object.keys(mpnNexarMap).length > 0 ? 18 : 15} className={`px-3 py-2 text-xs italic ${isBlocked ? 'text-amber-500' : 'text-gray-400'}`}>{reason}</td>
+                                          <td colSpan={15 + (hasNexarCols ? 3 : 0) + (hasLyticaCols ? 1 : 0)} className={`px-3 py-2 text-xs italic ${isBlocked ? 'text-amber-500' : 'text-gray-400'}`}>{reason}</td>
                                         </tr>
                                       )
                                     })
@@ -5410,7 +5527,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                         >···</button>
                         {showAmplMenu && (
                           <div
-                            className="absolute left-0 top-9 z-30 w-60 bg-white rounded-xl border border-gray-200 shadow-xl py-1.5"
+                            className="absolute left-0 bottom-9 z-30 w-60 bg-white rounded-xl border border-gray-200 shadow-xl py-1.5"
                             onMouseLeave={() => setShowAmplMenu(false)}
                           >
                             <p className="text-[10px] text-gray-400 px-3 pt-1.5 pb-0.5 uppercase tracking-wider font-semibold">Export</p>
@@ -5526,7 +5643,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                   )}
 
                   {/* SAP Results sub-tab */}
-                  {amplDemandSubTab === 'results' && amplDemandRawResults.length > 0 && (() => {
+                  {amplDemandSubTab === 'results' && (amplDemandRawResults.length > 0 || (amplDemandSearchedList.length > 0 && (Object.keys(amplDemandNexarMap).length > 0 || Object.keys(lyticaMap).length > 0))) && (() => {
                     const mpnGroupsMap = new Map<string, IQItem[]>()
                     for (const r of amplDemandRawResults) {
                       if (!mpnGroupsMap.has(r.mpn)) mpnGroupsMap.set(r.mpn, [])
@@ -5540,6 +5657,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                       const best = inWindow.reduce<IQItem>((min, r) => { const p = resolveLastPoPrice(r), mp = resolveLastPoPrice(min); return p == null ? min : mp == null ? r : p < mp ? r : min }, inWindow[0])
                       return { mpn, bestRow: best }
                     }).filter((x): x is { mpn: string; bestRow: IQItem } => x !== null)
+                    const foundMpnSet = new Set(entries.map(e => e.mpn))
 
                     return (
                       <div className="overflow-x-auto rounded-xl border border-gray-200 shadow-sm">
@@ -5599,6 +5717,51 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                                     : <span className="text-[10px] text-gray-300">—</span>}
                                   </td>
                                   <td className={`px-3 py-2 text-right font-mono font-bold whitespace-nowrap ${winS2 ? 'text-indigo-700' : 'text-gray-300'}`}>{minP2 != null ? minP2.toFixed(6) : '—'}</td>
+                                </tr>
+                              )
+                            })}
+                            {/* Missing MPNs — not found in SAP but have Nexar/Lytica data */}
+                            {amplDemandSearchedList.filter(m => !foundMpnSet.has(m)).map(m => {
+                              const nexE = amplDemandNexarMap[m.toUpperCase()] ?? amplDemandNexarMap[m] ?? null
+                              const lytE = lyticaMap[m.toUpperCase()] ?? lyticaMap[m] ?? null
+                              const hasAlt = (nexE?.nexarBestUsd != null) || (lytE?.price90th != null)
+                              if (!hasAlt) return null
+                              const cands: Array<['nexar' | 'lytica', number]> = []
+                              if (nexE?.nexarBestUsd != null) cands.push(['nexar', nexE.nexarBestUsd])
+                              if (lytE?.price90th != null) cands.push(['lytica', lytE.price90th])
+                              const minP = cands.length > 0 ? Math.min(...cands.map(([, p]) => p)) : null
+                              const winS = cands.length > 0 ? (cands.filter(([, p]) => p === minP).length === 1 ? cands.find(([, p]) => p === minP)![0] : 'tie') : null
+                              return (
+                                <tr key={`missing-${m}`} className="bg-orange-50/30 hover:bg-orange-50/60">
+                                  <td className="px-3 py-2 whitespace-nowrap">
+                                    <span className="font-mono font-semibold text-orange-700">{m}</span>
+                                    {nexE?.nexarBestUsd != null && lytE?.price90th != null
+                                      ? <span className="ml-1.5 text-[9px] font-semibold bg-purple-100 text-purple-600 px-1.5 py-0.5 rounded uppercase tracking-wide">Nexar/Lytica</span>
+                                      : nexE?.nexarBestUsd != null
+                                        ? <span className="ml-1.5 text-[9px] font-semibold bg-orange-100 text-orange-500 px-1.5 py-0.5 rounded uppercase tracking-wide">Nexar</span>
+                                        : <span className="ml-1.5 text-[9px] font-semibold bg-teal-100 text-teal-600 px-1.5 py-0.5 rounded uppercase tracking-wide">Lytica</span>
+                                    }
+                                  </td>
+                                  <td className="px-3 py-2 text-gray-300">—</td>
+                                  <td className="px-3 py-2 text-gray-300">—</td>
+                                  <td className="px-3 py-2 text-gray-300">—</td>
+                                  <td className="px-3 py-2 text-right text-gray-300">—</td>
+                                  <td className="px-3 py-2 text-right text-gray-300">—</td>
+                                  <td className="px-3 py-2 text-gray-300">—</td>
+                                  {Object.keys(amplDemandNexarMap).length > 0 && <>
+                                    <td className="px-3 py-2 text-right font-mono text-orange-700 whitespace-nowrap bg-orange-50/30">{nexE?.nexarBestUsd != null ? nexE.nexarBestUsd.toFixed(6) : '—'}</td>
+                                    <td className="px-3 py-2 text-gray-600 whitespace-nowrap bg-orange-50/30">{nexE?.nexarSeller || '—'}</td>
+                                  </>}
+                                  {Object.keys(lyticaMap).length > 0 && <>
+                                    <td className="px-3 py-2 text-right font-mono text-teal-700 whitespace-nowrap bg-teal-50/30">{lytE?.price90th != null ? lytE.price90th.toFixed(6) : '—'}</td>
+                                  </>}
+                                  <td className="px-3 py-2 text-center whitespace-nowrap">
+                                    {winS === 'nexar' ? <span className="px-2 py-0.5 text-[10px] font-bold rounded-full bg-orange-100 text-orange-700">Nexar</span>
+                                    : winS === 'lytica' ? <span className="px-2 py-0.5 text-[10px] font-bold rounded-full bg-teal-100 text-teal-700">Lytica</span>
+                                    : winS === 'tie' ? <span className="px-2 py-0.5 text-[10px] font-bold rounded-full bg-gray-100 text-gray-500">Tie</span>
+                                    : <span className="text-[10px] text-gray-300">—</span>}
+                                  </td>
+                                  <td className="px-3 py-2 text-right font-mono font-bold whitespace-nowrap text-indigo-700">{minP != null ? minP.toFixed(6) : '—'}</td>
                                 </tr>
                               )
                             })}
