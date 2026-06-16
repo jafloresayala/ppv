@@ -2875,6 +2875,52 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
     setAmplDemandDeepLoading(false)
   }, [amplDemandRawResults, windowDays])
 
+  // ── AMPL Demand: retry failed deep-analysis rows ──────────────────────────
+  const handleAmplDemandDeepRetry = useCallback(async () => {
+    const retryableIPs = amplDemandDeepRows
+      .filter(r => r.status === 'error' && r.error !== 'Cancelled' && r.error !== 'No MPNs in SAP')
+      .map(r => r.internalPN)
+    if (!retryableIPs.length) return
+    abortAmplDemandDeepRef.current?.abort()
+    const ctrl = new AbortController()
+    abortAmplDemandDeepRef.current = ctrl
+    const { signal } = ctrl
+    setAmplDemandDeepLoading(true)
+    setAmplDemandDeepRows(prev => prev.map(r =>
+      retryableIPs.includes(r.internalPN) ? { ...r, status: 'loading', error: undefined } : r
+    ))
+    await Promise.allSettled(retryableIPs.map(async ip => {
+      try {
+        const amplData = await apiPostWithRetry<AmplResponse>('/api/pricecalc/ampl', { internal_part_number: ip }, signal)
+        let queryMpns = amplData.mpns_list
+        if (!queryMpns.length) {
+          queryMpns = [...amplData.blocked.map((i: { MfgPartNumber: string }) => i.MfgPartNumber), ...amplData.deleted.map((i: { MfgPartNumber: string }) => i.MfgPartNumber)].filter(Boolean).filter((v: string, i: number, a: string[]) => a.indexOf(v) === i)
+        }
+        if (!queryMpns.length) {
+          setAmplDemandDeepRows(prev => prev.map(r => r.internalPN === ip ? { ...r, status: 'error', error: 'No MPNs in SAP' } : r))
+          return
+        }
+        const iqData = await apiPostWithRetry<{ count: number; data: IQItem[] }>('/api/pricecalc/internal-query', { mpns: queryMpns }, signal)
+        const rows: IQItem[] = Array.isArray(iqData.data) ? iqData.data : []
+        const bestRow = buildPlantSummaries(rows, windowDays * 86400000)[0]?.bestRow ?? null
+        setAmplDemandDeepRows(prev => prev.map(r => r.internalPN === ip ? {
+          ...r, status: 'done',
+          mcBestPriceUsd: bestRow ? resolveLastPoPrice(bestRow) : null,
+          mcStdPriceUsd: bestRow?.standardPriceUsd ?? null,
+          mcBestSupplier: bestRow?.supplierName || bestRow?.englishName || '—',
+          mcBestPlant: bestRow?.siteName || '—',
+          mcBestMpn: bestRow?.mpn || '—',
+          mcBestInternalPN: bestRow?.internalPN || '—',
+          mcLastPoDate: bestRow?.lastPoDate || '—',
+        } : r))
+      } catch (e) {
+        const isCancelled = e instanceof DOMException && e.name === 'AbortError'
+        setAmplDemandDeepRows(prev => prev.map(r => r.internalPN === ip ? { ...r, status: 'error', error: isCancelled ? 'Cancelled' : e instanceof Error ? e.message : String(e) } : r))
+      }
+    }))
+    setAmplDemandDeepLoading(false)
+  }, [amplDemandDeepRows, windowDays])
+
   // ── Multi-MPN: search handler ─────────────────────────────────────────────
   const handleMultiMpnSearch = useCallback(async () => {
     const mpns = multiMpnInput
@@ -5595,6 +5641,20 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                                 : <><svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 3H5a2 2 0 00-2 2v4m6-6h10a2 2 0 012 2v4M9 3v18m0 0h10a2 2 0 002-2V9M9 21H5a2 2 0 01-2-2V9m0 0h18"/></svg>Deep Analysis</>
                               }
                             </button>
+                            {/* Retry Failed button — only shown when there are retryable errors */}
+                            {(() => {
+                              const retryCount = amplDemandDeepRows.filter(r => r.status === 'error' && r.error !== 'Cancelled' && r.error !== 'No MPNs in SAP').length
+                              return retryCount > 0 && !amplDemandDeepLoading ? (
+                                <button
+                                  onClick={handleAmplDemandDeepRetry}
+                                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors shadow-sm bg-amber-50 hover:bg-amber-100 text-amber-700 border border-amber-300"
+                                  title={`Retry ${retryCount} failed Internal PN${retryCount > 1 ? 's' : ''} (connection errors)`}
+                                >
+                                  <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+                                  Retry Failed ({retryCount})
+                                </button>
+                              ) : null
+                            })()}
                           </div>
                         )}
 
