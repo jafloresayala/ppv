@@ -281,12 +281,17 @@ def _run(trigger: str, mpns: list[str] | None, window_days: int, skip_cached: bo
             _set_state(running=False, status="failed", message=str(e))
             return
 
+    # Force re-run ("from scratch"): an admin asked to rebuild the whole cache,
+    # so wipe every existing entry before recomputing.
+    if from_file and not skip_cached:
+        store.clear_all()
+
     # Resume support: when running from the source file, skip MPNs already cached
-    # and valid today so a re-run only processes the pending ones (no restart from 0).
+    # so a re-run only processes the pending ones (no restart from 0).
     skipped = 0
     file_total = len(mpns)
     if skip_cached and from_file:
-        cached = store.valid_today_mpns()
+        cached = store.cached_mpns()
         if cached:
             pending = [m for m in mpns if m not in cached]
             skipped = len(mpns) - len(pending)
@@ -298,7 +303,7 @@ def _run(trigger: str, mpns: list[str] | None, window_days: int, skip_cached: bo
                    started_at=datetime.now().isoformat(),
                    finished_at=datetime.now().isoformat(),
                    source_file=os.path.basename(source_file) if source_file else None,
-                   message=f"All {file_total} MPNs already cached today — nothing to do.")
+                   message=f"All {file_total} MPNs already cached — nothing to do.")
         return
 
     total = len(mpns)

@@ -2,7 +2,8 @@
 backend/mpn_store.py — SQLite store for pre-computed best SAP prices per MPN.
 
 Holds:
-  • mpn_best   — best supplier price per MPN (valid for a single day)
+  • mpn_best   — best supplier price per MPN (persistent until an admin re-runs
+                 the job from scratch; entries do not auto-expire)
   • job_runs   — history of every batch-job execution
   • job_errors — per-MPN errors captured during a run (for the admin dashboard)
   • job_meta   — key/value (e.g. last successful run timestamp)
@@ -261,61 +262,61 @@ def upsert_best(entry: dict) -> None:
 
 
 def get_best(mpn: str) -> dict | None:
-    """Return today's cached best for an MPN, or None if missing/stale."""
+    """Return the cached best for an MPN, or None if it isn't cached.
+
+    The cache is persistent: entries never expire on their own. They are only
+    removed when an admin runs a full re-run from scratch (`clear_all`).
+    """
     key = (mpn or "").strip().upper()
     with _cursor() as cur:
-        cur.execute(
-            "SELECT * FROM mpn_best WHERE mpn = ? AND valid_date = ?",
-            (key, _today()),
-        )
+        cur.execute("SELECT * FROM mpn_best WHERE mpn = ?", (key,))
         row = cur.fetchone()
     return dict(row) if row else None
 
 
 def get_best_many(mpns: Iterable[str]) -> dict[str, dict]:
-    """Return {MPN_UPPER: entry} for the given MPNs that are valid today."""
+    """Return {MPN_UPPER: entry} for the given MPNs that are cached (any age)."""
     keys = list({(m or "").strip().upper() for m in mpns if m})
     if not keys:
         return {}
     out: dict[str, dict] = {}
-    today = _today()
     with _cursor() as cur:
         # Chunk to stay under SQLite's variable limit
         for i in range(0, len(keys), 400):
             chunk = keys[i : i + 400]
             placeholders = ",".join("?" * len(chunk))
             cur.execute(
-                f"SELECT * FROM mpn_best WHERE valid_date = ? AND mpn IN ({placeholders})",
-                (today, *chunk),
+                f"SELECT * FROM mpn_best WHERE mpn IN ({placeholders})",
+                tuple(chunk),
             )
             for row in cur.fetchall():
                 out[row["mpn"]] = dict(row)
     return out
 
 
-def purge_stale() -> int:
-    """Delete entries not valid for today. Returns rows removed."""
+def clear_all() -> int:
+    """Wipe the entire cache (admin 'from scratch' re-run). Returns rows removed."""
     with _cursor() as cur:
-        cur.execute("DELETE FROM mpn_best WHERE valid_date <> ?", (_today(),))
+        cur.execute("DELETE FROM mpn_best")
         return cur.rowcount
 
 
-def count_valid_today() -> int:
+def count_cached() -> int:
     with _cursor() as cur:
-        cur.execute("SELECT COUNT(*) AS c FROM mpn_best WHERE valid_date = ?", (_today(),))
+        cur.execute("SELECT COUNT(*) AS c FROM mpn_best")
         return int(cur.fetchone()["c"])
 
 
-def all_valid_today() -> list[dict]:
+def all_cached() -> list[dict]:
     with _cursor() as cur:
-        cur.execute("SELECT * FROM mpn_best WHERE valid_date = ? ORDER BY mpn", (_today(),))
+        cur.execute("SELECT * FROM mpn_best ORDER BY mpn")
         return [dict(r) for r in cur.fetchall()]
 
 
-def valid_today_mpns() -> set[str]:
-    """Return the set of MPN keys already cached and valid for today."""
+def cached_mpns() -> set[str]:
+    """Return the set of MPN keys already cached (any age)."""
     with _cursor() as cur:
-        cur.execute("SELECT mpn FROM mpn_best WHERE valid_date = ?", (_today(),))
+        cur.execute("SELECT mpn FROM mpn_best")
         return {row["mpn"] for row in cur.fetchall()}
 
 

@@ -45,10 +45,13 @@ app.include_router(sourcing_router)
 
 @app.on_event("startup")
 def _init_mpn_store() -> None:
-    """Initialise the SQLite best-price cache and drop stale (non-today) entries."""
+    """Initialise the SQLite best-price cache.
+
+    The cache is persistent and never auto-expires; it is only cleared when an
+    authenticated admin runs a full re-run from scratch.
+    """
     try:
         mpn_store.init_db()
-        mpn_store.purge_stale()
     except Exception as exc:  # never block startup
         import logging
         logging.getLogger(__name__).warning("MPN store init failed: %s", exc)
@@ -1300,8 +1303,12 @@ def mpn_best_resolve(req: MpnResolveRequest):
 
 
 @app.post("/api/dbjob/run")
-def dbjob_run(req: DbJobRunRequest):
+def dbjob_run(req: DbJobRunRequest, authorization: str = Header(default="")):
     wd = req.window_days or DBJOB_WINDOW_DAYS
+    # A force re-run wipes the persistent cache and rebuilds it from scratch, so
+    # it requires admin credentials. A normal run only fills in pending MPNs.
+    if req.force:
+        _require_admin(authorization)
     return batch_job.start_job(trigger="manual", window_days=wd, skip_cached=not req.force)
 
 
@@ -1328,7 +1335,7 @@ def dbjob_status():
     state = batch_job.get_state()
     last_run_at = mpn_store.get_meta("last_run_at")
     latest = mpn_store.latest_run()
-    cached_count = mpn_store.count_valid_today()
+    cached_count = mpn_store.count_cached()
 
     # Overdue = past the scheduled hour today and no successful run since then
     now = datetime.now()
@@ -1355,9 +1362,9 @@ def dbjob_status():
 
 @app.get("/api/dbjob/export")
 def dbjob_export():
-    """Export the current (valid-today) best-price table as an Excel file."""
+    """Export the current best-price cache as an Excel file."""
     import io
-    rows = mpn_store.all_valid_today()
+    rows = mpn_store.all_cached()
     df = pd.DataFrame([{
         "MPN":            r.get("mpn"),
         "Internal PN":    r.get("internal_pn"),
@@ -1413,7 +1420,7 @@ def admin_dashboard(authorization: str = Header(default="")):
         "metrics":     mpn_store.error_metrics(),
         "runs":        mpn_store.list_runs(30),
         "recent_errors": mpn_store.list_errors(limit=300),
-        "cached_count": mpn_store.count_valid_today(),
+        "cached_count": mpn_store.count_cached(),
     }
 
 

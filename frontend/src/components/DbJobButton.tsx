@@ -25,6 +25,7 @@ export default function DbJobButton() {
   const [open, setOpen]       = useState(false)
   const [busy, setBusy]       = useState(false)
   const [adminOpen, setAdminOpen] = useState(false)
+  const [forceOpen, setForceOpen] = useState(false)
   const panelRef = useRef<HTMLDivElement | null>(null)
 
   const refresh = useCallback(async () => {
@@ -57,11 +58,7 @@ export default function DbJobButton() {
     setBusy(true)
     try { await runDbJob(undefined, false); await refresh() } finally { setBusy(false) }
   }
-  const handleForceRun = async () => {
-    if (!window.confirm('Force a full re-run? This re-processes every MPN from the file, ignoring today\u2019s cache.')) return
-    setBusy(true)
-    try { await runDbJob(undefined, true); await refresh() } finally { setBusy(false) }
-  }
+  const handleForceRun = () => setForceOpen(true)
   const handleCancel = async () => {
     setBusy(true)
     try { await cancelDbJob(); await refresh() } finally { setBusy(false) }
@@ -179,6 +176,7 @@ export default function DbJobButton() {
                 className="flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-xs font-semibold bg-white text-gray-600 border border-gray-200 hover:border-gray-300 disabled:opacity-50"
               >
                 <RefreshCw size={13} /> Force full re-run
+                <span className="inline-flex items-center gap-0.5 text-[10px] text-gray-400"><ShieldCheck size={11} /> admin</span>
               </button>
             )}
 
@@ -220,6 +218,72 @@ export default function DbJobButton() {
       )}
 
       {adminOpen && <AdminDashboardModal onClose={() => setAdminOpen(false)} />}
+      {forceOpen && <ForceRunModal onClose={() => setForceOpen(false)} onDone={refresh} />}
+    </div>
+  )
+}
+
+// ── Force full re-run (admin-gated cache rebuild) ─────────────────────────────
+
+function ForceRunModal({ onClose, onDone }: { onClose: () => void; onDone: () => void }) {
+  const [user, setUser]   = useState('')
+  const [pass, setPass]   = useState('')
+  const [error, setError] = useState('')
+  const [busy, setBusy]   = useState(false)
+
+  const submit = async () => {
+    if (!user || !pass) return
+    setBusy(true); setError('')
+    try {
+      const { token } = await adminLogin(user, pass)
+      await runDbJob(undefined, true, token)
+      onDone()
+      onClose()
+    } catch {
+      setError('Invalid credentials or the run could not be started.')
+    } finally { setBusy(false) }
+  }
+
+  return (
+    <div className="fixed inset-0 z-[60] bg-black/40 flex items-center justify-center p-4" onMouseDown={onClose}>
+      <div
+        className="bg-white rounded-2xl shadow-2xl w-full max-w-sm overflow-hidden"
+        onMouseDown={e => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between px-5 py-3 border-b border-gray-200">
+          <div className="flex items-center gap-2">
+            <ShieldCheck size={16} className="text-amber-600" />
+            <h3 className="font-bold text-gray-800 text-sm">Admin — Clear cache & re-run</h3>
+          </div>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-700"><X size={18} /></button>
+        </div>
+        <div className="p-5">
+          <div className="flex items-start gap-2 mb-4 p-2.5 rounded-lg bg-amber-50 border border-amber-200">
+            <AlertTriangle size={14} className="text-amber-600 mt-0.5 flex-shrink-0" />
+            <p className="text-[11px] text-amber-700">
+              This <strong>wipes the entire persistent cache</strong> and rebuilds every MPN from
+              scratch. The cache does not expire on its own — only an admin can clear it here.
+            </p>
+          </div>
+          <input
+            value={user} onChange={e => setUser(e.target.value)} placeholder="Admin username"
+            className="w-full mb-2 px-3 py-2 text-sm border border-gray-300 rounded-lg focus:outline-none focus:border-blue-400"
+          />
+          <input
+            type="password" value={pass} onChange={e => setPass(e.target.value)} placeholder="Admin password"
+            onKeyDown={e => e.key === 'Enter' && submit()}
+            className="w-full mb-3 px-3 py-2 text-sm border border-gray-300 rounded-lg focus:outline-none focus:border-blue-400"
+          />
+          {error && <p className="text-xs text-red-500 mb-2">{error}</p>}
+          <button
+            onClick={submit} disabled={busy || !user || !pass}
+            className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-sm font-semibold bg-amber-600 text-white hover:bg-amber-700 disabled:opacity-50"
+          >
+            {busy ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
+            {busy ? 'Clearing & re-running…' : 'Clear cache & re-run'}
+          </button>
+        </div>
+      </div>
     </div>
   )
 }

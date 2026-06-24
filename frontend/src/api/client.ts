@@ -260,8 +260,11 @@ export async function getDbJobStatus(): Promise<DbJobStatus> {
   return data
 }
 
-export async function runDbJob(windowDays?: number, force = false): Promise<DbJobStatus & { started: boolean; reason?: string }> {
-  const { data } = await http.post('/dbjob/run', { window_days: windowDays ?? null, force }, { timeout: 15_000 })
+export async function runDbJob(windowDays?: number, force = false, token?: string): Promise<DbJobStatus & { started: boolean; reason?: string }> {
+  const { data } = await http.post('/dbjob/run', { window_days: windowDays ?? null, force }, {
+    timeout: 15_000,
+    headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+  })
   return data
 }
 
