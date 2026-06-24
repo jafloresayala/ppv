@@ -187,7 +187,7 @@ export default function TabImpact() {
                       <p className="text-xs text-slate-500">Best Model</p>
                       <div className="flex items-center gap-2 flex-wrap mt-0.5">
                         <p className="font-bold text-brand">{forecast.best_model}</p>
-                        {MODEL_DOCS[forecast.best_model] && (
+                        {forecast.best_model && MODEL_DOCS[forecast.best_model] && (
                           <a
                             href={MODEL_DOCS[forecast.best_model]}
                             target="_blank"

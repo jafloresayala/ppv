@@ -2,6 +2,8 @@
 // Floating Price Calculator widget — wraps conexion_internalquery functionality
 import { useState, useCallback, useMemo, useRef } from 'react'
 import { Calculator, X, Pin, ChevronDown, ChevronUp, ExternalLink, Download } from 'lucide-react'
+import DbJobButton from './DbJobButton'
+import { lookupMpnBest, resolveMpnBest, type MpnBestEntry } from '../api/client'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -2006,6 +2008,10 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
   const [multiMpnAmplMap, setMultiMpnAmplMap]                         = useState<Record<string, AmplResponse>>({})
   const [multiMpnExpandedMpns, setMultiMpnExpandedMpns]               = useState<Set<string>>(new Set())
   const [mpnNexarMap, setMpnNexarMap]                                 = useState<Record<string, { nexarBestUsd: number | null; nexarSeller: string; nexarManufacturer: string; nexarStock: number | null; nexarMoq: number | null; nexarMpn: string }>>({})
+  // ── DB best-price cache (SQLite, populated by the daily job) ──────────────
+  const [mpnDbBestMap, setMpnDbBestMap]                               = useState<Record<string, MpnBestEntry>>({})
+  // Per-MPN resolution status for the DB-first flow: pending = computing in real time
+  const [mpnStatusMap, setMpnStatusMap]                               = useState<Record<string, 'pending' | 'done' | 'error'>>({})
   const [deepAnalysisRows, setDeepAnalysisRows]                       = useState<DeepAnalysisRow[]>([])
   const [deepAnalysisLoading, setDeepAnalysisLoading]                 = useState(false)
   const abortDeepRef = useRef<AbortController | null>(null)
@@ -2031,6 +2037,8 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
   const [amplDemandRawResults, setAmplDemandRawResults]       = useState<IQItem[]>([])
   const [amplDemandAmplMap, setAmplDemandAmplMap]             = useState<Record<string, AmplResponse>>({})
   const [amplDemandNexarMap, setAmplDemandNexarMap]           = useState<Record<string, { nexarBestUsd: number | null; nexarSeller: string; nexarManufacturer: string; nexarStock: number | null; nexarMoq: number | null; nexarMpn: string }>>({})
+  const [amplDemandDbBestMap, setAmplDemandDbBestMap]         = useState<Record<string, MpnBestEntry>>({})
+  const [amplDemandStatusMap, setAmplDemandStatusMap]         = useState<Record<string, 'pending' | 'done' | 'error'>>({})
   const [amplDemandDeepRows, setAmplDemandDeepRows]           = useState<DeepAnalysisRow[]>([])
   const [amplDemandLoading, setAmplDemandLoading]             = useState(false)
   const [amplDemandDeepLoading, setAmplDemandDeepLoading]     = useState(false)
@@ -2782,30 +2790,67 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
     setAmplDemandSearchedList(uniqueMpns)
     setAmplDemandAmplMap({})
     setAmplDemandNexarMap({})
+    setAmplDemandDbBestMap({})
+    setAmplDemandStatusMap(Object.fromEntries(uniqueMpns.map(m => [m, 'pending' as const])))
     setAmplDemandDeepRows([])
     setAmplDemandSubTab('results')
 
-    try {
-      const iqData = await apiPostWithRetry<{ count: number; data: IQItem[] }>(
-        '/api/pricecalc/internal-query', { mpns: uniqueMpns }, signal
-      )
-      const rows = Array.isArray(iqData.data) ? iqData.data : []
-      setAmplDemandRawResults(rows)
+    // Accumulators rebuilt into state after each step for progressive rendering.
+    const collectedRows: IQItem[] = []
+    const collectedAmpl: Record<string, AmplResponse> = {}
+    const applyEntry = (e: MpnBestEntry) => {
+      const rr = (e.rawRows ?? []) as unknown as IQItem[]
+      if (rr.length) collectedRows.push(...rr)
+      if (e.ampl && e.internalPN) collectedAmpl[e.internalPN] = e.ampl as unknown as AmplResponse
+    }
 
-      // Fetch AMPL data for each unique internalPN progressively
-      const internalPNs = [...new Set(rows.map((r: IQItem) => r.internalPN).filter(Boolean))]
-      if (internalPNs.length > 0 && !signal.aborted) {
-        await Promise.allSettled(internalPNs.map(async pn => {
-          try {
-            const amplData = await apiPostWithRetry<AmplResponse>('/api/pricecalc/ampl', { internal_part_number: pn }, signal)
-            if (!signal.aborted) setAmplDemandAmplMap(prev => ({ ...prev, [pn]: amplData }))
-          } catch { /* non-critical */ }
-        }))
+    try {
+      // 1 — Instant DB cache: render everything already cached, no realtime call.
+      const { found, missing } = await lookupMpnBest(uniqueMpns)
+      if (signal.aborted) { setAmplDemandLoading(false); return }
+
+      for (const e of Object.values(found).filter(Boolean) as MpnBestEntry[]) applyEntry(e)
+      setAmplDemandDbBestMap({ ...found })
+      setAmplDemandRawResults([...collectedRows])
+      setAmplDemandAmplMap({ ...collectedAmpl })
+      setAmplDemandStatusMap(prev => {
+        const next = { ...prev }
+        for (const k of Object.keys(found)) next[k] = 'done'
+        return next
+      })
+
+      // 2 — Only uncached MPNs hit SAP in real time, in small chunks; each result
+      //     is stored in the DB so the next search (any tab) is instant.
+      const CHUNK = 6
+      for (let i = 0; i < missing.length; i += CHUNK) {
+        if (signal.aborted) break
+        const chunk = missing.slice(i, i + CHUNK)
+        try {
+          const { results } = await resolveMpnBest(chunk, windowDays)
+          if (signal.aborted) break
+          const dbAdd: Record<string, MpnBestEntry> = {}
+          const statusAdd: Record<string, 'done' | 'error'> = {}
+          for (const m of chunk) {
+            const e = results[m]
+            if (e) { applyEntry(e); dbAdd[m] = e; statusAdd[m] = 'done' }
+            else { statusAdd[m] = 'error' }
+          }
+          setAmplDemandDbBestMap(prev => ({ ...prev, ...dbAdd }))
+          setAmplDemandRawResults([...collectedRows])
+          setAmplDemandAmplMap({ ...collectedAmpl })
+          setAmplDemandStatusMap(prev => ({ ...prev, ...statusAdd }))
+        } catch {
+          setAmplDemandStatusMap(prev => {
+            const next = { ...prev }
+            for (const m of chunk) next[m] = 'error'
+            return next
+          })
+        }
       }
 
-      // Nexar: all searched MPNs plus SAP-returned variants
+      // 3 — Nexar: all searched MPNs plus SAP-returned variants
       if (searchNexar && !signal.aborted) {
-        const nexarMpns = [...new Set([...uniqueMpns, ...rows.map((r: IQItem) => r.mpn).filter(Boolean)])]
+        const nexarMpns = [...new Set([...uniqueMpns, ...collectedRows.map((r: IQItem) => r.mpn).filter(Boolean)])]
         const nexarUpdates: typeof amplDemandNexarMap = {}
         await Promise.allSettled(nexarMpns.map(async (mpn: string) => {
           try {
@@ -2822,11 +2867,17 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
       }
     } catch (e) {
       const isCancelled = e instanceof DOMException && e.name === 'AbortError'
-      if (!isCancelled) setAmplDemandRawResults([])
+      if (!isCancelled) {
+        setAmplDemandStatusMap(prev => {
+          const next = { ...prev }
+          for (const k of Object.keys(next)) if (next[k] === 'pending') next[k] = 'error'
+          return next
+        })
+      }
     }
     setAmplDemandLoading(false)
     setStopAmplDemandHover(false)
-  }, [amplDemandRows, amplDemandMpnColIdx, searchNexar, qty])
+  }, [amplDemandRows, amplDemandMpnColIdx, searchNexar, qty, windowDays])
 
   // ── AMPL Demand: deep analysis ─────────────────────────────────────────────
   const handleAmplDemandDeep = useCallback(async () => {
@@ -2938,36 +2989,72 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
     setMultiMpnSearchedList(mpns)
     setMultiMpnAmplMap({})
     setMpnNexarMap({})
+    setMpnDbBestMap({})
+    setMpnStatusMap(Object.fromEntries(mpns.map(m => [m, 'pending' as const])))
     setMultiMpnSubTab('results')
     setMultiMpnExpandedMpns(new Set())
     setDeepAnalysisRows([])
     abortDeepRef.current?.abort()
-    try {
-      const iqData = await apiPostWithRetry<{ count: number; data: IQItem[] }>(
-        '/api/pricecalc/internal-query', { mpns }, signal
-      )
-      const rows = Array.isArray(iqData.data) ? iqData.data : []
-      setMultiMpnRawResults(rows)
 
-      // For each unique internalPN found in IQ results, fetch AMPL data progressively
-      const internalPNs = [...new Set(rows.map(r => r.internalPN).filter(Boolean))]
-      if (internalPNs.length > 0 && !signal.aborted) {
-        await Promise.allSettled(
-          internalPNs.map(async pn => {
-            try {
-              const amplData = await apiPostWithRetry<AmplResponse>('/api/pricecalc/ampl', { internal_part_number: pn }, signal)
-              if (!signal.aborted) {
-                setMultiMpnAmplMap(prev => ({ ...prev, [pn]: amplData }))
-              }
-            } catch { /* non-critical */ }
+    // Accumulators rebuilt into state after every step for progressive rendering.
+    const collectedRows: IQItem[] = []
+    const collectedAmpl: Record<string, AmplResponse> = {}
+    const applyEntry = (e: MpnBestEntry) => {
+      const rr = (e.rawRows ?? []) as unknown as IQItem[]
+      if (rr.length) collectedRows.push(...rr)
+      if (e.ampl && e.internalPN) collectedAmpl[e.internalPN] = e.ampl as unknown as AmplResponse
+    }
+
+    try {
+      // 1 — Instant DB cache: render everything already cached, no realtime call.
+      const { found, missing } = await lookupMpnBest(mpns)
+      if (signal.aborted) { setMultiMpnLoading(false); return }
+
+      const foundEntries = Object.values(found).filter(Boolean) as MpnBestEntry[]
+      for (const e of foundEntries) applyEntry(e)
+      setMpnDbBestMap({ ...found })
+      setMultiMpnRawResults([...collectedRows])
+      setMultiMpnAmplMap({ ...collectedAmpl })
+      setMpnStatusMap(prev => {
+        const next = { ...prev }
+        for (const k of Object.keys(found)) next[k] = 'done'
+        return next
+      })
+
+      // 2 — Only the uncached MPNs hit SAP in real time, in small chunks so they
+      //     flip from "computing" to a price progressively. Each result is also
+      //     stored in the DB so the next search is instant.
+      const CHUNK = 6
+      for (let i = 0; i < missing.length; i += CHUNK) {
+        if (signal.aborted) break
+        const chunk = missing.slice(i, i + CHUNK)
+        try {
+          const { results } = await resolveMpnBest(chunk, windowDays)
+          if (signal.aborted) break
+          const dbAdd: Record<string, MpnBestEntry> = {}
+          const statusAdd: Record<string, 'done' | 'error'> = {}
+          for (const m of chunk) {
+            const e = results[m]
+            if (e) { applyEntry(e); dbAdd[m] = e; statusAdd[m] = 'done' }
+            else { statusAdd[m] = 'error' }
+          }
+          setMpnDbBestMap(prev => ({ ...prev, ...dbAdd }))
+          setMultiMpnRawResults([...collectedRows])
+          setMultiMpnAmplMap({ ...collectedAmpl })
+          setMpnStatusMap(prev => ({ ...prev, ...statusAdd }))
+        } catch {
+          // Whole chunk failed (e.g. connection) → mark those MPNs as errored
+          setMpnStatusMap(prev => {
+            const next = { ...prev }
+            for (const m of chunk) next[m] = 'error'
+            return next
           })
-        )
+        }
       }
 
-      // ── Nexar market fetch (all searched MPNs, even those not found in SAP) ──
+      // 3 — Nexar market fetch (optional, separate) for all searched MPNs.
       if (searchNexar && mpns.length > 0 && !signal.aborted) {
-        // Include both the original searched list and any SAP-returned MPN variants
-        const uniqueMpns = [...new Set([...mpns, ...rows.map(r => r.mpn).filter(Boolean)])]
+        const uniqueMpns = [...new Set([...mpns, ...collectedRows.map(r => r.mpn).filter(Boolean)])]
         const nexarUpdates: Record<string, { nexarBestUsd: number | null; nexarSeller: string; nexarManufacturer: string; nexarStock: number | null; nexarMoq: number | null; nexarMpn: string }> = {}
         await Promise.allSettled(uniqueMpns.map(async mpn => {
           try {
@@ -2985,11 +3072,18 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
       }
     } catch (e) {
       const isCancelled = e instanceof DOMException && e.name === 'AbortError'
-      if (!isCancelled) setMultiMpnRawResults([])
+      if (!isCancelled) {
+        // Fall back to leaving whatever was collected; mark still-pending as errored
+        setMpnStatusMap(prev => {
+          const next = { ...prev }
+          for (const k of Object.keys(next)) if (next[k] === 'pending') next[k] = 'error'
+          return next
+        })
+      }
     }
     setMultiMpnLoading(false)
     setStopMpnHover(false)
-  }, [multiMpnInput, searchNexar, qty, mpnComponentQtys])
+  }, [multiMpnInput, searchNexar, qty, mpnComponentQtys, windowDays])
 
   const handleDeepAnalysis = useCallback(async (internalPNs: string[]) => {
     if (!internalPNs.length) return
@@ -3506,6 +3600,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                 <h2 className="font-bold text-gray-800 leading-tight">KE-SOL Quote Price tool</h2>
                 <p className="text-xs text-gray-400">SAP + Nexar Market + Lytica</p>
               </div>
+              <DbJobButton />
               {mode !== 'page' && (
                 <button onClick={() => setOpen(false)} className="text-gray-400 hover:text-gray-700 p-1.5 rounded-lg hover:bg-gray-100">
                   <X size={18} />
@@ -4980,6 +5075,84 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                         {/* ── IQ Results: one best-price row per MPN — shows as soon as IQ data arrives ── */}
                         {multiMpnSubTab === 'results' && (mpnEntries.length > 0 || (!multiMpnLoading && multiMpnSearchedList.length > 0)) && (
                           <div>
+                            {/* ⚡ Instant best price from the daily SQLite cache (SAP only) */}
+                            {(() => {
+                              const list = multiMpnSearchedList
+                              if (!list.length) return null
+                              const rows = list.map(m => {
+                                const key = m.toUpperCase()
+                                return { mpn: m, entry: mpnDbBestMap[key], status: mpnStatusMap[key] ?? 'done' }
+                              })
+                              const cachedCount   = rows.filter(r => r.entry && r.status === 'done').length
+                              const pendingCount  = rows.filter(r => r.status === 'pending').length
+                              const errorCount    = rows.filter(r => r.status === 'error').length
+                              return (
+                                <div className="mb-3 rounded-xl border border-indigo-200 bg-indigo-50/40 overflow-hidden">
+                                  <div className="flex items-center gap-2 px-3 py-2 border-b border-indigo-100">
+                                    <svg className="h-3.5 w-3.5 text-indigo-500" fill="currentColor" viewBox="0 0 20 20"><path d="M11 3a1 1 0 10-2 0v1.586l-2.293-2.293a1 1 0 10-1.414 1.414L7.586 7H6a1 1 0 000 2h5a1 1 0 001-1V3z"/><path d="M3 9a1 1 0 011-1h2.586L4.293 5.707a1 1 0 010-1.414L9 9v8a1 1 0 11-2 0v-4.586l-3.293 3.293a1 1 0 01-1.414-1.414L4.586 11H4a1 1 0 01-1-1V9z"/></svg>
+                                    <span className="text-xs font-bold text-indigo-700">Instant best price (DB cache · SAP only)</span>
+                                    <span className="text-[10px] text-indigo-400">{cachedCount} cached</span>
+                                    {pendingCount > 0 && <span className="text-[10px] text-amber-500">· {pendingCount} computing</span>}
+                                    {errorCount > 0 && <span className="text-[10px] text-red-400">· {errorCount} failed</span>}
+                                  </div>
+                                  <div className="overflow-x-auto">
+                                    <table className="min-w-max w-full text-xs">
+                                      <thead className="text-[10px] uppercase tracking-wide text-indigo-400">
+                                        <tr>
+                                          <th className="px-3 py-1.5 text-left">MPN</th>
+                                          <th className="px-3 py-1.5 text-left">Source</th>
+                                          <th className="px-3 py-1.5 text-right">Best Price (USD)</th>
+                                          <th className="px-3 py-1.5 text-left">Supplier</th>
+                                          <th className="px-3 py-1.5 text-left">Plant</th>
+                                          <th className="px-3 py-1.5 text-left">Last PO</th>
+                                        </tr>
+                                      </thead>
+                                      <tbody>
+                                        {rows.map(({ mpn, entry, status }) => {
+                                          if (status === 'pending') return (
+                                            <tr key={mpn} className="border-t border-indigo-100/70 bg-amber-50/40">
+                                              <td className="px-3 py-1.5 font-mono text-gray-700">{mpn}</td>
+                                              <td className="px-3 py-1.5" colSpan={5}>
+                                                <span className="inline-flex items-center gap-1.5 text-[11px] text-amber-600 font-medium">
+                                                  <svg className="animate-spin h-3 w-3" fill="none" viewBox="0 0 24 24">
+                                                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                                                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
+                                                  </svg>
+                                                  Not cached — querying SAP…
+                                                </span>
+                                              </td>
+                                            </tr>
+                                          )
+                                          if (!entry || entry.bestPriceUsd == null) return (
+                                            <tr key={mpn} className="border-t border-indigo-100/70">
+                                              <td className="px-3 py-1.5 font-mono text-gray-700">{mpn}</td>
+                                              <td className="px-3 py-1.5 text-[11px] text-gray-400" colSpan={5}>
+                                                {status === 'error' ? 'Connection error — not cached' : 'No SAP price found'}
+                                              </td>
+                                            </tr>
+                                          )
+                                          return (
+                                            <tr key={mpn} className="border-t border-indigo-100/70">
+                                              <td className="px-3 py-1.5 font-mono text-gray-700">{entry.mpn}</td>
+                                              <td className="px-3 py-1.5">
+                                                <span className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${entry.bestSource === 'Internal' ? 'bg-purple-100 text-purple-700' : 'bg-blue-100 text-blue-700'}`}>
+                                                  {entry.bestSource === 'Internal' ? 'Internal PN' : 'MPN'}
+                                                </span>
+                                                {entry.origin === 'realtime' && <span className="ml-1 text-[9px] text-gray-400">live</span>}
+                                              </td>
+                                              <td className="px-3 py-1.5 text-right font-mono font-bold text-indigo-700">{fmt6(entry.bestPriceUsd)}</td>
+                                              <td className="px-3 py-1.5 text-gray-600 max-w-[160px] truncate" title={entry.bestSupplier ?? ''}>{entry.bestSupplier || '—'}</td>
+                                              <td className="px-3 py-1.5 text-gray-500">{entry.bestPlant || '—'}</td>
+                                              <td className="px-3 py-1.5 text-gray-500">{entry.lastPoDate || '—'}</td>
+                                            </tr>
+                                          )
+                                        })}
+                                      </tbody>
+                                    </table>
+                                  </div>
+                                </div>
+                              )
+                            })()}
                             <p className="text-[10px] text-gray-400 mb-2">Cheapest Last PO (USD) within a {windowDays}-day window from the latest purchase date — one row per MPN</p>
                             <div className="overflow-x-auto rounded-xl border border-gray-200 shadow-sm">
                               <table className="min-w-max w-full text-xs border-collapse">
@@ -5703,6 +5876,84 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                   )}
 
                   {/* SAP Results sub-tab */}
+                  {amplDemandSubTab === 'results' && amplDemandSearchedList.length > 0 && (() => {
+                    const list = amplDemandSearchedList
+                    const rows = list.map(m => {
+                      const key = m.toUpperCase()
+                      return { mpn: m, entry: amplDemandDbBestMap[key], status: amplDemandStatusMap[key] ?? 'done' }
+                    })
+                    const cachedCount  = rows.filter(r => r.entry && r.status === 'done').length
+                    const pendingCount = rows.filter(r => r.status === 'pending').length
+                    const errorCount   = rows.filter(r => r.status === 'error').length
+                    if (!cachedCount && !pendingCount && !errorCount) return null
+                    return (
+                      <div className="mb-3 rounded-xl border border-indigo-200 bg-indigo-50/40 overflow-hidden">
+                        <div className="flex items-center gap-2 px-3 py-2 border-b border-indigo-100">
+                          <svg className="h-3.5 w-3.5 text-indigo-500" fill="currentColor" viewBox="0 0 20 20"><path d="M11 3a1 1 0 10-2 0v1.586l-2.293-2.293a1 1 0 10-1.414 1.414L7.586 7H6a1 1 0 000 2h5a1 1 0 001-1V3z"/><path d="M3 9a1 1 0 011-1h2.586L4.293 5.707a1 1 0 010-1.414L9 9v8a1 1 0 11-2 0v-4.586l-3.293 3.293a1 1 0 01-1.414-1.414L4.586 11H4a1 1 0 01-1-1V9z"/></svg>
+                          <span className="text-xs font-bold text-indigo-700">Instant best price (DB cache · SAP only)</span>
+                          <span className="text-[10px] text-indigo-400">{cachedCount} cached</span>
+                          {pendingCount > 0 && <span className="text-[10px] text-amber-500">· {pendingCount} computing</span>}
+                          {errorCount > 0 && <span className="text-[10px] text-red-400">· {errorCount} failed</span>}
+                        </div>
+                        <div className="overflow-x-auto">
+                          <table className="min-w-max w-full text-xs">
+                            <thead className="text-[10px] uppercase tracking-wide text-indigo-400">
+                              <tr>
+                                <th className="px-3 py-1.5 text-left">MPN</th>
+                                <th className="px-3 py-1.5 text-left">Source</th>
+                                <th className="px-3 py-1.5 text-right">Best Price (USD)</th>
+                                <th className="px-3 py-1.5 text-left">Supplier</th>
+                                <th className="px-3 py-1.5 text-left">Plant</th>
+                                <th className="px-3 py-1.5 text-left">Last PO</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {rows.map(({ mpn, entry, status }) => {
+                                if (status === 'pending') return (
+                                  <tr key={mpn} className="border-t border-indigo-100/70 bg-amber-50/40">
+                                    <td className="px-3 py-1.5 font-mono text-gray-700">{mpn}</td>
+                                    <td className="px-3 py-1.5" colSpan={5}>
+                                      <span className="inline-flex items-center gap-1.5 text-[11px] text-amber-600 font-medium">
+                                        <svg className="animate-spin h-3 w-3" fill="none" viewBox="0 0 24 24">
+                                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
+                                        </svg>
+                                        Not cached — querying SAP…
+                                      </span>
+                                    </td>
+                                  </tr>
+                                )
+                                if (!entry || entry.bestPriceUsd == null) return (
+                                  <tr key={mpn} className="border-t border-indigo-100/70">
+                                    <td className="px-3 py-1.5 font-mono text-gray-700">{mpn}</td>
+                                    <td className="px-3 py-1.5 text-[11px] text-gray-400" colSpan={5}>
+                                      {status === 'error' ? 'Connection error — not cached' : 'No SAP price found'}
+                                    </td>
+                                  </tr>
+                                )
+                                return (
+                                  <tr key={mpn} className="border-t border-indigo-100/70">
+                                    <td className="px-3 py-1.5 font-mono text-gray-700">{entry.mpn}</td>
+                                    <td className="px-3 py-1.5">
+                                      <span className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${entry.bestSource === 'Internal' ? 'bg-purple-100 text-purple-700' : 'bg-blue-100 text-blue-700'}`}>
+                                        {entry.bestSource === 'Internal' ? 'Internal PN' : 'MPN'}
+                                      </span>
+                                      {entry.origin === 'realtime' && <span className="ml-1 text-[9px] text-gray-400">live</span>}
+                                    </td>
+                                    <td className="px-3 py-1.5 text-right font-mono font-bold text-indigo-700">{fmt6(entry.bestPriceUsd)}</td>
+                                    <td className="px-3 py-1.5 text-gray-600 max-w-[160px] truncate" title={entry.bestSupplier ?? ''}>{entry.bestSupplier || '—'}</td>
+                                    <td className="px-3 py-1.5 text-gray-500">{entry.bestPlant || '—'}</td>
+                                    <td className="px-3 py-1.5 text-gray-500">{entry.lastPoDate || '—'}</td>
+                                  </tr>
+                                )
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    )
+                  })()}
+
                   {amplDemandSubTab === 'results' && (amplDemandRawResults.length > 0 || (amplDemandSearchedList.length > 0 && (Object.keys(amplDemandNexarMap).length > 0 || Object.keys(lyticaMap).length > 0))) && (() => {
                     const mpnGroupsMap = new Map<string, IQItem[]>()
                     for (const r of amplDemandRawResults) {

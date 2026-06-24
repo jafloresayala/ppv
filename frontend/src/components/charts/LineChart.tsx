@@ -143,10 +143,10 @@ export default function LineChart({ labels, series, height = 260, yLabel, refLin
             const lo = Math.min(...combined)
             const hi = Math.max(...combined)
             const pad = (hi - lo) * 0.1 || Math.abs(hi) * 0.1 || 1
-            return { x: { time: false }, y: { min: Math.max(0, lo - pad), max: hi + pad } }
+            return { x: { time: false }, y: { min: Math.max(0, lo - pad), max: hi + pad } } as uPlot.Scales
           }
         }
-        return { x: { time: false } }
+        return { x: { time: false } } as uPlot.Scales
       })(),
       axes: [
         { values: (_u, ticks) => ticks.map(t => labels[t] ?? ''), gap: 5, size: 55 },

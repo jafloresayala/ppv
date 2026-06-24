@@ -200,3 +200,126 @@ export async function getRawData(
   }, { timeout: 60_000 })
   return data
 }
+
+export interface NexarCacheStats {
+  initialized_at: string | null
+  expires_at:     string | null
+  cached_count:   number
+}
+
+export async function getNexarCacheStats(): Promise<NexarCacheStats> {
+  const { data } = await http.get<NexarCacheStats>('/pricecalc/nexar-cache-stats', { timeout: 5_000 })
+  return data
+}
+
+// ── MPN best-price DB cache + daily batch job ──────────────────────────────
+
+export interface MpnBestEntry {
+  mpn:          string
+  internalPN:   string | null
+  bestSource:   string | null   // 'MPN' | 'Internal' | 'None'
+  bestPriceUsd: number | null
+  stdPriceUsd:  number | null
+  bestSupplier: string | null
+  bestPlant:    string | null
+  bestMpn:      string | null
+  lastPoDate:   string | null
+  computedAt:   string | null
+  origin:       string | null   // 'job' | 'realtime'
+  // Full cached payload (present when hasPayload) — typed loosely; the widget
+  // casts rawRows→IQItem[] and ampl→AmplResponse.
+  rawRows?:     Record<string, unknown>[]
+  ampl?:        Record<string, unknown> | null
+  mcRows?:      Record<string, unknown>[]
+  hasPayload?:  boolean
+}
+
+export interface DbJobStatus {
+  running:       boolean
+  run_id:        number | null
+  trigger:       string | null
+  total:         number
+  processed:     number
+  success:       number
+  errors:        number
+  conn_errors:   number
+  started_at:    string | null
+  finished_at:   string | null
+  status:        string         // idle | running | done | failed | cancelled
+  source_file:   string | null
+  message:       string
+  last_run_at:   string | null
+  cached_count:  number
+  schedule_hour: number
+  overdue:       boolean
+  latest_run:    Record<string, unknown> | null
+}
+
+export async function getDbJobStatus(): Promise<DbJobStatus> {
+  const { data } = await http.get<DbJobStatus>('/dbjob/status', { timeout: 10_000 })
+  return data
+}
+
+export async function runDbJob(windowDays?: number, force = false): Promise<DbJobStatus & { started: boolean; reason?: string }> {
+  const { data } = await http.post('/dbjob/run', { window_days: windowDays ?? null, force }, { timeout: 15_000 })
+  return data
+}
+
+export async function retryDbJobErrors(): Promise<{ started: boolean; reason?: string }> {
+  const { data } = await http.post('/dbjob/retry-errors', {}, { timeout: 15_000 })
+  return data
+}
+
+export async function cancelDbJob(): Promise<{ cancelled: boolean }> {
+  const { data } = await http.post('/dbjob/cancel', {}, { timeout: 10_000 })
+  return data
+}
+
+export function dbJobExportUrl(): string {
+  return '/api/dbjob/export'
+}
+
+export interface MpnLookupResponse {
+  found:   Record<string, MpnBestEntry>
+  missing: string[]
+}
+
+export async function lookupMpnBest(mpns: string[]): Promise<MpnLookupResponse> {
+  const { data } = await http.post<MpnLookupResponse>('/mpn-best/lookup', { mpns }, { timeout: 20_000 })
+  return data
+}
+
+export interface MpnResolveResponse {
+  results:  Record<string, MpnBestEntry | null>
+  from_db:  string[]
+  computed: string[]
+}
+
+export async function resolveMpnBest(mpns: string[], windowDays?: number): Promise<MpnResolveResponse> {
+  const { data } = await http.post<MpnResolveResponse>(
+    '/mpn-best/resolve', { mpns, window_days: windowDays ?? 45 }, { timeout: 600_000 },
+  )
+  return data
+}
+
+// ── Admin dashboard ─────────────────────────────────────────────────────────
+
+export async function adminLogin(username: string, password: string): Promise<{ token: string; expires_in: number }> {
+  const { data } = await http.post('/admin/login', { username, password }, { timeout: 10_000 })
+  return data
+}
+
+export interface AdminDashboard {
+  metrics:       { total: number; by_type: Record<string, number> }
+  runs:          Array<Record<string, unknown>>
+  recent_errors: Array<Record<string, unknown>>
+  cached_count:  number
+}
+
+export async function getAdminDashboard(token: string): Promise<AdminDashboard> {
+  const { data } = await http.get<AdminDashboard>('/admin/dashboard', {
+    timeout: 15_000,
+    headers: { Authorization: `Bearer ${token}` },
+  })
+  return data
+}

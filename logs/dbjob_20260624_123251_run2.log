@@ -1,0 +1,14 @@
+======================================================================
+PPV DB Pre-Compute Job — run #2
+Finished:    2026-06-24T12:32:51.570889
+Source file: (none)
+Trigger:     retry
+======================================================================
+Total MPNs:        23
+Succeeded:         23
+Errors (total):    0
+  · connection:    0
+  · other:         0
+Status:            done
+======================================================================
+No errors — all MPNs processed successfully. ✅

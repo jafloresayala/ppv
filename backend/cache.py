@@ -63,6 +63,7 @@ TTL_ANALYTIC = int(os.getenv("CACHE_TTL_ANALYTICS",  str(1 * 3600)))  # 1 h
 TTL_FORECAST = int(os.getenv("CACHE_TTL_FORECAST",   str(2 * 3600)))  # 2 h
 TTL_MASTER   = int(os.getenv("CACHE_TTL_MASTER",     str(8 * 3600)))  # 8 h — plant master dataset
 TTL_DRILL    = int(os.getenv("CACHE_TTL_DRILL",       str(2 * 3600)))  # 2 h — floating-window drill-downs (matches session lifetime)
+TTL_NEXAR    = int(os.getenv("CACHE_TTL_NEXAR",      str(24 * 3600))) # 24 h — Nexar market-prices cache
 
 # ── In-memory fallback (same TTL is ignored — data lives for process lifetime) 
 _fallback: dict[str, bytes] = {}
@@ -131,7 +132,37 @@ def set_json(key: str, value: Any, ttl: int) -> None:
         logger.debug("set_json error for key %s: %s", key, exc)
 
 
-# ── Pickle helpers (DataFrames / raw records) ─────────────────────────────────
+def set_if_not_exists(key: str, value: Any, ttl: int) -> bool:
+    """Store value only if key does not exist. Returns True if the key was set."""
+    encoded = json.dumps(value, default=str).encode()
+    if _redis_ok and _client:
+        try:
+            result = _client.set(key, encoded, ex=ttl, nx=True)  # type: ignore[call-overload]
+            return result is not None
+        except Exception as exc:
+            logger.debug("Redis SET NX error: %s", exc)
+    # In-memory fallback: only set if not already present
+    if key not in _fallback:
+        _fallback[key] = encoded
+        return True
+    return False
+
+
+def count_keys_with_prefix(prefix: str) -> int:
+    """Count the number of cached keys that start with `prefix`."""
+    if _redis_ok and _client:
+        try:
+            count = 0
+            cursor = 0
+            while True:
+                cursor, keys = _client.scan(cursor, match=f"{prefix}*", count=100)  # type: ignore[misc]
+                count += len(keys)
+                if cursor == 0:
+                    break
+            return count
+        except Exception as exc:
+            logger.debug("Redis SCAN error: %s", exc)
+    return sum(1 for k in _fallback if k.startswith(prefix))
 
 def get_pickle(key: str) -> Any | None:
     raw = _get_raw(key)

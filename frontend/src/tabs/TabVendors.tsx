@@ -111,7 +111,7 @@ export default function TabVendors() {
 
   // Auto-fetch all materials when vendor or global quantity changes
   useEffect(() => {
-    const drill = selected ? vd?.drilldown?.[selected] : null
+    const drill: any = selected ? vd?.drilldown?.[selected] : null
     if (!drill?.by_material?.length) return
     drill.by_material
       .filter((r: any) => r.total > 0)

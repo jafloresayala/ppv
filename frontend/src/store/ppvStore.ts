@@ -57,6 +57,7 @@ interface PPVState {
   setDateRange:  (range: { start: string; end: string } | null) => void
   setTab:        (tab: number) => void
   clearError:    () => void
+  clearPartialWarning: () => void
   sendMessage:    (content: string) => Promise<void>
   clearChat:      () => void
 }

@@ -5,6 +5,7 @@ Serves as the proxy between the React frontend and SAP API.
 import asyncio
 import calendar
 import json as _json
+import logging
 import time
 import uuid
 import requests
@@ -12,7 +13,7 @@ from datetime import datetime, timedelta
 from requests_ntlm import HttpNtlmAuth
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import StreamingResponse
@@ -21,9 +22,12 @@ from pydantic import BaseModel
 import pandas as pd
 
 from config import SAP_API_URL, COL_PPV, COL_PRICE, COL_FX, ALLOWED_ORIGINS, AZ_INF_ENDPOINT, AZ_INF_API_KEY, AZ_INF_API_VER, AZ_INF_MODEL, PRICECALC_API_URL
+from config import ADMIN_USERNAME, ADMIN_PASSWORD, DBJOB_SCHEDULE_HOUR, DBJOB_WINDOW_DAYS
 from data_service import parse_df, extract_records, get_filter_options, apply_filters, enrich_with_currency
 from analytics import compute_all_analytics, compute_forecast, search_material, compute_mg_plant_components
 import cache
+import mpn_store
+import batch_job
 from sourcing import router as sourcing_router
 
 app = FastAPI(title="PPV API", version="2.0.0")
@@ -37,6 +41,17 @@ app.add_middleware(
 )
 
 app.include_router(sourcing_router)
+
+
+@app.on_event("startup")
+def _init_mpn_store() -> None:
+    """Initialise the SQLite best-price cache and drop stale (non-today) entries."""
+    try:
+        mpn_store.init_db()
+        mpn_store.purge_stale()
+    except Exception as exc:  # never block startup
+        import logging
+        logging.getLogger(__name__).warning("MPN store init failed: %s", exc)
 
 # ── Session store (in-memory fallback; Redis is primary when available) ────────
 _sessions: dict[str, pd.DataFrame] = {}
@@ -1163,10 +1178,246 @@ def pricecalc_internal_query(req: PriceCalcIQRequest):
 
 @app.post("/api/pricecalc/market-prices")
 def pricecalc_market_prices(req: PriceCalcMarketRequest):
+    # ── Nexar 24-hour cache (per MPN, quantity-agnostic) ──────────────────────
+    # Frontend always sends a single MPN per call, so we cache per that MPN.
+    # Quantity is intentionally excluded from the cache key: offer prices are
+    # per-unit and don't change with quantity; this maximises cache reuse.
+    if len(req.mpns) == 1:
+        mpn_upper = req.mpns[0].strip().upper()
+        mkt_key   = cache.make_key("nexar", "mkt", mpn_upper)
+        cached    = cache.get_json(mkt_key)
+        if cached is not None:
+            return cached
+        result = _pricecalc_post("/market-prices", {"mpns": req.mpns, "quantity": req.quantity})
+        cache.set_json(mkt_key, result, cache.TTL_NEXAR)
+        # Record the moment the first entry was written (SET NX — won't overwrite)
+        init_key = cache.make_key("nexar", "init")
+        cache.set_if_not_exists(init_key, {"ts": datetime.utcnow().isoformat()}, cache.TTL_NEXAR)
+        return result
+    # Multi-MPN fallback (not called by the frontend currently) — no caching
     return _pricecalc_post("/market-prices", {"mpns": req.mpns, "quantity": req.quantity})
 
 
-# ── SAP batch pricing for MG drilldown modal ──────────────────────────────────
+@app.get("/api/pricecalc/nexar-cache-stats")
+def nexar_cache_stats():
+    """Return when the 24-h Nexar cache session started and how many MPNs are cached."""
+    init_data = cache.get_json(cache.make_key("nexar", "init"))
+    cached_count = cache.count_keys_with_prefix(cache.make_key("nexar", "mkt", ""))
+    if init_data and init_data.get("ts"):
+        ts = init_data["ts"]
+        try:
+            dt = datetime.fromisoformat(ts)
+            expires_at = (dt + timedelta(hours=24)).isoformat()
+        except Exception:
+            expires_at = ""
+        return {"initialized_at": ts, "expires_at": expires_at, "cached_count": cached_count}
+    return {"initialized_at": None, "expires_at": None, "cached_count": cached_count}
+
+
+# ── MPN best-price DB cache + daily batch job ─────────────────────────────────
+
+class MpnLookupRequest(BaseModel):
+    mpns: list[str]
+
+class MpnResolveRequest(BaseModel):
+    mpns:        list[str]
+    window_days: int = DBJOB_WINDOW_DAYS
+
+class DbJobRunRequest(BaseModel):
+    window_days: int | None = None
+    force: bool = False   # when True, re-process every MPN (ignore today's cache)
+
+class AdminLoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+def _entry_public(e: dict | None) -> dict | None:
+    """Shape a mpn_best row for the frontend."""
+    if not e:
+        return None
+    payload = {}
+    raw = e.get("payload_json")
+    if raw:
+        try:
+            payload = _json.loads(raw) or {}
+        except (ValueError, TypeError):
+            payload = {}
+    return {
+        "mpn":           e.get("mpn"),
+        "internalPN":    e.get("internal_pn"),
+        "bestSource":    e.get("best_source"),
+        "bestPriceUsd":  e.get("best_price_usd"),
+        "stdPriceUsd":   e.get("std_price_usd"),
+        "bestSupplier":  e.get("best_supplier"),
+        "bestPlant":     e.get("best_plant"),
+        "bestMpn":       e.get("best_mpn"),
+        "lastPoDate":    e.get("last_po_date"),
+        "computedAt":    e.get("computed_at"),
+        "origin":        e.get("origin"),
+        # Full payload for All Records / Blocked-Deleted / Multi-Component tabs
+        "rawRows":       payload.get("raw_rows") or [],
+        "ampl":          payload.get("ampl"),
+        "mcRows":        payload.get("mc_rows") or [],
+        "hasPayload":    bool(raw),
+    }
+
+
+@app.post("/api/mpn-best/lookup")
+def mpn_best_lookup(req: MpnLookupRequest):
+    """DB-only lookup. Returns cached best entries (valid today) and the misses."""
+    found = mpn_store.get_best_many(req.mpns)
+    keys = [(m or "").strip().upper() for m in req.mpns if m]
+    missing = [k for k in dict.fromkeys(keys) if k not in found]
+    return {
+        "found":   {k: _entry_public(v) for k, v in found.items()},
+        "missing": missing,
+    }
+
+
+@app.post("/api/mpn-best/resolve")
+def mpn_best_resolve(req: MpnResolveRequest):
+    """
+    DB-first resolver: returns cached entries instantly and computes any misses
+    in real time (SAP only), storing them so the next lookup is instant.
+    """
+    found = mpn_store.get_best_many(req.mpns)
+    keys = list(dict.fromkeys((m or "").strip().upper() for m in req.mpns if m))
+    result: dict[str, dict | None] = {k: _entry_public(found[k]) for k in keys if k in found}
+
+    misses = [k for k in keys if k not in found]
+    for mpn in misses:
+        try:
+            entry = batch_job.process_mpn(mpn, req.window_days)
+            entry["origin"] = "realtime"
+            mpn_store.upsert_best(entry)
+            result[mpn] = _entry_public({**entry, "internal_pn": entry.get("internal_pn")})
+        except Exception as exc:  # surface as null; caller can fall back
+            result[mpn] = None
+            logging.getLogger(__name__).info("resolve miss for %s: %s", mpn, exc)
+
+    return {"results": result, "from_db": [k for k in keys if k in found], "computed": misses}
+
+
+@app.post("/api/dbjob/run")
+def dbjob_run(req: DbJobRunRequest):
+    wd = req.window_days or DBJOB_WINDOW_DAYS
+    return batch_job.start_job(trigger="manual", window_days=wd, skip_cached=not req.force)
+
+
+@app.post("/api/dbjob/retry-errors")
+def dbjob_retry_errors():
+    """Re-run only the MPNs that failed with connection errors in the latest run."""
+    last = mpn_store.latest_run()
+    if not last:
+        raise HTTPException(status_code=404, detail="No previous run to retry.")
+    mpns = mpn_store.connection_error_mpns(last["id"])
+    if not mpns:
+        return {"started": False, "reason": "No connection errors to retry."}
+    return batch_job.start_job(trigger="retry", mpns=mpns)
+
+
+@app.post("/api/dbjob/cancel")
+def dbjob_cancel():
+    batch_job.request_cancel()
+    return {"cancelled": True}
+
+
+@app.get("/api/dbjob/status")
+def dbjob_status():
+    state = batch_job.get_state()
+    last_run_at = mpn_store.get_meta("last_run_at")
+    latest = mpn_store.latest_run()
+    cached_count = mpn_store.count_valid_today()
+
+    # Overdue = past the scheduled hour today and no successful run since then
+    now = datetime.now()
+    today_sched = now.replace(hour=DBJOB_SCHEDULE_HOUR, minute=0, second=0, microsecond=0)
+    overdue = False
+    if not state["running"] and now >= today_sched:
+        if not last_run_at:
+            overdue = True
+        else:
+            try:
+                overdue = datetime.fromisoformat(last_run_at) < today_sched
+            except ValueError:
+                overdue = True
+
+    return {
+        **state,
+        "last_run_at":  last_run_at,
+        "cached_count": cached_count,
+        "schedule_hour": DBJOB_SCHEDULE_HOUR,
+        "overdue":      overdue,
+        "latest_run":   latest,
+    }
+
+
+@app.get("/api/dbjob/export")
+def dbjob_export():
+    """Export the current (valid-today) best-price table as an Excel file."""
+    import io
+    rows = mpn_store.all_valid_today()
+    df = pd.DataFrame([{
+        "MPN":            r.get("mpn"),
+        "Internal PN":    r.get("internal_pn"),
+        "Best Source":    r.get("best_source"),
+        "Best Price USD": r.get("best_price_usd"),
+        "Std Price USD":  r.get("std_price_usd"),
+        "Best Supplier":  r.get("best_supplier"),
+        "Best Plant":     r.get("best_plant"),
+        "Best MPN":       r.get("best_mpn"),
+        "Last PO Date":   r.get("last_po_date"),
+        "Computed At":    r.get("computed_at"),
+        "Origin":         r.get("origin"),
+    } for r in rows])
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xl:
+        df.to_excel(xl, index=False, sheet_name="MPN Best Prices")
+    buf.seek(0)
+    fname = f"mpn_best_prices_{datetime.now():%Y%m%d}.xlsx"
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
+# ── Admin dashboard (error metrics) ───────────────────────────────────────────
+
+_ADMIN_TOKENS: dict[str, datetime] = {}  # token → expiry
+_ADMIN_TOKEN_TTL = timedelta(hours=8)
+
+
+def _require_admin(authorization: str | None) -> None:
+    token = (authorization or "").removeprefix("Bearer ").strip()
+    exp = _ADMIN_TOKENS.get(token)
+    if not exp or exp < datetime.now():
+        _ADMIN_TOKENS.pop(token, None)
+        raise HTTPException(status_code=401, detail="Admin authentication required.")
+
+
+@app.post("/api/admin/login")
+def admin_login(req: AdminLoginRequest):
+    if req.username != ADMIN_USERNAME or req.password != ADMIN_PASSWORD:
+        raise HTTPException(status_code=401, detail="Invalid credentials.")
+    token = uuid.uuid4().hex
+    _ADMIN_TOKENS[token] = datetime.now() + _ADMIN_TOKEN_TTL
+    return {"token": token, "expires_in": int(_ADMIN_TOKEN_TTL.total_seconds())}
+
+
+@app.get("/api/admin/dashboard")
+def admin_dashboard(authorization: str = Header(default="")):
+    _require_admin(authorization)
+    return {
+        "metrics":     mpn_store.error_metrics(),
+        "runs":        mpn_store.list_runs(30),
+        "recent_errors": mpn_store.list_errors(limit=300),
+        "cached_count": mpn_store.count_valid_today(),
+    }
+
+
+# ── SAP batch pricing for MG drilldown modal ─────────────────────────────────
 
 _PPV_TO_SAP: dict = {
     "0010": "KEJ", "0020": "KEMX", "0040": "KEPS",
