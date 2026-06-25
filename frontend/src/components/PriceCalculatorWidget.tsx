@@ -3,6 +3,8 @@
 import { useState, useCallback, useMemo, useRef } from 'react'
 import { Calculator, X, Pin, ChevronDown, ChevronUp, ExternalLink, Download } from 'lucide-react'
 import DbJobButton from './DbJobButton'
+import DataGrid, { type DataGridColumn } from './DataGrid'
+import SupplierComparePanel, { type CompareRecord } from './SupplierComparePanel'
 import { lookupMpnBest, resolveMpnBest, type MpnBestEntry } from '../api/client'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -2007,6 +2009,10 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
   const [multiMpnSubTab, setMultiMpnSubTab]                           = useState<'results' | 'allrecords' | 'blocked' | 'deep'>('results')
   const [multiMpnAmplMap, setMultiMpnAmplMap]                         = useState<Record<string, AmplResponse>>({})
   const [multiMpnExpandedMpns, setMultiMpnExpandedMpns]               = useState<Set<string>>(new Set())
+  // ── Supplier-comparison panel (per-MPN, per-plant savings analysis) ───────
+  // Opened by clicking a row in the IQ Results grid. Holds the clicked MPN +
+  // its full set of raw records so we can compare suppliers within a plant.
+  const [mpnCompare, setMpnCompare]                                   = useState<{ mpn: string; allRows: IQItem[] } | null>(null)
   const [mpnNexarMap, setMpnNexarMap]                                 = useState<Record<string, { nexarBestUsd: number | null; nexarSeller: string; nexarManufacturer: string; nexarStock: number | null; nexarMoq: number | null; nexarMpn: string }>>({})
   // ── DB best-price cache (SQLite, populated by the daily job) ──────────────
   const [mpnDbBestMap, setMpnDbBestMap]                               = useState<Record<string, MpnBestEntry>>({})
@@ -4960,7 +4966,194 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                       const blockedSet    = new Set(allBlockedItems.map(i => i.mpn))
                       const hasNexarCols  = Object.keys(mpnNexarMap).length > 0
                       const hasLyticaCols = Object.keys(lyticaMap).length > 0
-                      return (
+
+                      // ── Unified DataGrid for ALL result sizes ──
+                      // Paginated grid with always-on per-column filters, global
+                      // search, sorting and Excel export. Rendering only one page of
+                      // rows keeps the UI snappy even for thousands of MPNs, while
+                      // small result sets still get the same filters/columns.
+                      {
+                        type Entry = { mpn: string; bestRow: IQItem; allRows: IQItem[] }
+                        const gridCols: DataGridColumn<Entry>[] = [
+                          {
+                            key: 'mpn', header: 'MPN', type: 'text',
+                            accessor: e => e.bestRow.mpn,
+                            render: e => <span className="font-mono font-semibold text-emerald-700">{e.bestRow.mpn}</span>,
+                          },
+                          {
+                            key: 'altPn', header: 'Alt PN', type: 'text', noSort: true,
+                            accessor: e => multiMpnAmplMap[e.bestRow.internalPN]?.active.find(a => a.MfgPartNumber === e.bestRow.mpn)?.MpnPartNumber ?? '',
+                            render: e => {
+                              const resolvedAltPn = multiMpnAmplMap[e.bestRow.internalPN]?.active.find(a => a.MfgPartNumber === e.bestRow.mpn)?.MpnPartNumber
+                              return <span className="font-mono text-gray-500">{resolvedAltPn && resolvedAltPn !== e.bestRow.mpn ? resolvedAltPn : '—'}</span>
+                            },
+                          },
+                          {
+                            key: 'supplier', header: 'Supplier', type: 'text',
+                            accessor: e => e.bestRow.supplierName || e.bestRow.englishName || '',
+                            render: e => <span className="text-gray-600 inline-block max-w-[180px] truncate align-bottom" title={e.bestRow.supplierName || e.bestRow.englishName || ''}>{e.bestRow.supplierName || e.bestRow.englishName || '—'}</span>,
+                          },
+                          {
+                            key: 'searched', header: 'Searched', type: 'text',
+                            accessor: e => e.mpn,
+                            render: e => <span className="font-mono font-semibold text-blue-700">{e.mpn}</span>,
+                          },
+                          {
+                            key: 'internalPN', header: 'Internal PN', type: 'text',
+                            accessor: e => e.bestRow.internalPN || '',
+                            render: e => <span className="font-mono text-gray-700">{e.bestRow.internalPN || '—'}</span>,
+                          },
+                          {
+                            key: 'plant', header: 'Plant', type: 'select', align: 'center',
+                            accessor: e => e.bestRow.siteName || '',
+                          },
+                          {
+                            key: 'qty', header: 'PO/QTY', type: 'number', align: 'right',
+                            accessor: e => e.bestRow.quantity ?? null,
+                            render: e => <span className="font-mono text-gray-700">{e.bestRow.quantity?.toLocaleString() ?? '—'}</span>,
+                          },
+                          {
+                            key: 'cur', header: 'Cur', type: 'select', align: 'center',
+                            accessor: e => e.bestRow.localCurrency || '',
+                            render: e => <span className="font-mono text-gray-500">{e.bestRow.localCurrency || '—'}</span>,
+                          },
+                          {
+                            key: 'lpoLocal', header: 'Last PO (Local)', type: 'number', align: 'right',
+                            accessor: e => resolvePoLocal(e.bestRow),
+                            render: e => <span className="font-mono text-gray-700">{resolvePoLocal(e.bestRow) != null ? resolvePoLocal(e.bestRow)!.toLocaleString('en-US', { minimumFractionDigits: 4 }) : '—'}</span>,
+                          },
+                          {
+                            key: 'stdLocal', header: 'Std (Local)', type: 'number', align: 'right',
+                            accessor: e => resolveStdLocal(e.bestRow),
+                            render: e => <span className="font-mono text-gray-500">{resolveStdLocal(e.bestRow) != null ? resolveStdLocal(e.bestRow)!.toLocaleString('en-US', { minimumFractionDigits: 4 }) : '—'}</span>,
+                          },
+                          {
+                            key: 'lpoUsd', header: 'Last PO (USD)', type: 'number', align: 'right',
+                            accessor: e => resolveLastPoPrice(e.bestRow),
+                            render: e => {
+                              const lpoUsd = resolveLastPoPrice(e.bestRow)
+                              const isLpoGtStd = lpoUsd != null && e.bestRow.standardPriceUsd != null && lpoUsd > e.bestRow.standardPriceUsd
+                              return <span className={`font-mono font-semibold ${isLpoGtStd ? 'text-red-700' : 'text-blue-700'}`}>{fmt6(lpoUsd)}</span>
+                            },
+                          },
+                          {
+                            key: 'stdUsd', header: 'Std (USD)', type: 'number', align: 'right',
+                            accessor: e => e.bestRow.standardPriceUsd ?? null,
+                            render: e => <span className="font-mono text-gray-500">{fmt6(e.bestRow.standardPriceUsd)}</span>,
+                          },
+                          {
+                            key: 'date', header: 'Date', type: 'date',
+                            accessor: e => e.bestRow.lastPoDate || '',
+                            render: e => <span className="text-gray-500">{e.bestRow.lastPoDate || '—'}</span>,
+                          },
+                          {
+                            key: 'lpoGtStd', header: 'Last PO Price > Std Price', type: 'select', align: 'center',
+                            accessor: e => {
+                              const lpoUsd = resolveLastPoPrice(e.bestRow)
+                              return (lpoUsd != null && e.bestRow.standardPriceUsd != null && lpoUsd > e.bestRow.standardPriceUsd) ? '1' : ''
+                            },
+                            render: e => {
+                              const lpoUsd = resolveLastPoPrice(e.bestRow)
+                              const isLpoGtStd = lpoUsd != null && e.bestRow.standardPriceUsd != null && lpoUsd > e.bestRow.standardPriceUsd
+                              return isLpoGtStd ? <span className="text-[10px] font-bold text-red-700 bg-red-100 px-1.5 py-0.5 rounded">1</span> : null
+                            },
+                          },
+                          {
+                            key: 'swap', header: 'Swap', type: 'select', align: 'center',
+                            accessor: e => (!!(myPlant && e.bestRow.siteName && e.bestRow.siteName !== myPlant)) ? '1' : '',
+                            render: e => {
+                              const isSwap = !!(myPlant && e.bestRow.siteName && e.bestRow.siteName !== myPlant)
+                              return isSwap ? <span className="text-[10px] font-bold text-green-700 bg-green-100 px-1.5 py-0.5 rounded">1</span> : null
+                            },
+                          },
+                          {
+                            key: 'manualRev', header: 'Manual Rev.', type: 'select', align: 'center',
+                            accessor: e => (resolveLastPoPrice(e.bestRow) === 0) ? '1' : '',
+                            render: e => {
+                              const isManual = resolveLastPoPrice(e.bestRow) === 0
+                              return isManual ? <span className="text-[10px] font-bold text-amber-700 bg-amber-100 px-1.5 py-0.5 rounded">1</span> : null
+                            },
+                          },
+                        ]
+                        if (hasNexarCols) {
+                          gridCols.push(
+                            {
+                              key: 'bestInMarket', header: 'Best in Market', type: 'select', align: 'center', className: 'text-purple-600',
+                              accessor: e => {
+                                const lpoUsd = resolveLastPoPrice(e.bestRow)
+                                const nexarBestUsd = mpnNexarMap[e.mpn]?.nexarBestUsd ?? null
+                                return (nexarBestUsd != null && lpoUsd != null && lpoUsd > 0 && nexarBestUsd < lpoUsd) ? '1' : ''
+                              },
+                              render: e => {
+                                const lpoUsd = resolveLastPoPrice(e.bestRow)
+                                const nexarBestUsd = mpnNexarMap[e.mpn]?.nexarBestUsd ?? null
+                                const bestInMarket = nexarBestUsd != null && lpoUsd != null && lpoUsd > 0 && nexarBestUsd < lpoUsd
+                                return bestInMarket ? <span className="text-[10px] font-bold text-purple-700 bg-purple-100 px-1.5 py-0.5 rounded">1</span> : null
+                              },
+                            },
+                            {
+                              key: 'nexarBest', header: 'Nexar Best (USD)', type: 'number', align: 'right', className: 'text-purple-600',
+                              accessor: e => mpnNexarMap[e.mpn]?.nexarBestUsd ?? null,
+                              render: e => <span className="font-mono text-purple-700">{fmt6(mpnNexarMap[e.mpn]?.nexarBestUsd ?? null)}</span>,
+                            },
+                            {
+                              key: 'nexarSeller', header: 'Nexar Seller', type: 'text', className: 'text-purple-600',
+                              accessor: e => mpnNexarMap[e.mpn]?.nexarSeller ?? '',
+                              render: e => <span className="font-mono text-purple-600 inline-block max-w-[160px] truncate align-bottom" title={mpnNexarMap[e.mpn]?.nexarSeller}>{mpnNexarMap[e.mpn]?.nexarSeller || '—'}</span>,
+                            },
+                          )
+                        }
+                        if (hasLyticaCols) {
+                          gridCols.push({
+                            key: 'lytica90', header: 'Lytica 90th (USD)', type: 'number', align: 'right',
+                            accessor: e => (lyticaMap[e.mpn.toUpperCase()] ?? lyticaMap[e.mpn])?.price90th ?? null,
+                            render: e => {
+                              const lytE = lyticaMap[e.mpn.toUpperCase()] ?? lyticaMap[e.mpn] ?? null
+                              return <span className="font-mono text-teal-700">{lytE?.price90th != null ? fmt6(lytE.price90th) : '—'}</span>
+                            },
+                          })
+                        }
+                        const missingCount = searchedSubset.filter(m => !foundSet.has(m)).length
+                        return (
+                          <div>
+                            <p className="text-[10px] text-gray-400 mb-1.5">
+                              <span className="inline-flex items-center gap-1 text-blue-500">
+                                <svg className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2"><path strokeLinecap="round" strokeLinejoin="round" d="M15 15l-2 5L9 9l11 4-5 2zm0 0l5 5M7.188 2.239l.777 2.897M5.136 7.965l-2.898-.777M13.95 4.05l-2.122 2.122m-5.657 5.656l-2.12 2.122" /></svg>
+                                Click a row
+                              </span> to compare suppliers per plant and see potential savings.
+                            </p>
+                            <DataGrid<Entry>
+                              rows={tableEntries}
+                              columns={gridCols}
+                              rowKey={(e) => e.mpn}
+                              pageSize={50}
+                              dense
+                              exportFileName={`PPV_MPN_Results_${new Date().toISOString().slice(0, 10)}`}
+                              exportSheetName="IQ Results"
+                              onRowClick={(e) => setMpnCompare({ mpn: e.mpn, allRows: e.allRows })}
+                              rowClassName={(e, i) => {
+                                const lpoUsd = resolveLastPoPrice(e.bestRow)
+                                const isLpoGtStd = lpoUsd != null && e.bestRow.standardPriceUsd != null && lpoUsd > e.bestRow.standardPriceUsd
+                                const isSwap = !!(myPlant && e.bestRow.siteName && e.bestRow.siteName !== myPlant)
+                                return isLpoGtStd ? 'bg-red-50 hover:bg-red-100/70' : isSwap ? 'bg-green-50 hover:bg-green-100/70' : i % 2 === 0 ? 'hover:bg-gray-50' : 'bg-gray-50/50 hover:bg-gray-100/50'
+                              }}
+                            />
+                            {(pendingMpns.length > 0 || missingCount > 0) && (
+                              <p className="text-[10px] text-gray-400 mt-1.5">
+                                {pendingMpns.length > 0 && <span>{pendingMpns.length} still querying SAP… </span>}
+                                {missingCount > 0 && <span>{missingCount} searched MPN{missingCount !== 1 ? 's' : ''} returned no priced match (not shown in grid).</span>}
+                              </p>
+                            )}
+                          </div>
+                        )
+                      }
+
+                      /* eslint-disable no-unreachable */
+                      // NOTE: legacy plain-table fallback — superseded by the DataGrid
+                      // above (which now handles all result sizes). Kept temporarily
+                      // for reference; never reached at runtime.
+                      // eslint-disable-next-line no-constant-condition
+                      if (false) return (
                         <div className="overflow-x-auto rounded-xl border border-gray-200 shadow-sm">
                           <table className="min-w-max w-full text-xs border-collapse">
                             <thead className="bg-gray-50 text-[10px] uppercase tracking-wide text-gray-500 sticky top-0">
@@ -6225,6 +6418,25 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
             </div>
           </div>
         </div>
+      )}
+
+      {/* ── Supplier savings comparison panel (per-MPN, per-plant) ── */}
+      {mpnCompare && (
+        <SupplierComparePanel
+          mpn={mpnCompare.mpn}
+          records={mpnCompare.allRows.map<CompareRecord>(r => ({
+            plant: r.siteName || '',
+            supplier: r.supplierName || r.englishName || '',
+            lastPoUsd: resolveLastPoPrice(r),
+            stdUsd: r.standardPriceUsd ?? null,
+            quantity: r.quantity ?? null,
+            lastPoDate: r.lastPoDate || '',
+            internalPN: r.internalPN || '',
+            localCurrency: r.localCurrency || '',
+            lastPoLocal: resolvePoLocal(r),
+          }))}
+          onClose={() => setMpnCompare(null)}
+        />
       )}
     </>
   )
