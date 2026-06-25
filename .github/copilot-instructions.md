@@ -47,6 +47,14 @@ price_variation/
 - **Azure AI Inference** (`azure-ai-inference`) for the AI chat tab — streaming via SSE
 - Credentials and config come from **environment variables** (`.env` / `backend/.env`); constants live in `backend/config.py`
 
+### Model / AI chat integration
+- Primary model integration is in `backend/main.py`: `/api/chat` for non-stream replies and `/api/chat/stream` for streaming SSE responses.
+- Model config lives in `backend/config.py`: `AZ_INF_ENDPOINT`, `AZ_INF_API_KEY`, `AZ_INF_API_VER`, `AZ_INF_MODEL`.
+- Current model is `Kimi-K2.6`. Change model behavior by updating backend prompt construction or the model config, not the frontend UI.
+- Frontend chat clients are in `frontend/src/api/client.ts` and `frontend/src/tabs/TabAI.tsx`.
+- For chat with session context, the backend injects raw/aggregated dataset context via `_build_data_context()` when `session_id` is present.
+- Do not add direct AI inference calls in the frontend; all AI requests must be proxied through the backend.
+
 ## Architecture Patterns
 
 ### Data flow

@@ -76,21 +76,74 @@ class _ConnectionFail(Exception):
     """Marks a connection/timeout error so the MPN can be retried later."""
 
 
-def _post(path: str, body: dict, timeout: int = 60) -> dict:
+# Signatures of transient "remote forcibly closed the connection" resets.
+_TRANSIENT_CONN_SIGNS = (
+    "connection aborted", "connection reset", "forcibly closed",
+    "remote end closed", "connectionreseterror", "10054", "broken pipe",
+    "error consultando nexar",
+)
+
+
+def _is_transient(text: str) -> bool:
+    t = (text or "").lower()
+    return any(s in t for s in _TRANSIENT_CONN_SIGNS)
+
+
+def _build_session() -> requests.Session:
+    from requests.adapters import HTTPAdapter
     try:
-        r = requests.post(f"{PRICECALC_API_URL}{path}", json=body, timeout=timeout)
-        r.raise_for_status()
-        return r.json()
-    except (requests.exceptions.ConnectionError,
-            requests.exceptions.Timeout,
-            requests.exceptions.ChunkedEncodingError) as e:
-        raise _ConnectionFail(str(e)) from e
-    except requests.exceptions.HTTPError as e:
-        # 5xx from the upstream proxy is usually a transient backend/SAP issue → retry
-        status = e.response.status_code if e.response is not None else 0
-        if status in (502, 503, 504):
-            raise _ConnectionFail(f"HTTP {status}: {e}") from e
-        raise
+        from urllib3.util.retry import Retry
+    except ImportError:  # pragma: no cover
+        from requests.packages.urllib3.util.retry import Retry  # type: ignore
+    retry = Retry(
+        total=3, connect=3, read=3, backoff_factor=0.4,
+        status_forcelist=(502, 503, 504),
+        allowed_methods=frozenset(["GET", "POST"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=DBJOB_MAX_WORKERS + 4,
+                          pool_maxsize=DBJOB_MAX_WORKERS + 4)
+    sess = requests.Session()
+    sess.mount("http://", adapter)
+    sess.mount("https://", adapter)
+    return sess
+
+
+_SESSION = _build_session()
+
+
+def _post(path: str, body: dict, timeout: int = 60, max_attempts: int = 3) -> dict:
+    """POST with transparent retry on stale-socket connection resets."""
+    import time as _time
+    last: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            r = _SESSION.post(f"{PRICECALC_API_URL}{path}", json=body, timeout=timeout)
+            r.raise_for_status()
+            return r.json()
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                requests.exceptions.ChunkedEncodingError) as e:
+            last = e
+            if attempt < max_attempts and _is_transient(str(e)):
+                _time.sleep(0.4 * attempt)
+                continue
+            raise _ConnectionFail(str(e)) from e
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response is not None else 0
+            detail = ""
+            try:
+                detail = e.response.json().get("detail", "") if e.response is not None else ""
+            except Exception:
+                pass
+            # 5xx from the upstream proxy is usually a transient backend/SAP/Nexar issue
+            if status in (502, 503, 504) or _is_transient(detail):
+                if attempt < max_attempts:
+                    _time.sleep(0.4 * attempt)
+                    continue
+                raise _ConnectionFail(f"HTTP {status}: {detail or e}") from e
+            raise
+    raise _ConnectionFail(f"Connection failed after {max_attempts} attempts: {last}")
 
 
 # ── Core per-MPN computation (reused by realtime fallback) ────────────────────
@@ -171,6 +224,10 @@ def process_mpn(mpn: str, window_days: int = DBJOB_WINDOW_DAYS) -> dict:
         "window_days": window_days,
         "computed_at": now,
         "origin": "job",
+        # 'ok' when a usable price was found, otherwise 'no_price' (SAP had no
+        # usable price). Connection/other failures are recorded separately via
+        # store.mark_error() by the caller.
+        "status": "ok" if chosen_price is not None else "no_price",
         # Full payload so the Multi-MPN / AMPL tabs (All Records, Blocked/Deleted,
         # Multi-Component) can be reconstructed instantly from the cache.
         "payload": {
@@ -339,6 +396,13 @@ def _run(trigger: str, mpns: list[str] | None, window_days: int, skip_cached: bo
             rec = {"mpn": mpn, "internal_pn": None, "error_type": etype, "message": msg}
             error_records.append(rec)
             store.add_error(run_id, mpn, None, etype, msg)
+            # Also document the failure in the persistent cache so it can be
+            # found and re-queried later from the admin search (without losing a
+            # previously-good price).
+            try:
+                store.mark_error(mpn, msg)
+            except Exception:  # never let bookkeeping break the job
+                pass
         processed += 1
         if processed % 25 == 0 or processed == total:
             store.update_run_progress(run_id, processed, success, errors, conn_errors)

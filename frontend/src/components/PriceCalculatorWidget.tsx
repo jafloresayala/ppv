@@ -2012,6 +2012,9 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
   const [mpnDbBestMap, setMpnDbBestMap]                               = useState<Record<string, MpnBestEntry>>({})
   // Per-MPN resolution status for the DB-first flow: pending = computing in real time
   const [mpnStatusMap, setMpnStatusMap]                               = useState<Record<string, 'pending' | 'done' | 'error'>>({})
+  // Which searched MPNs were already in the DB cache (instant) vs queried for the
+  // first time this session (uncached). Drives the split between the two tables.
+  const [mpnFromCacheSet, setMpnFromCacheSet]                         = useState<Set<string>>(new Set())
   const [deepAnalysisRows, setDeepAnalysisRows]                       = useState<DeepAnalysisRow[]>([])
   const [deepAnalysisLoading, setDeepAnalysisLoading]                 = useState(false)
   const abortDeepRef = useRef<AbortController | null>(null)
@@ -2991,6 +2994,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
     setMpnNexarMap({})
     setMpnDbBestMap({})
     setMpnStatusMap(Object.fromEntries(mpns.map(m => [m, 'pending' as const])))
+    setMpnFromCacheSet(new Set())
     setMultiMpnSubTab('results')
     setMultiMpnExpandedMpns(new Set())
     setDeepAnalysisRows([])
@@ -3013,6 +3017,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
       const foundEntries = Object.values(found).filter(Boolean) as MpnBestEntry[]
       for (const e of foundEntries) applyEntry(e)
       setMpnDbBestMap({ ...found })
+      setMpnFromCacheSet(new Set(Object.keys(found).map(k => k.toUpperCase())))
       setMultiMpnRawResults([...collectedRows])
       setMultiMpnAmplMap({ ...collectedAmpl })
       setMpnStatusMap(prev => {
@@ -4904,6 +4909,236 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                       </tr>
                     )
 
+                    // ── DB-cache split ────────────────────────────────────────
+                    // Cached MPNs render instantly in the top table; MPNs queried
+                    // for the first time this session render in a separate table.
+                    const fromCache = mpnFromCacheSet
+                    const synthBestRow = (e: MpnBestEntry): IQItem => ({
+                      rawStandardPrice: 0, rawStandardPricePer: 0,
+                      rawLastPoPrice: null, rawLastPoPer: null, uomConversion: 1,
+                      localCurrencyExchangeRate: 0, localCurrencyExchangeRateUsd: 0,
+                      mpn: e.bestMpn || e.mpn, internalPN: e.internalPN || '',
+                      siteName: e.bestPlant || '', quantity: undefined as unknown as number,
+                      standardPriceLocalCurr: undefined as unknown as number, lastPoPriceLocalCurr: null,
+                      standardPriceUsd: (e.stdPriceUsd ?? undefined) as unknown as number,
+                      lastPoPriceUsd: e.bestPriceUsd ?? null,
+                      localCurrency: '', lastPoDate: e.lastPoDate || '',
+                      supplierNumber: '', supplierName: e.bestSupplier || '', englishName: null,
+                      manufacturerName: '', materialDescription: '',
+                    })
+                    const foundMpnKeys = new Set(mpnEntries.map(e => e.mpn.toUpperCase()))
+                    // Cached MPNs without raw rows (cached before payloads existed) still
+                    // render a row synthesized from the stored best price.
+                    const synthCachedEntries = multiMpnSearchedList
+                      .filter(m => fromCache.has(m.toUpperCase()) && !foundMpnKeys.has(m.toUpperCase()))
+                      .map(m => {
+                        const e = mpnDbBestMap[m.toUpperCase()]
+                        if (!e || e.bestPriceUsd == null) return null
+                        const bestRow = synthBestRow(e)
+                        return { mpn: m, bestRow, allRows: [bestRow] }
+                      })
+                      .filter((x): x is { mpn: string; bestRow: IQItem; allRows: IQItem[] } => x !== null)
+                    const cachedEntries = [
+                      ...mpnEntries.filter(e => fromCache.has(e.mpn.toUpperCase())),
+                      ...synthCachedEntries,
+                    ].sort((a, b) => a.mpn.localeCompare(b.mpn))
+                    const freshEntries = mpnEntries
+                      .filter(e => !fromCache.has(e.mpn.toUpperCase()))
+                      .sort((a, b) => a.mpn.localeCompare(b.mpn))
+                    const cachedSearched = multiMpnSearchedList.filter(m => fromCache.has(m.toUpperCase()))
+                    const freshSearched  = multiMpnSearchedList.filter(m => !fromCache.has(m.toUpperCase()))
+                    const freshPending   = freshSearched.filter(m => (mpnStatusMap[m.toUpperCase()] ?? 'done') === 'pending')
+
+                    // Reusable detailed table (identical columns for cached & first-time).
+                    const renderDetailTable = (
+                      tableEntries: { mpn: string; bestRow: IQItem; allRows: IQItem[] }[],
+                      searchedSubset: string[],
+                      pendingMpns: string[],
+                    ) => {
+                      const foundSet      = new Set(tableEntries.map(e => e.mpn))
+                      const rawSet        = new Set(multiMpnRawResults.map(r => r.mpn))
+                      const blockedSet    = new Set(allBlockedItems.map(i => i.mpn))
+                      const hasNexarCols  = Object.keys(mpnNexarMap).length > 0
+                      const hasLyticaCols = Object.keys(lyticaMap).length > 0
+                      return (
+                        <div className="overflow-x-auto rounded-xl border border-gray-200 shadow-sm">
+                          <table className="min-w-max w-full text-xs border-collapse">
+                            <thead className="bg-gray-50 text-[10px] uppercase tracking-wide text-gray-500 sticky top-0">
+                              <tr>
+                                <th className="px-2 py-2.5 w-6 border-b border-gray-200" />
+                                <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">MPN</th>
+                                <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">Alt PN</th>
+                                <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">Supplier</th>
+                                <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">Searched</th>
+                                <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">Internal PN</th>
+                                <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">Plant</th>
+                                <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200">PO/QTY</th>
+                                <th className="px-3 py-2.5 text-center whitespace-nowrap border-b border-gray-200">Cur</th>
+                                <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200">Last PO (Local)</th>
+                                <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200">Std (Local)</th>
+                                <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200">Last PO (USD)</th>
+                                <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200">Std (USD)</th>
+                                <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">Date</th>
+                                <th className="px-3 py-2.5 text-center whitespace-nowrap border-b border-gray-200">Last PO Price &gt; Std Price</th>
+                                <th className="px-3 py-2.5 text-center whitespace-nowrap border-b border-gray-200">Swap</th>
+                                <th className="px-3 py-2.5 text-center whitespace-nowrap border-b border-gray-200">Manual Rev.</th>
+                                {hasNexarCols && <th className="px-3 py-2.5 text-center whitespace-nowrap border-b border-gray-200 text-purple-600">Best in Market</th>}
+                                {hasNexarCols && <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200 text-purple-600">Nexar Best (USD)</th>}
+                                {hasNexarCols && <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200 text-purple-600">Nexar Seller</th>}
+                                {hasLyticaCols && <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-teal-200 text-teal-600">Lytica 90th (USD)</th>}
+                              </tr>
+                            </thead>
+                            <tbody className="divide-y divide-gray-100">
+                              {pendingMpns.map(mpn => (
+                                <tr key={`pending-${mpn}`} className="bg-blue-50/40 animate-pulse">
+                                  <td className="px-2 py-2 text-center">
+                                    <svg className="animate-spin h-3 w-3 text-blue-500 mx-auto" fill="none" viewBox="0 0 24 24">
+                                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
+                                    </svg>
+                                  </td>
+                                  <td className="px-3 py-2 font-mono text-gray-700 whitespace-nowrap">—</td>
+                                  <td className="px-3 py-2 font-mono text-gray-500 whitespace-nowrap">—</td>
+                                  <td className="px-3 py-2 text-gray-500 whitespace-nowrap">—</td>
+                                  <td className="px-3 py-2 font-mono font-semibold text-blue-700 whitespace-nowrap">{mpn}</td>
+                                  <td className="px-3 py-2 font-mono text-gray-700 whitespace-nowrap">—</td>
+                                  <td className="px-3 py-2 text-gray-700 whitespace-nowrap">—</td>
+                                  <td className="px-3 py-2 text-right font-mono text-gray-700 whitespace-nowrap">—</td>
+                                  <td className="px-3 py-2 text-center font-mono text-gray-500 whitespace-nowrap">—</td>
+                                  <td className="px-3 py-2 text-right font-mono text-gray-700 whitespace-nowrap">—</td>
+                                  <td className="px-3 py-2 text-right font-mono text-gray-500 whitespace-nowrap">—</td>
+                                  <td className="px-3 py-2 text-right font-mono text-blue-700 font-semibold whitespace-nowrap">—</td>
+                                  <td className="px-3 py-2 text-right font-mono text-gray-500 whitespace-nowrap">—</td>
+                                  <td className="px-3 py-2 text-gray-500 whitespace-nowrap">—</td>
+                                  <td className="px-3 py-2 text-center whitespace-nowrap" />
+                                  <td className="px-3 py-2 text-center whitespace-nowrap" />
+                                  <td className="px-3 py-2 text-center whitespace-nowrap" />
+                                  {hasNexarCols && <td className="px-3 py-2 whitespace-nowrap" />}
+                                  {hasNexarCols && <td className="px-3 py-2 whitespace-nowrap" />}
+                                  {hasNexarCols && <td className="px-3 py-2 whitespace-nowrap" />}
+                                  {hasLyticaCols && <td className="px-3 py-2 whitespace-nowrap" />}
+                                </tr>
+                              ))}
+                              {tableEntries.map(({ mpn, bestRow }, i) => {
+                                const lpoUsd     = resolveLastPoPrice(bestRow)
+                                const stdUsd     = bestRow.standardPriceUsd
+                                const isLpoGtStd = lpoUsd != null && stdUsd != null && lpoUsd > stdUsd
+                                const isSwap     = !!(myPlant && bestRow.siteName && bestRow.siteName !== myPlant)
+                                const isManual   = lpoUsd === 0
+                                const nexarEntry   = mpnNexarMap[mpn]
+                                const nexarBestUsd = nexarEntry?.nexarBestUsd ?? null
+                                const nexarSeller  = nexarEntry?.nexarSeller ?? ''
+                                const bestInMarket = nexarBestUsd != null && lpoUsd != null && lpoUsd > 0 && nexarBestUsd < lpoUsd
+                                const bgColor    = isLpoGtStd ? 'bg-red-50 hover:bg-red-100/70' : isSwap ? 'bg-green-50 hover:bg-green-100/70' : i % 2 === 0 ? 'hover:bg-gray-50' : 'bg-gray-50/50 hover:bg-gray-100/50'
+                                const amplStillLoading = multiMpnLoading && !!bestRow.internalPN && !(bestRow.internalPN in multiMpnAmplMap)
+                                const resolvedAltPn    = multiMpnAmplMap[bestRow.internalPN]?.active.find(a => a.MfgPartNumber === bestRow.mpn)?.MpnPartNumber
+                                return (
+                                  <tr key={mpn} className={bgColor}>
+                                    <td className="px-2 py-2 text-center text-emerald-500 font-bold"></td>
+                                    <td className="px-3 py-2 font-mono font-semibold text-emerald-700 whitespace-nowrap">{bestRow.mpn}</td>
+                                    <td className="px-3 py-2 font-mono text-gray-500 whitespace-nowrap">
+                                      {amplStillLoading
+                                        ? <span className="inline-flex items-center text-blue-400 animate-pulse"><svg className="h-2.5 w-2.5 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"/></svg></span>
+                                        : (resolvedAltPn && resolvedAltPn !== bestRow.mpn ? resolvedAltPn : '—')
+                                      }
+                                    </td>
+                                    <td className="px-3 py-2 text-gray-600 max-w-[180px] truncate" title={bestRow.supplierName || bestRow.englishName || ''}>{bestRow.supplierName || bestRow.englishName || '—'}</td>
+                                    <td className="px-3 py-2 font-mono font-semibold text-blue-700 whitespace-nowrap">{mpn}</td>
+                                    <td className="px-3 py-2 font-mono text-gray-700 whitespace-nowrap">{bestRow.internalPN || '—'}</td>
+                                    <td className="px-3 py-2 text-center whitespace-nowrap">{bestRow.siteName || '—'}</td>
+                                    <td className="px-3 py-2 text-right font-mono text-gray-700 whitespace-nowrap">{bestRow.quantity?.toLocaleString() ?? '—'}</td>
+                                    <td className="px-3 py-2 text-center font-mono text-gray-500 whitespace-nowrap">{bestRow.localCurrency || '—'}</td>
+                                    <td className="px-3 py-2 text-right font-mono text-gray-700 whitespace-nowrap">{resolvePoLocal(bestRow) != null ? resolvePoLocal(bestRow)!.toLocaleString('en-US', { minimumFractionDigits: 4 }) : '—'}</td>
+                                    <td className="px-3 py-2 text-right font-mono text-gray-500 whitespace-nowrap">{resolveStdLocal(bestRow) != null ? resolveStdLocal(bestRow)!.toLocaleString('en-US', { minimumFractionDigits: 4 }) : '—'}</td>
+                                    <td className={`px-3 py-2 text-right font-mono font-semibold whitespace-nowrap ${isLpoGtStd ? 'text-red-700' : 'text-blue-700'}`}>{fmt6(lpoUsd)}</td>
+                                    <td className="px-3 py-2 text-right font-mono text-gray-500 whitespace-nowrap">{fmt6(stdUsd)}</td>
+                                    <td className="px-3 py-2 text-gray-500 whitespace-nowrap">{bestRow.lastPoDate || '—'}</td>
+                                    <td className="px-3 py-2 text-center whitespace-nowrap">
+                                      {isLpoGtStd && <span className="text-[10px] font-bold text-red-700 bg-red-100 px-1.5 py-0.5 rounded">1</span>}
+                                    </td>
+                                    <td className="px-3 py-2 text-center whitespace-nowrap">
+                                      {isSwap && <span className="text-[10px] font-bold text-green-700 bg-green-100 px-1.5 py-0.5 rounded">1</span>}
+                                    </td>
+                                    <td className="px-3 py-2 text-center whitespace-nowrap">
+                                      {isManual && <span className="text-[10px] font-bold text-amber-700 bg-amber-100 px-1.5 py-0.5 rounded">1</span>}
+                                    </td>
+                                    {hasNexarCols && (
+                                      <td className="px-3 py-2 text-center whitespace-nowrap">
+                                        {bestInMarket && <span className="text-[10px] font-bold text-purple-700 bg-purple-100 px-1.5 py-0.5 rounded">1</span>}
+                                      </td>
+                                    )}
+                                    {hasNexarCols && (
+                                      <td className="px-3 py-2 text-right font-mono text-purple-700 whitespace-nowrap">{fmt6(nexarBestUsd)}</td>
+                                    )}
+                                    {hasNexarCols && (
+                                      <td className="px-3 py-2 text-left font-mono text-purple-600 whitespace-nowrap max-w-[160px] truncate" title={nexarSeller}>{nexarSeller || '—'}</td>
+                                    )}
+                                    {hasLyticaCols && (() => {
+                                      const lytE = lyticaMap[mpn.toUpperCase()] ?? lyticaMap[mpn] ?? null
+                                      return <td className="px-3 py-2 text-right font-mono text-teal-700 whitespace-nowrap bg-teal-50/30">{lytE?.price90th != null ? fmt6(lytE.price90th) : '—'}</td>
+                                    })()}
+                                  </tr>
+                                )
+                              })}
+                              {(() => {
+                                return searchedSubset.filter(m => !foundSet.has(m)).map(m => {
+                                  const reason    = rawSet.has(m) ? 'No valid price data' : blockedSet.has(m) ? 'Blocked / Deleted' : 'No matches'
+                                  const isBlocked = reason === 'Blocked / Deleted'
+                                  const nexE = mpnNexarMap[m] ?? mpnNexarMap[m.toUpperCase()] ?? null
+                                  const lytE = lyticaMap[m.toUpperCase()] ?? lyticaMap[m] ?? null
+                                  const hasAltData = (hasNexarCols && nexE?.nexarBestUsd != null) || (hasLyticaCols && lytE?.price90th != null)
+                                  if (hasAltData) {
+                                    return (
+                                      <tr key={`missing-${m}`} className="bg-orange-50/30 hover:bg-orange-50/60">
+                                        <td className="px-2 py-2 text-center">
+                                          <svg className="h-3 w-3 mx-auto text-orange-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/></svg>
+                                        </td>
+                                        <td className="px-3 py-2 font-mono text-orange-700 whitespace-nowrap">
+                                          {m}
+                                          {nexE?.nexarBestUsd != null && lytE?.price90th != null
+                                            ? <span className="ml-1.5 text-[9px] font-semibold bg-purple-100 text-purple-600 px-1.5 py-0.5 rounded uppercase tracking-wide">Nexar/Lytica</span>
+                                            : nexE?.nexarBestUsd != null
+                                              ? <span className="ml-1.5 text-[9px] font-semibold bg-orange-100 text-orange-500 px-1.5 py-0.5 rounded uppercase tracking-wide">Nexar</span>
+                                              : <span className="ml-1.5 text-[9px] font-semibold bg-teal-100 text-teal-600 px-1.5 py-0.5 rounded uppercase tracking-wide">Lytica</span>
+                                          }
+                                        </td>
+                                        <td className="px-3 py-2 text-gray-300 whitespace-nowrap">—</td>
+                                        <td className="px-3 py-2 text-gray-300 whitespace-nowrap">—</td>
+                                        <td className="px-3 py-2 font-mono font-semibold text-orange-400 whitespace-nowrap">{m}</td>
+                                        <td className="px-3 py-2 text-gray-300 whitespace-nowrap">—</td>
+                                        <td className="px-3 py-2 text-gray-300 whitespace-nowrap">—</td>
+                                        <td className="px-3 py-2 text-right text-gray-300 whitespace-nowrap">—</td>
+                                        <td className="px-3 py-2 text-center text-gray-300 whitespace-nowrap">—</td>
+                                        <td className="px-3 py-2 text-right text-gray-300 whitespace-nowrap">—</td>
+                                        <td className="px-3 py-2 text-right text-gray-300 whitespace-nowrap">—</td>
+                                        <td className="px-3 py-2 text-right text-gray-300 whitespace-nowrap">—</td>
+                                        <td className="px-3 py-2 text-right text-gray-300 whitespace-nowrap">—</td>
+                                        <td className="px-3 py-2 text-gray-300 whitespace-nowrap">—</td>
+                                        <td className="px-3 py-2 whitespace-nowrap" />
+                                        <td className="px-3 py-2 whitespace-nowrap" />
+                                        <td className="px-3 py-2 whitespace-nowrap" />
+                                        {hasNexarCols && <td className="px-3 py-2 whitespace-nowrap" />}
+                                        {hasNexarCols && <td className="px-3 py-2 text-right font-mono font-semibold text-purple-700 whitespace-nowrap">{nexE?.nexarBestUsd != null ? fmt6(nexE.nexarBestUsd) : '—'}</td>}
+                                        {hasNexarCols && <td className="px-3 py-2 text-left font-mono text-purple-600 whitespace-nowrap max-w-[160px] truncate" title={nexE?.nexarSeller}>{nexE?.nexarSeller || '—'}</td>}
+                                        {hasLyticaCols && <td className="px-3 py-2 text-right font-mono font-semibold text-teal-700 whitespace-nowrap bg-teal-50/30">{lytE?.price90th != null ? fmt6(lytE.price90th) : '—'}</td>}
+                                      </tr>
+                                    )
+                                  }
+                                  return (
+                                    <tr key={`missing-${m}`} className={isBlocked ? 'bg-amber-50/60' : 'bg-gray-50/40'}>
+                                      <td className="px-2 py-2 text-center text-gray-300">—</td>
+                                      <td className="px-3 py-2 font-mono text-gray-500 whitespace-nowrap">{m}</td>
+                                      <td colSpan={15 + (hasNexarCols ? 3 : 0) + (hasLyticaCols ? 1 : 0)} className={`px-3 py-2 text-xs italic ${isBlocked ? 'text-amber-500' : 'text-gray-400'}`}>{reason}</td>
+                                    </tr>
+                                  )
+                                })
+                              })()}
+                            </tbody>
+                          </table>
+                        </div>
+                      )
+                    }
+
                     return (
                       <div>
                         {/* Sub-tab bar */}
@@ -5012,299 +5247,35 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                           })()}
                         </div>
 
-                        {/* ── IQ Results: loading skeleton — only while the bulk IQ call is in-flight ── */}
-                        {multiMpnSubTab === 'results' && multiMpnLoading && multiMpnRawResults.length === 0 && multiMpnSearchedList.length > 0 && (
-                          <div>
-                            <p className="text-[10px] text-gray-400 mb-2">Cheapest Last PO (USD) within a {windowDays}-day window from the latest purchase date — one row per MPN</p>
-                            <div className="overflow-x-auto rounded-xl border border-gray-200 shadow-sm">
-                              <table className="min-w-max w-full text-xs border-collapse">
-                                <thead className="bg-gray-50 text-[10px] uppercase tracking-wide text-gray-500 sticky top-0">
-                                  <tr>
-                                    <th className="px-2 py-2.5 w-6 border-b border-gray-200" />
-                                    <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">MPN</th>
-                                    <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">Alt PN</th>
-                                    <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">Supplier</th>
-                                    <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">Searched</th>
-                                    <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">Internal PN</th>
-                                    <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">Plant</th>
-                                    <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200">PO/QTY</th>
-                                    <th className="px-3 py-2.5 text-center whitespace-nowrap border-b border-gray-200">Cur</th>
-                                    <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200">Last PO (Local)</th>
-                                    <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200">Std (Local)</th>
-                                    <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200">Last PO (USD)</th>
-                                    <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200">Std (USD)</th>
-                                    <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">Date</th>
-                                    <th className="px-3 py-2.5 text-center whitespace-nowrap border-b border-gray-200">Last PO Price &gt; Std Price</th>
-                                    <th className="px-3 py-2.5 text-center whitespace-nowrap border-b border-gray-200">Swap</th>
-                                    <th className="px-3 py-2.5 text-center whitespace-nowrap border-b border-gray-200">Manual Rev.</th>
-                                  </tr>
-                                </thead>
-                                <tbody className="divide-y divide-gray-100">
-                                  {multiMpnSearchedList.map(mpn => (
-                                    <tr key={mpn} className="bg-blue-50/40 animate-pulse">
-                                      <td className="px-2 py-2 text-center">
-                                        <svg className="animate-spin h-3 w-3 text-blue-500 mx-auto" fill="none" viewBox="0 0 24 24">
-                                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
-                                        </svg>
-                                      </td>
-                                      <td className="px-3 py-2 font-mono text-gray-700 whitespace-nowrap">—</td>
-                                      <td className="px-3 py-2 font-mono text-gray-500 whitespace-nowrap">—</td>
-                                      <td className="px-3 py-2 text-gray-500 whitespace-nowrap">—</td>
-                                      <td className="px-3 py-2 font-mono font-semibold text-blue-700 whitespace-nowrap">{mpn}</td>
-                                      <td className="px-3 py-2 font-mono text-gray-700 whitespace-nowrap">—</td>
-                                      <td className="px-3 py-2 text-gray-700 whitespace-nowrap">—</td>
-                                      <td className="px-3 py-2 text-right font-mono text-gray-700 whitespace-nowrap">—</td>
-                                      <td className="px-3 py-2 text-center font-mono text-gray-500 whitespace-nowrap">—</td>
-                                      <td className="px-3 py-2 text-right font-mono text-gray-700 whitespace-nowrap">—</td>
-                                      <td className="px-3 py-2 text-right font-mono text-gray-500 whitespace-nowrap">—</td>
-                                      <td className="px-3 py-2 text-right font-mono text-blue-700 font-semibold whitespace-nowrap">—</td>
-                                      <td className="px-3 py-2 text-right font-mono text-gray-500 whitespace-nowrap">—</td>
-                                      <td className="px-3 py-2 text-gray-500 whitespace-nowrap">—</td>
-                                      <td className="px-3 py-2 text-center whitespace-nowrap" />
-                                      <td className="px-3 py-2 text-center whitespace-nowrap" />
-                                      <td className="px-3 py-2 text-center whitespace-nowrap" />
-                                    </tr>
-                                  ))}
-                                </tbody>
-                              </table>
-                            </div>
-                          </div>
-                        )}
-
-                        {/* ── IQ Results: one best-price row per MPN — shows as soon as IQ data arrives ── */}
-                        {multiMpnSubTab === 'results' && (mpnEntries.length > 0 || (!multiMpnLoading && multiMpnSearchedList.length > 0)) && (
-                          <div>
-                            {/* ⚡ Instant best price from the daily SQLite cache (SAP only) */}
-                            {(() => {
-                              const list = multiMpnSearchedList
-                              if (!list.length) return null
-                              const rows = list.map(m => {
-                                const key = m.toUpperCase()
-                                return { mpn: m, entry: mpnDbBestMap[key], status: mpnStatusMap[key] ?? 'done' }
-                              })
-                              const cachedCount   = rows.filter(r => r.entry && r.status === 'done').length
-                              const pendingCount  = rows.filter(r => r.status === 'pending').length
-                              const errorCount    = rows.filter(r => r.status === 'error').length
-                              return (
-                                <div className="mb-3 rounded-xl border border-indigo-200 bg-indigo-50/40 overflow-hidden">
-                                  <div className="flex items-center gap-2 px-3 py-2 border-b border-indigo-100">
-                                    <svg className="h-3.5 w-3.5 text-indigo-500" fill="currentColor" viewBox="0 0 20 20"><path d="M11 3a1 1 0 10-2 0v1.586l-2.293-2.293a1 1 0 10-1.414 1.414L7.586 7H6a1 1 0 000 2h5a1 1 0 001-1V3z"/><path d="M3 9a1 1 0 011-1h2.586L4.293 5.707a1 1 0 010-1.414L9 9v8a1 1 0 11-2 0v-4.586l-3.293 3.293a1 1 0 01-1.414-1.414L4.586 11H4a1 1 0 01-1-1V9z"/></svg>
-                                    <span className="text-xs font-bold text-indigo-700">Instant best price (DB cache · SAP only)</span>
-                                    <span className="text-[10px] text-indigo-400">{cachedCount} cached</span>
-                                    {pendingCount > 0 && <span className="text-[10px] text-amber-500">· {pendingCount} computing</span>}
-                                    {errorCount > 0 && <span className="text-[10px] text-red-400">· {errorCount} failed</span>}
-                                  </div>
-                                  <div className="overflow-x-auto">
-                                    <table className="min-w-max w-full text-xs">
-                                      <thead className="text-[10px] uppercase tracking-wide text-indigo-400">
-                                        <tr>
-                                          <th className="px-3 py-1.5 text-left">MPN</th>
-                                          <th className="px-3 py-1.5 text-left">Source</th>
-                                          <th className="px-3 py-1.5 text-right">Best Price (USD)</th>
-                                          <th className="px-3 py-1.5 text-left">Supplier</th>
-                                          <th className="px-3 py-1.5 text-left">Plant</th>
-                                          <th className="px-3 py-1.5 text-left">Last PO</th>
-                                        </tr>
-                                      </thead>
-                                      <tbody>
-                                        {rows.map(({ mpn, entry, status }) => {
-                                          if (status === 'pending') return (
-                                            <tr key={mpn} className="border-t border-indigo-100/70 bg-amber-50/40">
-                                              <td className="px-3 py-1.5 font-mono text-gray-700">{mpn}</td>
-                                              <td className="px-3 py-1.5" colSpan={5}>
-                                                <span className="inline-flex items-center gap-1.5 text-[11px] text-amber-600 font-medium">
-                                                  <svg className="animate-spin h-3 w-3" fill="none" viewBox="0 0 24 24">
-                                                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                                                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
-                                                  </svg>
-                                                  Not cached — querying SAP…
-                                                </span>
-                                              </td>
-                                            </tr>
-                                          )
-                                          if (!entry || entry.bestPriceUsd == null) return (
-                                            <tr key={mpn} className="border-t border-indigo-100/70">
-                                              <td className="px-3 py-1.5 font-mono text-gray-700">{mpn}</td>
-                                              <td className="px-3 py-1.5 text-[11px] text-gray-400" colSpan={5}>
-                                                {status === 'error' ? 'Connection error — not cached' : 'No SAP price found'}
-                                              </td>
-                                            </tr>
-                                          )
-                                          return (
-                                            <tr key={mpn} className="border-t border-indigo-100/70">
-                                              <td className="px-3 py-1.5 font-mono text-gray-700">{entry.mpn}</td>
-                                              <td className="px-3 py-1.5">
-                                                <span className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${entry.bestSource === 'Internal' ? 'bg-purple-100 text-purple-700' : 'bg-blue-100 text-blue-700'}`}>
-                                                  {entry.bestSource === 'Internal' ? 'Internal PN' : 'MPN'}
-                                                </span>
-                                                {entry.origin === 'realtime' && <span className="ml-1 text-[9px] text-gray-400">live</span>}
-                                              </td>
-                                              <td className="px-3 py-1.5 text-right font-mono font-bold text-indigo-700">{fmt6(entry.bestPriceUsd)}</td>
-                                              <td className="px-3 py-1.5 text-gray-600 max-w-[160px] truncate" title={entry.bestSupplier ?? ''}>{entry.bestSupplier || '—'}</td>
-                                              <td className="px-3 py-1.5 text-gray-500">{entry.bestPlant || '—'}</td>
-                                              <td className="px-3 py-1.5 text-gray-500">{entry.lastPoDate || '—'}</td>
-                                            </tr>
-                                          )
-                                        })}
-                                      </tbody>
-                                    </table>
-                                  </div>
+                        {/* ── IQ Results: cached (instant) + first-time tables ── */}
+                        {multiMpnSubTab === 'results' && multiMpnSearchedList.length > 0 && (
+                          <div className="space-y-4">
+                            {/* Cached — instant from the persistent DB cache */}
+                            {(cachedEntries.length > 0 || cachedSearched.length > 0) && (
+                              <div>
+                                <div className="flex items-center gap-2 mb-1.5">
+                                  <svg className="h-3.5 w-3.5 text-indigo-500" fill="currentColor" viewBox="0 0 20 20"><path d="M11 3a1 1 0 10-2 0v1.586l-2.293-2.293a1 1 0 10-1.414 1.414L7.586 7H6a1 1 0 000 2h5a1 1 0 001-1V3z"/><path d="M3 9a1 1 0 011-1h2.586L4.293 5.707a1 1 0 010-1.414L9 9v8a1 1 0 11-2 0v-4.586l-3.293 3.293a1 1 0 01-1.414-1.414L4.586 11H4a1 1 0 01-1-1V9z"/></svg>
+                                  <span className="text-xs font-bold text-indigo-700">Instant best price (DB cache · SAP only)</span>
+                                  <span className="text-[10px] text-indigo-400">{cachedEntries.length} cached</span>
                                 </div>
-                              )
-                            })()}
-                            <p className="text-[10px] text-gray-400 mb-2">Cheapest Last PO (USD) within a {windowDays}-day window from the latest purchase date — one row per MPN</p>
-                            <div className="overflow-x-auto rounded-xl border border-gray-200 shadow-sm">
-                              <table className="min-w-max w-full text-xs border-collapse">
-                                <thead className="bg-gray-50 text-[10px] uppercase tracking-wide text-gray-500 sticky top-0">
-                                  <tr>
-                                    <th className="px-2 py-2.5 w-6 border-b border-gray-200" />
-                                    <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">MPN</th>
-                                    <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">Alt PN</th>
-                                    <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">Supplier</th>
-                                    <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">Searched</th>
-                                    <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">Internal PN</th>
-                                    <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">Plant</th>
-                                    <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200">PO/QTY</th>
-                                    <th className="px-3 py-2.5 text-center whitespace-nowrap border-b border-gray-200">Cur</th>
-                                    <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200">Last PO (Local)</th>
-                                    <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200">Std (Local)</th>
-                                    <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200">Last PO (USD)</th>
-                                    <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200">Std (USD)</th>
-                                    <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">Date</th>
-                                    <th className="px-3 py-2.5 text-center whitespace-nowrap border-b border-gray-200">Last PO Price &gt; Std Price</th>
-                                    <th className="px-3 py-2.5 text-center whitespace-nowrap border-b border-gray-200">Swap</th>
-                                    <th className="px-3 py-2.5 text-center whitespace-nowrap border-b border-gray-200">Manual Rev.</th>
-                                    {Object.keys(mpnNexarMap).length > 0 && <th className="px-3 py-2.5 text-center whitespace-nowrap border-b border-gray-200 text-purple-600">Best in Market</th>}
-                                    {Object.keys(mpnNexarMap).length > 0 && <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-gray-200 text-purple-600">Nexar Best (USD)</th>}
-                                    {Object.keys(mpnNexarMap).length > 0 && <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200 text-purple-600">Nexar Seller</th>}
-                                    {Object.keys(lyticaMap).length > 0 && <th className="px-3 py-2.5 text-right whitespace-nowrap border-b border-teal-200 text-teal-600">Lytica 90th (USD)</th>}
-                                  </tr>
-                                </thead>
-                                <tbody className="divide-y divide-gray-100">
-                                  {mpnEntries.map(({ mpn, bestRow }, i) => {
-                                    const lpoUsd     = resolveLastPoPrice(bestRow)
-                                    const stdUsd     = bestRow.standardPriceUsd
-                                    const isLpoGtStd = lpoUsd != null && stdUsd != null && lpoUsd > stdUsd
-                                    const isSwap     = !!(myPlant && bestRow.siteName && bestRow.siteName !== myPlant)
-                                    const isManual   = lpoUsd === 0
-                                    const qtyIns     = mpnComponentQtys[mpn] ?? qty
-                                    const nexarEntry   = mpnNexarMap[mpn]
-                                    const nexarBestUsd = nexarEntry?.nexarBestUsd ?? null
-                                    const nexarSeller  = nexarEntry?.nexarSeller ?? ''
-                                    const bestInMarket = nexarBestUsd != null && lpoUsd != null && lpoUsd > 0 && nexarBestUsd < lpoUsd
-                                    const bgColor    = isLpoGtStd ? 'bg-red-50 hover:bg-red-100/70' : isSwap ? 'bg-green-50 hover:bg-green-100/70' : i % 2 === 0 ? 'hover:bg-gray-50' : 'bg-gray-50/50 hover:bg-gray-100/50'
-                                    const amplStillLoading = multiMpnLoading && !!bestRow.internalPN && !(bestRow.internalPN in multiMpnAmplMap)
-                                    const resolvedAltPn    = multiMpnAmplMap[bestRow.internalPN]?.active.find(a => a.MfgPartNumber === bestRow.mpn)?.MpnPartNumber
-                                    return (
-                                      <tr key={mpn} className={bgColor}>
-                                        <td className="px-2 py-2 text-center text-emerald-500 font-bold"></td>
-                                        <td className="px-3 py-2 font-mono font-semibold text-emerald-700 whitespace-nowrap">{bestRow.mpn}</td>
-                                        <td className="px-3 py-2 font-mono text-gray-500 whitespace-nowrap">
-                                          {amplStillLoading
-                                            ? <span className="inline-flex items-center text-blue-400 animate-pulse"><svg className="h-2.5 w-2.5 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"/></svg></span>
-                                            : (resolvedAltPn && resolvedAltPn !== bestRow.mpn ? resolvedAltPn : '—')
-                                          }
-                                        </td>
-                                        <td className="px-3 py-2 text-gray-600 max-w-[180px] truncate" title={bestRow.supplierName || bestRow.englishName || ''}>{bestRow.supplierName || bestRow.englishName || '—'}</td>
-                                        <td className="px-3 py-2 font-mono font-semibold text-blue-700 whitespace-nowrap">{mpn}</td>
-                                        <td className="px-3 py-2 font-mono text-gray-700 whitespace-nowrap">{bestRow.internalPN || '—'}</td>
-                                        <td className="px-3 py-2 text-center whitespace-nowrap">{bestRow.siteName || '—'}</td>
-                                        <td className="px-3 py-2 text-right font-mono text-gray-700 whitespace-nowrap">{bestRow.quantity?.toLocaleString() ?? '—'}</td>
-                                        <td className="px-3 py-2 text-center font-mono text-gray-500 whitespace-nowrap">{bestRow.localCurrency || '—'}</td>
-                                        <td className="px-3 py-2 text-right font-mono text-gray-700 whitespace-nowrap">{resolvePoLocal(bestRow) != null ? resolvePoLocal(bestRow)!.toLocaleString('en-US', { minimumFractionDigits: 4 }) : '—'}</td>
-                                        <td className="px-3 py-2 text-right font-mono text-gray-500 whitespace-nowrap">{resolveStdLocal(bestRow) != null ? resolveStdLocal(bestRow)!.toLocaleString('en-US', { minimumFractionDigits: 4 }) : '—'}</td>
-                                        <td className={`px-3 py-2 text-right font-mono font-semibold whitespace-nowrap ${isLpoGtStd ? 'text-red-700' : 'text-blue-700'}`}>{fmt6(lpoUsd)}</td>
-                                        <td className="px-3 py-2 text-right font-mono text-gray-500 whitespace-nowrap">{fmt6(stdUsd)}</td>
-                                        <td className="px-3 py-2 text-gray-500 whitespace-nowrap">{bestRow.lastPoDate || '—'}</td>
-                                        <td className="px-3 py-2 text-center whitespace-nowrap">
-                                          {isLpoGtStd && <span className="text-[10px] font-bold text-red-700 bg-red-100 px-1.5 py-0.5 rounded">1</span>}
-                                        </td>
-                                        <td className="px-3 py-2 text-center whitespace-nowrap">
-                                          {isSwap && <span className="text-[10px] font-bold text-green-700 bg-green-100 px-1.5 py-0.5 rounded">1</span>}
-                                        </td>
-                                        <td className="px-3 py-2 text-center whitespace-nowrap">
-                                          {isManual && <span className="text-[10px] font-bold text-amber-700 bg-amber-100 px-1.5 py-0.5 rounded">1</span>}
-                                        </td>
-                                        {Object.keys(mpnNexarMap).length > 0 && (
-                                          <td className="px-3 py-2 text-center whitespace-nowrap">
-                                            {bestInMarket && <span className="text-[10px] font-bold text-purple-700 bg-purple-100 px-1.5 py-0.5 rounded">1</span>}
-                                          </td>
-                                        )}
-                                        {Object.keys(mpnNexarMap).length > 0 && (
-                                          <td className="px-3 py-2 text-right font-mono text-purple-700 whitespace-nowrap">{fmt6(nexarBestUsd)}</td>
-                                        )}
-                                        {Object.keys(mpnNexarMap).length > 0 && (
-                                          <td className="px-3 py-2 text-left font-mono text-purple-600 whitespace-nowrap max-w-[160px] truncate" title={nexarSeller}>{nexarSeller || '—'}</td>
-                                        )}
-                                        {Object.keys(lyticaMap).length > 0 && (() => {
-                                          const lytE = lyticaMap[mpn.toUpperCase()] ?? lyticaMap[mpn] ?? null
-                                          return <td className="px-3 py-2 text-right font-mono text-teal-700 whitespace-nowrap bg-teal-50/30">{lytE?.price90th != null ? fmt6(lytE.price90th) : '—'}</td>
-                                        })()}
-                                      </tr>
-                                    )
-                                  })}
-                                  {(() => {
-                                    const foundSet    = new Set(mpnEntries.map(e => e.mpn))
-                                    const rawSet      = new Set(multiMpnRawResults.map(r => r.mpn))
-                                    const blockedSet  = new Set(allBlockedItems.map(i => i.mpn))
-                                    const hasNexarCols = Object.keys(mpnNexarMap).length > 0
-                                    const hasLyticaCols = Object.keys(lyticaMap).length > 0
-                                    return multiMpnSearchedList.filter(m => !foundSet.has(m)).map(m => {
-                                      const reason    = rawSet.has(m) ? 'No valid price data' : blockedSet.has(m) ? 'Blocked / Deleted' : 'No matches'
-                                      const isBlocked = reason === 'Blocked / Deleted'
-                                      const nexE = mpnNexarMap[m] ?? mpnNexarMap[m.toUpperCase()] ?? null
-                                      const lytE = lyticaMap[m.toUpperCase()] ?? lyticaMap[m] ?? null
-                                      const hasAltData = (hasNexarCols && nexE?.nexarBestUsd != null) || (hasLyticaCols && lytE?.price90th != null)
-                                      if (hasAltData) {
-                                        return (
-                                          <tr key={`missing-${m}`} className="bg-orange-50/30 hover:bg-orange-50/60">
-                                            <td className="px-2 py-2 text-center">
-                                              <svg className="h-3 w-3 mx-auto text-orange-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/></svg>
-                                            </td>
-                                            <td className="px-3 py-2 font-mono text-orange-700 whitespace-nowrap">
-                                              {m}
-                                              {nexE?.nexarBestUsd != null && lytE?.price90th != null
-                                                ? <span className="ml-1.5 text-[9px] font-semibold bg-purple-100 text-purple-600 px-1.5 py-0.5 rounded uppercase tracking-wide">Nexar/Lytica</span>
-                                                : nexE?.nexarBestUsd != null
-                                                  ? <span className="ml-1.5 text-[9px] font-semibold bg-orange-100 text-orange-500 px-1.5 py-0.5 rounded uppercase tracking-wide">Nexar</span>
-                                                  : <span className="ml-1.5 text-[9px] font-semibold bg-teal-100 text-teal-600 px-1.5 py-0.5 rounded uppercase tracking-wide">Lytica</span>
-                                              }
-                                            </td>
-                                            <td className="px-3 py-2 text-gray-300 whitespace-nowrap">—</td>
-                                            <td className="px-3 py-2 text-gray-300 whitespace-nowrap">—</td>
-                                            <td className="px-3 py-2 font-mono font-semibold text-orange-400 whitespace-nowrap">{m}</td>
-                                            <td className="px-3 py-2 text-gray-300 whitespace-nowrap">—</td>
-                                            <td className="px-3 py-2 text-gray-300 whitespace-nowrap">—</td>
-                                            <td className="px-3 py-2 text-right text-gray-300 whitespace-nowrap">—</td>
-                                            <td className="px-3 py-2 text-center text-gray-300 whitespace-nowrap">—</td>
-                                            <td className="px-3 py-2 text-right text-gray-300 whitespace-nowrap">—</td>
-                                            <td className="px-3 py-2 text-right text-gray-300 whitespace-nowrap">—</td>
-                                            <td className="px-3 py-2 text-right text-gray-300 whitespace-nowrap">—</td>
-                                            <td className="px-3 py-2 text-right text-gray-300 whitespace-nowrap">—</td>
-                                            <td className="px-3 py-2 text-gray-300 whitespace-nowrap">—</td>
-                                            <td className="px-3 py-2 whitespace-nowrap" />
-                                            <td className="px-3 py-2 whitespace-nowrap" />
-                                            <td className="px-3 py-2 whitespace-nowrap" />
-                                            {hasNexarCols && <td className="px-3 py-2 whitespace-nowrap" />}
-                                            {hasNexarCols && <td className="px-3 py-2 text-right font-mono font-semibold text-purple-700 whitespace-nowrap">{nexE?.nexarBestUsd != null ? fmt6(nexE.nexarBestUsd) : '—'}</td>}
-                                            {hasNexarCols && <td className="px-3 py-2 text-left font-mono text-purple-600 whitespace-nowrap max-w-[160px] truncate" title={nexE?.nexarSeller}>{nexE?.nexarSeller || '—'}</td>}
-                                            {hasLyticaCols && <td className="px-3 py-2 text-right font-mono font-semibold text-teal-700 whitespace-nowrap bg-teal-50/30">{lytE?.price90th != null ? fmt6(lytE.price90th) : '—'}</td>}
-                                          </tr>
-                                        )
-                                      }
-                                      return (
-                                        <tr key={`missing-${m}`} className={isBlocked ? 'bg-amber-50/60' : 'bg-gray-50/40'}>
-                                          <td className="px-2 py-2 text-center text-gray-300">—</td>
-                                          <td className="px-3 py-2 font-mono text-gray-500 whitespace-nowrap">{m}</td>
-                                          <td colSpan={15 + (hasNexarCols ? 3 : 0) + (hasLyticaCols ? 1 : 0)} className={`px-3 py-2 text-xs italic ${isBlocked ? 'text-amber-500' : 'text-gray-400'}`}>{reason}</td>
-                                        </tr>
-                                      )
-                                    })
-                                  })()}
-                                </tbody>
-                              </table>
-                            </div>
+                                <p className="text-[10px] text-gray-400 mb-2">Cheapest Last PO (USD) within a {windowDays}-day window from the latest purchase date — one row per MPN</p>
+                                {renderDetailTable(cachedEntries, cachedSearched, [])}
+                              </div>
+                            )}
+                            {/* First-time — queried live now, not yet in the cache */}
+                            {(freshEntries.length > 0 || freshSearched.length > 0) && (
+                              <div>
+                                <div className="flex items-center gap-2 mb-1.5">
+                                  {freshPending.length > 0
+                                    ? <svg className="animate-spin h-3.5 w-3.5 text-amber-500" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" /></svg>
+                                    : <svg className="h-3.5 w-3.5 text-amber-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2"><path strokeLinecap="round" strokeLinejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>}
+                                  <span className="text-xs font-bold text-amber-700">First-time query · not cached</span>
+                                  <span className="text-[10px] text-amber-400">{freshEntries.length} found{freshPending.length > 0 ? ` · ${freshPending.length} querying SAP…` : ''}</span>
+                                </div>
+                                <p className="text-[10px] text-gray-400 mb-2">These MPNs weren’t in the database — they’re being looked up live now and saved to the cache for next time.</p>
+                                {renderDetailTable(freshEntries, freshSearched.filter(m => (mpnStatusMap[m.toUpperCase()] ?? 'done') !== 'pending'), freshPending)}
+                              </div>
+                            )}
                           </div>
                         )}
 

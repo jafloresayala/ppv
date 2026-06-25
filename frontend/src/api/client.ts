@@ -226,6 +226,8 @@ export interface MpnBestEntry {
   lastPoDate:   string | null
   computedAt:   string | null
   origin:       string | null   // 'job' | 'realtime'
+  status?:      string | null   // 'ok' | 'no_price' | 'error'
+  errorDetail?: string | null
   // Full cached payload (present when hasPayload) — typed loosely; the widget
   // casts rawRows→IQItem[] and ampl→AmplResponse.
   rawRows?:     Record<string, unknown>[]
@@ -317,6 +319,7 @@ export interface AdminDashboard {
   runs:          Array<Record<string, unknown>>
   recent_errors: Array<Record<string, unknown>>
   cached_count:  number
+  status_counts?: Record<string, number>
 }
 
 export async function getAdminDashboard(token: string): Promise<AdminDashboard> {
@@ -324,5 +327,51 @@ export async function getAdminDashboard(token: string): Promise<AdminDashboard> 
     timeout: 15_000,
     headers: { Authorization: `Bearer ${token}` },
   })
+  return data
+}
+
+// ── Admin: search & re-query specific MPNs ────────────────────────────────────
+
+export interface AdminMpnSearchResponse {
+  results:       MpnBestEntry[]
+  status_counts: Record<string, number>
+}
+
+export async function adminSearchMpns(
+  token: string, q: string, status?: string,
+): Promise<AdminMpnSearchResponse> {
+  const { data } = await http.get<AdminMpnSearchResponse>('/admin/mpn-search', {
+    timeout: 20_000,
+    params: { q: q || '', status: status || '' },
+    headers: { Authorization: `Bearer ${token}` },
+  })
+  return data
+}
+
+export interface AdminRequeryResponse {
+  results:       MpnBestEntry[]
+  summary:       { requested: number; ok: number; failed: number }
+  status_counts: Record<string, number>
+}
+
+export async function adminRequeryMpns(
+  token: string, mpns: string[], windowDays?: number,
+): Promise<AdminRequeryResponse> {
+  const { data } = await http.post<AdminRequeryResponse>(
+    '/admin/mpn-requery',
+    { mpns, window_days: windowDays ?? null },
+    { timeout: 600_000, headers: { Authorization: `Bearer ${token}` } },
+  )
+  return data
+}
+
+export async function adminRequeryFailed(
+  token: string, statuses?: string[], windowDays?: number,
+): Promise<{ started: boolean; reason?: string; count: number }> {
+  const { data } = await http.post(
+    '/admin/mpn-requery-failed',
+    { statuses: statuses ?? null, window_days: windowDays ?? null },
+    { timeout: 30_000, headers: { Authorization: `Bearer ${token}` } },
+  )
   return data
 }

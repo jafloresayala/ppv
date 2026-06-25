@@ -1147,26 +1147,90 @@ def trend_detail(req: TrendDetailRequest):
 
 # ── Price Calculator proxy (conexion_internalquery) ───────────────────────────
 
-def _pricecalc_post(path: str, body: dict):
+# Signatures of transient "the remote forcibly closed the connection" errors.
+# These happen when a pooled keep-alive socket goes stale (the upstream proxy or
+# Nexar drops idle connections) and `requests` reuses the dead socket. Retrying
+# transparently opens a fresh connection, which is why restarting the server
+# "fixed" it before. We now retry automatically instead.
+_TRANSIENT_CONN_SIGNS = (
+    "connection aborted", "connection reset", "forcibly closed",
+    "remote end closed", "connectionreseterror", "10054", "broken pipe",
+    "error consultando nexar",  # upstream surfaces the Nexar reset in its detail
+)
+
+
+def _is_transient_conn_error(text: str) -> bool:
+    t = (text or "").lower()
+    return any(sign in t for sign in _TRANSIENT_CONN_SIGNS)
+
+
+def _build_pricecalc_session() -> requests.Session:
+    """A requests.Session with urllib3 retry on connection errors / 5xx."""
+    from requests.adapters import HTTPAdapter
     try:
-        r = requests.post(f"{PRICECALC_API_URL}{path}", json=body, timeout=30)
-        r.raise_for_status()
-        return r.json()
-    except requests.exceptions.ConnectionError:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Price Calculator API not reachable at {PRICECALC_API_URL}. "
-                   "Start the conexion_internalquery backend first."
-        )
-    except requests.exceptions.Timeout:
-        raise HTTPException(status_code=504, detail="Price Calculator API timed out.")
-    except requests.exceptions.HTTPError as e:
-        detail = str(e)
+        from urllib3.util.retry import Retry
+    except ImportError:  # pragma: no cover
+        from requests.packages.urllib3.util.retry import Retry  # type: ignore
+    retry = Retry(
+        total=3, connect=3, read=3,
+        backoff_factor=0.4,
+        status_forcelist=(502, 503, 504),
+        allowed_methods=frozenset(["GET", "POST"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=20)
+    sess = requests.Session()
+    sess.mount("http://", adapter)
+    sess.mount("https://", adapter)
+    return sess
+
+
+_PRICECALC_SESSION = _build_pricecalc_session()
+
+
+def _pricecalc_post(path: str, body: dict, *, timeout: int = 30, max_attempts: int = 3):
+    """POST to the Price Calculator API with transparent retry on connection resets.
+
+    A stale pooled socket raises ConnectionResetError(10054). We retry with a
+    fresh connection a few times before surfacing the error to the caller.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
         try:
-            detail = e.response.json().get("detail", detail)
-        except Exception:
-            pass
-        raise HTTPException(status_code=e.response.status_code if e.response else 502, detail=detail)
+            r = _PRICECALC_SESSION.post(f"{PRICECALC_API_URL}{path}", json=body, timeout=timeout)
+            r.raise_for_status()
+            return r.json()
+        except requests.exceptions.ConnectionError as e:
+            last_exc = e
+            if attempt < max_attempts and _is_transient_conn_error(str(e)):
+                time.sleep(0.4 * attempt)
+                continue
+            raise HTTPException(
+                status_code=503,
+                detail=f"Price Calculator API not reachable at {PRICECALC_API_URL}. "
+                       "Start the conexion_internalquery backend first."
+            )
+        except requests.exceptions.Timeout as e:
+            last_exc = e
+            if attempt < max_attempts:
+                time.sleep(0.4 * attempt)
+                continue
+            raise HTTPException(status_code=504, detail="Price Calculator API timed out.")
+        except requests.exceptions.HTTPError as e:
+            detail = str(e)
+            try:
+                detail = e.response.json().get("detail", detail)
+            except Exception:
+                pass
+            status = e.response.status_code if e.response is not None else 502
+            # Upstream may surface a transient Nexar/SAP connection reset as a 5xx
+            # detail — retry those instead of failing the whole search.
+            if attempt < max_attempts and (status >= 500 or _is_transient_conn_error(detail)):
+                time.sleep(0.4 * attempt)
+                continue
+            raise HTTPException(status_code=status, detail=detail)
+    # Exhausted retries on a transient error
+    raise HTTPException(status_code=503, detail=f"Price Calculator API connection failed: {last_exc}")
 
 
 @app.post("/api/pricecalc/ampl")
@@ -1258,6 +1322,8 @@ def _entry_public(e: dict | None) -> dict | None:
         "lastPoDate":    e.get("last_po_date"),
         "computedAt":    e.get("computed_at"),
         "origin":        e.get("origin"),
+        "status":        e.get("status"),
+        "errorDetail":   e.get("error_detail"),
         # Full payload for All Records / Blocked-Deleted / Multi-Component tabs
         "rawRows":       payload.get("raw_rows") or [],
         "ampl":          payload.get("ampl"),
@@ -1297,6 +1363,11 @@ def mpn_best_resolve(req: MpnResolveRequest):
             result[mpn] = _entry_public({**entry, "internal_pn": entry.get("internal_pn")})
         except Exception as exc:  # surface as null; caller can fall back
             result[mpn] = None
+            # Document the failure so it shows up in the admin search & re-query.
+            try:
+                mpn_store.mark_error(mpn, str(exc))
+            except Exception:
+                pass
             logging.getLogger(__name__).info("resolve miss for %s: %s", mpn, exc)
 
     return {"results": result, "from_db": [k for k in keys if k in found], "computed": misses}
@@ -1421,7 +1492,103 @@ def admin_dashboard(authorization: str = Header(default="")):
         "runs":        mpn_store.list_runs(30),
         "recent_errors": mpn_store.list_errors(limit=300),
         "cached_count": mpn_store.count_cached(),
+        "status_counts": mpn_store.status_counts(),
     }
+
+
+# ── Admin: search & re-query specific MPNs ────────────────────────────────────
+
+class AdminRequeryRequest(BaseModel):
+    mpns:        list[str]
+    window_days: int | None = None
+
+class AdminRequeryFailedRequest(BaseModel):
+    statuses:    list[str] | None = None   # default: ['no_price', 'error']
+    window_days: int | None = None
+
+
+@app.get("/api/admin/mpn-search")
+def admin_mpn_search(q: str = "", status: str = "", authorization: str = Header(default="")):
+    """Search cached entries by MPN / internal PN, optionally filtered by status."""
+    _require_admin(authorization)
+    if status:
+        wanted = [s.strip() for s in status.split(",") if s.strip()]
+        rows = mpn_store.list_by_status(wanted)
+        if q:
+            qu = q.strip().upper()
+            rows = [r for r in rows if qu in (r.get("mpn") or "").upper()
+                    or qu in (r.get("internal_pn") or "").upper()]
+    else:
+        rows = mpn_store.search_best(q)
+    return {
+        "results": [_entry_public(r) for r in rows],
+        "status_counts": mpn_store.status_counts(),
+    }
+
+
+def _requery_mpns_sync(mpns: list[str], window_days: int) -> list[dict]:
+    """Re-process a small batch of MPNs in real time (SAP only) and persist them.
+
+    Used by the admin 'Re-query' action so the result is available immediately.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    keys = list(dict.fromkeys((m or "").strip().upper() for m in mpns if m))
+    out: list[dict] = []
+
+    def _one(mpn: str) -> dict:
+        try:
+            entry = batch_job.process_mpn(mpn, window_days)
+            entry["origin"] = "realtime"
+            mpn_store.upsert_best(entry)
+            return _entry_public(mpn_store.get_best(mpn)) or {"mpn": mpn, "status": "no_price"}
+        except Exception as exc:  # noqa: BLE001
+            try:
+                mpn_store.mark_error(mpn, str(exc))
+            except Exception:
+                pass
+            return _entry_public(mpn_store.get_best(mpn)) or {
+                "mpn": mpn, "status": "error", "errorDetail": str(exc)[:1000]
+            }
+
+    if not keys:
+        return out
+    with ThreadPoolExecutor(max_workers=min(6, len(keys))) as ex:
+        out = list(ex.map(_one, keys))
+    return out
+
+
+@app.post("/api/admin/mpn-requery")
+def admin_mpn_requery(req: AdminRequeryRequest, authorization: str = Header(default="")):
+    """Re-query specific MPNs immediately (synchronous, SAP only) and update the cache."""
+    _require_admin(authorization)
+    if not req.mpns:
+        raise HTTPException(status_code=400, detail="No MPNs provided.")
+    if len(req.mpns) > 50:
+        raise HTTPException(status_code=400,
+                            detail="Too many MPNs for a synchronous re-query (max 50). "
+                                   "Use 'Re-query all failed' for large batches.")
+    wd = req.window_days or DBJOB_WINDOW_DAYS
+    results = _requery_mpns_sync(req.mpns, wd)
+    ok = sum(1 for r in results if (r or {}).get("status") == "ok")
+    return {
+        "results": results,
+        "summary": {"requested": len(req.mpns), "ok": ok, "failed": len(results) - ok},
+        "status_counts": mpn_store.status_counts(),
+    }
+
+
+@app.post("/api/admin/mpn-requery-failed")
+def admin_mpn_requery_failed(req: AdminRequeryFailedRequest, authorization: str = Header(default="")):
+    """Re-query every cached entry whose status is no_price/error via the background job."""
+    _require_admin(authorization)
+    statuses = req.statuses or ["no_price", "error"]
+    mpns = mpn_store.mpns_by_status(statuses)
+    if not mpns:
+        return {"started": False, "reason": "No matching entries to re-query.", "count": 0}
+    wd = req.window_days or DBJOB_WINDOW_DAYS
+    res = batch_job.start_job(trigger="requery", mpns=mpns, window_days=wd)
+    return {**res, "count": len(mpns)}
 
 
 # ── SAP batch pricing for MG drilldown modal ─────────────────────────────────

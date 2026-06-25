@@ -73,14 +73,26 @@ def init_db() -> None:
                 computed_at     TEXT,            -- ISO timestamp
                 valid_date      TEXT,            -- YYYY-MM-DD the entry is valid for
                 origin          TEXT,            -- 'job' | 'realtime'
-                payload_json    TEXT             -- raw IQ rows + AMPL blocked/deleted (JSON)
+                payload_json    TEXT,            -- raw IQ rows + AMPL blocked/deleted (JSON)
+                status          TEXT,            -- 'ok' | 'no_price' | 'error'
+                error_detail    TEXT             -- message when status='error'
             )
             """
         )
-        # ── Migration: add payload_json to pre-existing DBs that lack it ──────
+        # ── Migration: add columns to pre-existing DBs that lack them ────────
         cols = {r["name"] for r in cur.execute("PRAGMA table_info(mpn_best)").fetchall()}
         if "payload_json" not in cols:
             cur.execute("ALTER TABLE mpn_best ADD COLUMN payload_json TEXT")
+        if "status" not in cols:
+            cur.execute("ALTER TABLE mpn_best ADD COLUMN status TEXT")
+            # Backfill: rows with a price are 'ok', rows without are 'no_price'
+            cur.execute(
+                "UPDATE mpn_best SET status = CASE "
+                "WHEN best_price_usd IS NOT NULL THEN 'ok' ELSE 'no_price' END "
+                "WHERE status IS NULL"
+            )
+        if "error_detail" not in cols:
+            cur.execute("ALTER TABLE mpn_best ADD COLUMN error_detail TEXT")
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS job_runs (
@@ -222,17 +234,23 @@ def upsert_best(entry: dict) -> None:
         if payload is not None
         else entry.get("payload_json")
     )
+    # Derive a status when the caller didn't set one explicitly:
+    #   • 'ok'        — a usable best price was found
+    #   • 'no_price'  — SAP returned data but no usable price (or no data at all)
+    status = entry.get("status")
+    if not status:
+        status = "ok" if entry.get("best_price_usd") is not None else "no_price"
     with _cursor() as cur:
         cur.execute(
             """
             INSERT INTO mpn_best
                 (mpn, internal_pn, best_source, best_price_usd, std_price_usd,
                  best_supplier, best_plant, best_mpn, last_po_date, window_days,
-                 computed_at, valid_date, origin, payload_json)
+                 computed_at, valid_date, origin, payload_json, status, error_detail)
             VALUES
                 (:mpn, :internal_pn, :best_source, :best_price_usd, :std_price_usd,
                  :best_supplier, :best_plant, :best_mpn, :last_po_date, :window_days,
-                 :computed_at, :valid_date, :origin, :payload_json)
+                 :computed_at, :valid_date, :origin, :payload_json, :status, :error_detail)
             ON CONFLICT(mpn) DO UPDATE SET
                 internal_pn=excluded.internal_pn, best_source=excluded.best_source,
                 best_price_usd=excluded.best_price_usd, std_price_usd=excluded.std_price_usd,
@@ -240,7 +258,8 @@ def upsert_best(entry: dict) -> None:
                 best_mpn=excluded.best_mpn, last_po_date=excluded.last_po_date,
                 window_days=excluded.window_days, computed_at=excluded.computed_at,
                 valid_date=excluded.valid_date, origin=excluded.origin,
-                payload_json=excluded.payload_json
+                payload_json=excluded.payload_json, status=excluded.status,
+                error_detail=excluded.error_detail
             """,
             {
                 "mpn": (entry.get("mpn") or "").strip().upper(),
@@ -257,8 +276,43 @@ def upsert_best(entry: dict) -> None:
                 "valid_date": entry.get("valid_date") or _today(),
                 "origin": entry.get("origin") or "job",
                 "payload_json": payload_json,
+                "status": status,
+                "error_detail": entry.get("error_detail"),
             },
         )
+
+
+def mark_error(mpn: str, detail: str, internal_pn: str | None = None) -> None:
+    """Record a connection/other failure for an MPN in the persistent cache.
+
+    A good cached price ('ok') is never overwritten by an error — a transient
+    connection reset must not destroy a previously-resolved price. New or
+    previously-failed MPNs are stored with status='error' so an admin can find
+    and re-query them later.
+    """
+    key = (mpn or "").strip().upper()
+    if not key:
+        return
+    now = datetime.now().isoformat()
+    with _cursor() as cur:
+        cur.execute("SELECT status FROM mpn_best WHERE mpn = ?", (key,))
+        row = cur.fetchone()
+        if row and row["status"] == "ok":
+            return  # keep the good price
+        cur.execute(
+            """
+            INSERT INTO mpn_best
+                (mpn, internal_pn, best_source, best_price_usd, computed_at,
+                 valid_date, origin, status, error_detail)
+            VALUES (?, ?, 'None', NULL, ?, ?, 'realtime', 'error', ?)
+            ON CONFLICT(mpn) DO UPDATE SET
+                internal_pn=COALESCE(excluded.internal_pn, mpn_best.internal_pn),
+                computed_at=excluded.computed_at, status='error',
+                error_detail=excluded.error_detail
+            """,
+            (key, internal_pn, now, _today(), (detail or "")[:1000]),
+        )
+
 
 
 def get_best(mpn: str) -> dict | None:
@@ -318,6 +372,53 @@ def cached_mpns() -> set[str]:
     with _cursor() as cur:
         cur.execute("SELECT mpn FROM mpn_best")
         return {row["mpn"] for row in cur.fetchall()}
+
+
+def search_best(query: str, limit: int = 200) -> list[dict]:
+    """Search cached entries by MPN or internal PN (case-insensitive substring)."""
+    q = (query or "").strip().upper()
+    with _cursor() as cur:
+        if q:
+            like = f"%{q}%"
+            cur.execute(
+                "SELECT * FROM mpn_best "
+                "WHERE UPPER(mpn) LIKE ? OR UPPER(IFNULL(internal_pn,'')) LIKE ? "
+                "OR UPPER(IFNULL(best_mpn,'')) LIKE ? "
+                "ORDER BY mpn LIMIT ?",
+                (like, like, like, limit),
+            )
+        else:
+            cur.execute("SELECT * FROM mpn_best ORDER BY mpn LIMIT ?", (limit,))
+        return [dict(r) for r in cur.fetchall()]
+
+
+def list_by_status(statuses: Iterable[str], limit: int = 5000) -> list[dict]:
+    """Return entries whose status is in the given set (e.g. no_price/error)."""
+    sset = [s for s in {(s or "").strip() for s in statuses} if s]
+    if not sset:
+        return []
+    placeholders = ",".join("?" * len(sset))
+    with _cursor() as cur:
+        cur.execute(
+            f"SELECT * FROM mpn_best WHERE status IN ({placeholders}) ORDER BY mpn LIMIT ?",
+            (*sset, limit),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def mpns_by_status(statuses: Iterable[str]) -> list[str]:
+    """Return just the MPN keys whose status is in the given set."""
+    return [r["mpn"] for r in list_by_status(statuses)]
+
+
+def status_counts() -> dict[str, int]:
+    """Counts of cached entries grouped by status ('ok'/'no_price'/'error')."""
+    with _cursor() as cur:
+        cur.execute(
+            "SELECT COALESCE(status,'unknown') AS s, COUNT(*) AS c FROM mpn_best GROUP BY s"
+        )
+        return {r["s"]: int(r["c"]) for r in cur.fetchall()}
+
 
 
 # ── job_runs CRUD ─────────────────────────────────────────────────────────────
