@@ -5,7 +5,7 @@
 // "target" plant, and quantifies how much money could be saved if every supplier
 // in the comparison aligned to the cheapest Last PO (USD) price found.
 import { useMemo, useState } from 'react'
-import { X, TrendingDown, ArrowRight, Building2, Trophy } from 'lucide-react'
+import { X, TrendingDown, ArrowRight, Building2, Trophy, CalendarClock } from 'lucide-react'
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -109,22 +109,40 @@ export default function SupplierComparePanel({ mpn, records, demand = [], demand
   })
   // Target plant is optional. Empty = compare within the base plant only.
   const [targetPlant, setTargetPlant] = useState<string>('')
+  // Look-back window (days): the reference (cheapest) price is taken only from
+  // POs within this many days BEFORE the latest PO date in scope. Default 45.
+  const [windowDays, setWindowDays] = useState<number>(45)
 
   const baseGroup   = plantGroups.find(g => g.plant === basePlant) ?? null
   const targetGroup = targetPlant ? plantGroups.find(g => g.plant === targetPlant) ?? null : null
 
   // ── Savings model ──────────────────────────────────────────────────────────
-  // Reference price = cheapest Last PO (USD) across the plant(s) in scope.
-  // For every supplier record in scope, the per-unit overspend is
-  // (its price − reference). Multiplying by its quantity gives the $ that could
-  // be saved if it bought at the reference price instead.
+  // Reference price = cheapest Last PO (USD) within a `windowDays` window from
+  // the latest PO date in scope. For every supplier record, the per-unit
+  // overspend is (its price − reference); × its quantity = potential saving.
   const analysis = useMemo(() => {
     const scopeRows: CompareRecord[] = []
     if (baseGroup) scopeRows.push(...baseGroup.rows)
     if (targetGroup) scopeRows.push(...targetGroup.rows)
     const priced = scopeRows.filter(r => r.lastPoUsd != null && r.lastPoUsd > 0)
 
-    const refRow = priced.reduce<CompareRecord | null>((min, r) => {
+    // Latest PO date across priced records → start of the window.
+    const ts = (s: string) => { const t = new Date(s).getTime(); return isNaN(t) ? null : t }
+    const dated = priced.map(r => ts(r.lastPoDate)).filter((t): t is number => t != null)
+    const maxT = dated.length ? Math.max(...dated) : null
+    const windowStart = maxT != null ? maxT - windowDays * 86_400_000 : null
+
+    // A record is eligible to set the reference price only if it falls inside
+    // the window (or we have no dates at all, in which case all priced count).
+    const inWindow = (r: CompareRecord) => {
+      if (windowStart == null) return true
+      const t = ts(r.lastPoDate)
+      return t == null ? false : t >= windowStart
+    }
+    const eligible = priced.filter(inWindow)
+    const pool = eligible.length ? eligible : priced   // fall back if window empties
+
+    const refRow = pool.reduce<CompareRecord | null>((min, r) => {
       if (min == null) return r
       return (r.lastPoUsd ?? Infinity) < (min.lastPoUsd ?? Infinity) ? r : min
     }, null)
@@ -133,20 +151,21 @@ export default function SupplierComparePanel({ mpn, records, demand = [], demand
     const lines = scopeRows.map(r => {
       const price = r.lastPoUsd
       const isRef = refRow != null && r === refRow
+      const within = inWindow(r)
       const deltaUnit = price != null && refPrice != null ? price - refPrice : null
       const qty = r.quantity ?? null
       // Annualized-style saving estimate based on the recorded PO quantity.
       const saveTotal = deltaUnit != null && deltaUnit > 0 && qty != null ? deltaUnit * qty : (deltaUnit != null && deltaUnit > 0 ? null : 0)
-      return { r, price, isRef, deltaUnit, qty, saveTotal }
+      return { r, price, isRef, within, deltaUnit, qty, saveTotal }
     })
 
     const totalQtySaving = lines.reduce((sum, l) => sum + (l.saveTotal ?? 0), 0)
     const distinctSuppliers = new Set(scopeRows.map(r => r.supplier).filter(Boolean)).size
-    const maxPrice = priced.reduce((mx, r) => Math.max(mx, r.lastPoUsd ?? 0), 0)
+    const maxPrice = pool.reduce((mx, r) => Math.max(mx, r.lastPoUsd ?? 0), 0)
     const unitSpread = refPrice != null && maxPrice > 0 ? maxPrice - refPrice : null
 
-    return { refRow, refPrice, lines, totalQtySaving, distinctSuppliers, unitSpread, maxPrice }
-  }, [baseGroup, targetGroup])
+    return { refRow, refPrice, lines, totalQtySaving, distinctSuppliers, unitSpread, maxPrice, windowStart, maxT }
+  }, [baseGroup, targetGroup, windowDays])
 
   const scopeLabel = targetPlant ? `${basePlant} vs ${targetPlant}` : basePlant
 
@@ -207,13 +226,38 @@ export default function SupplierComparePanel({ mpn, records, demand = [], demand
             </select>
           </label>
 
+          {/* Look-back window (days) */}
+          <label className="flex flex-col gap-1">
+            <span className="text-[10px] font-semibold uppercase tracking-wide text-gray-400 flex items-center gap-1">
+              <CalendarClock className="h-3 w-3" /> Window (days)
+            </span>
+            <div className="flex items-center gap-1">
+              <input
+                type="number" min={1} max={3650}
+                value={windowDays}
+                onChange={e => setWindowDays(Math.max(1, Number(e.target.value) || 1))}
+                className="w-20 px-2.5 py-1.5 text-xs border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-500/30 focus:border-emerald-500 bg-white"
+                title="Cheapest price is taken from POs within this many days before the latest PO date"
+              />
+              <div className="flex gap-0.5">
+                {[30, 45, 90, 365].map(d => (
+                  <button
+                    key={d}
+                    onClick={() => setWindowDays(d)}
+                    className={`px-1.5 py-1 text-[10px] rounded font-semibold transition-colors ${windowDays === d ? 'bg-emerald-600 text-white' : 'bg-gray-100 text-gray-500 hover:bg-gray-200'}`}
+                  >{d}</button>
+                ))}
+              </div>
+            </div>
+          </label>
+
           <span className="ml-auto text-[11px] text-gray-400 mb-1.5">Scope: <span className="font-semibold text-gray-600">{scopeLabel}</span></span>
         </div>
 
         {/* Summary cards */}
         <div className="px-5 py-3 grid grid-cols-2 sm:grid-cols-4 gap-3 border-b border-gray-100 bg-gray-50/50">
           <div className="bg-white rounded-xl border border-gray-200 p-3">
-            <p className="text-[10px] uppercase tracking-wide text-gray-400">Cheapest price</p>
+            <p className="text-[10px] uppercase tracking-wide text-gray-400">Cheapest price <span className="text-emerald-500">· {windowDays}d window</span></p>
             <p className="text-sm font-bold text-emerald-700 font-mono mt-0.5">{fmtUsd6(analysis.refPrice)}</p>
             <p className="text-[10px] text-gray-400 truncate mt-0.5" title={analysis.refRow?.supplier}>
               {analysis.refRow ? `${analysis.refRow.supplier} · ${analysis.refRow.plant}` : '—'}
@@ -284,7 +328,7 @@ export default function SupplierComparePanel({ mpn, records, demand = [], demand
                 {[...analysis.lines]
                   .sort((a, b) => (a.price ?? Infinity) - (b.price ?? Infinity))
                   .map((l, i) => (
-                    <tr key={i} className={l.isRef ? 'bg-emerald-50/70' : (l.saveTotal && l.saveTotal > 0 ? 'bg-amber-50/40 hover:bg-amber-50/70' : 'hover:bg-gray-50')}>
+                    <tr key={i} className={`${l.isRef ? 'bg-emerald-50/70' : (l.saveTotal && l.saveTotal > 0 ? 'bg-amber-50/40 hover:bg-amber-50/70' : 'hover:bg-gray-50')} ${!l.within ? 'opacity-50' : ''}`}>
                       <td className="px-2.5 py-2 font-mono text-gray-700 whitespace-nowrap">{l.r.plant || '—'}</td>
                       <td className="px-2.5 py-2 text-gray-700 max-w-[200px] truncate" title={l.r.supplier}>
                         {l.isRef && <Trophy className="inline h-3 w-3 text-emerald-600 mr-1 -mt-0.5" />}
@@ -308,14 +352,20 @@ export default function SupplierComparePanel({ mpn, records, demand = [], demand
                           </>
                         )
                       })()}
-                      <td className="px-2.5 py-2 text-gray-500 whitespace-nowrap">{l.r.lastPoDate || '—'}</td>
+                      <td className="px-2.5 py-2 text-gray-500 whitespace-nowrap">
+                        {l.r.lastPoDate || '—'}
+                        {!l.within && l.price != null && l.price > 0 && (
+                          <span className="ml-1.5 text-[9px] font-semibold bg-gray-200 text-gray-500 px-1 py-0.5 rounded uppercase tracking-wide" title={`Outside the ${windowDays}-day window — not eligible as the cheapest reference`}>out of window</span>
+                        )}
+                      </td>
                     </tr>
                   ))}
               </tbody>
             </table>
           )}
           <p className="text-[10px] text-gray-400 mt-3 leading-relaxed">
-            <strong>How it works:</strong> the cheapest Last PO (USD) in scope is the reference (🏆). For every other supplier record,
+            <strong>How it works:</strong> the cheapest Last PO (USD) <strong>within the last {windowDays} days from the latest PO date</strong> is the
+            reference (🏆). Rows outside that window are dimmed and can't set the reference. For every other supplier record,
             <em> Δ/unit</em> is its overspend per piece, and <em>Potential Saving</em> = Δ/unit × its PO quantity — the money that could be
             saved by buying that volume at the reference price. Pick a second plant to compare cross-plant suppliers.
           </p>

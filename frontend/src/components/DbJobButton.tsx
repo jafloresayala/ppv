@@ -29,7 +29,6 @@ export default function DbJobButton() {
   const [open, setOpen]       = useState(false)
   const [busy, setBusy]       = useState(false)
   const [adminOpen, setAdminOpen] = useState(false)
-  const [forceOpen, setForceOpen] = useState(false)
   const panelRef = useRef<HTMLDivElement | null>(null)
 
   const refresh = useCallback(async () => {
@@ -58,11 +57,6 @@ export default function DbJobButton() {
   const connErrs  = Number(status?.latest_run?.conn_errors ?? 0)
   const progress  = status && status.total > 0 ? Math.round((status.processed / status.total) * 100) : 0
 
-  const handleRun = async () => {
-    setBusy(true)
-    try { await runDbJob(undefined, false); await refresh() } finally { setBusy(false) }
-  }
-  const handleForceRun = () => setForceOpen(true)
   const handleCancel = async () => {
     setBusy(true)
     try { await cancelDbJob(); await refresh() } finally { setBusy(false) }
@@ -158,29 +152,12 @@ export default function DbJobButton() {
 
           {/* Actions */}
           <div className="flex flex-col gap-2">
-            {running ? (
+            {running && (
               <button
                 onClick={handleCancel} disabled={busy}
                 className="flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-xs font-semibold bg-red-50 text-red-700 border border-red-200 hover:bg-red-100 disabled:opacity-50"
               >
                 <Square size={13} /> Cancel job
-              </button>
-            ) : (
-              <button
-                onClick={handleRun} disabled={busy}
-                className="flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-xs font-semibold bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50"
-              >
-                <Play size={13} /> Run job (pending only)
-              </button>
-            )}
-
-            {!running && (status?.cached_count ?? 0) > 0 && (
-              <button
-                onClick={handleForceRun} disabled={busy}
-                className="flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-xs font-semibold bg-white text-gray-600 border border-gray-200 hover:border-gray-300 disabled:opacity-50"
-              >
-                <RefreshCw size={13} /> Force full re-run
-                <span className="inline-flex items-center gap-0.5 text-[10px] text-gray-400"><ShieldCheck size={11} /> admin</span>
               </button>
             )}
 
@@ -222,72 +199,6 @@ export default function DbJobButton() {
       )}
 
       {adminOpen && <AdminDashboardModal onClose={() => setAdminOpen(false)} />}
-      {forceOpen && <ForceRunModal onClose={() => setForceOpen(false)} onDone={refresh} />}
-    </div>
-  )
-}
-
-// ── Force full re-run (admin-gated cache rebuild) ─────────────────────────────
-
-function ForceRunModal({ onClose, onDone }: { onClose: () => void; onDone: () => void }) {
-  const [user, setUser]   = useState('')
-  const [pass, setPass]   = useState('')
-  const [error, setError] = useState('')
-  const [busy, setBusy]   = useState(false)
-
-  const submit = async () => {
-    if (!user || !pass) return
-    setBusy(true); setError('')
-    try {
-      const { token } = await adminLogin(user, pass)
-      await runDbJob(undefined, true, token)
-      onDone()
-      onClose()
-    } catch {
-      setError('Invalid credentials or the run could not be started.')
-    } finally { setBusy(false) }
-  }
-
-  return (
-    <div className="fixed inset-0 z-[60] bg-black/40 flex items-center justify-center p-4" onMouseDown={onClose}>
-      <div
-        className="bg-white rounded-2xl shadow-2xl w-full max-w-sm overflow-hidden"
-        onMouseDown={e => e.stopPropagation()}
-      >
-        <div className="flex items-center justify-between px-5 py-3 border-b border-gray-200">
-          <div className="flex items-center gap-2">
-            <ShieldCheck size={16} className="text-amber-600" />
-            <h3 className="font-bold text-gray-800 text-sm">Admin — Clear cache & re-run</h3>
-          </div>
-          <button onClick={onClose} className="text-gray-400 hover:text-gray-700"><X size={18} /></button>
-        </div>
-        <div className="p-5">
-          <div className="flex items-start gap-2 mb-4 p-2.5 rounded-lg bg-amber-50 border border-amber-200">
-            <AlertTriangle size={14} className="text-amber-600 mt-0.5 flex-shrink-0" />
-            <p className="text-[11px] text-amber-700">
-              This <strong>wipes the entire persistent cache</strong> and rebuilds every MPN from
-              scratch. The cache does not expire on its own — only an admin can clear it here.
-            </p>
-          </div>
-          <input
-            value={user} onChange={e => setUser(e.target.value)} placeholder="Admin username"
-            className="w-full mb-2 px-3 py-2 text-sm border border-gray-300 rounded-lg focus:outline-none focus:border-blue-400"
-          />
-          <input
-            type="password" value={pass} onChange={e => setPass(e.target.value)} placeholder="Admin password"
-            onKeyDown={e => e.key === 'Enter' && submit()}
-            className="w-full mb-3 px-3 py-2 text-sm border border-gray-300 rounded-lg focus:outline-none focus:border-blue-400"
-          />
-          {error && <p className="text-xs text-red-500 mb-2">{error}</p>}
-          <button
-            onClick={submit} disabled={busy || !user || !pass}
-            className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-sm font-semibold bg-amber-600 text-white hover:bg-amber-700 disabled:opacity-50"
-          >
-            {busy ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
-            {busy ? 'Clearing & re-running…' : 'Clear cache & re-run'}
-          </button>
-        </div>
-      </div>
     </div>
   )
 }
@@ -323,6 +234,52 @@ function AdminDashboardModal({ onClose }: { onClose: () => void }) {
   const [demandConvert, setDemandConvert] = useState<DemandConvertState | null>(null)
   const [demandBusy, setDemandBusy]     = useState(false)
   const [demandNotice, setDemandNotice] = useState('')
+
+  // ── Pre-compute job control (moved here from the dropdown) ──
+  const [jobStatus, setJobStatus]   = useState<DbJobStatus | null>(null)
+  const [jobBusy, setJobBusy]       = useState(false)
+  const [jobNotice, setJobNotice]   = useState('')
+
+  const loadJobStatus = async () => {
+    try { setJobStatus(await getDbJobStatus()) } catch { /* ignore */ }
+  }
+
+  // Poll job status while the admin modal is open (2s while running, 10s idle).
+  useEffect(() => {
+    if (!token) return
+    loadJobStatus()
+    const id = setInterval(loadJobStatus, jobStatus?.running ? 2000 : 10000)
+    return () => clearInterval(id)
+  }, [token, jobStatus?.running])
+
+  const runPending = async () => {
+    if (!token) return
+    setJobBusy(true); setJobNotice('')
+    try {
+      const res = await runDbJob(undefined, false, token)
+      setJobNotice(res.started ? 'Run started — processing pending MPNs.' : (res.reason ?? 'Could not start.'))
+      await loadJobStatus()
+    } catch { setJobNotice('Failed to start the run.') } finally { setJobBusy(false) }
+  }
+
+  const forceRun = async () => {
+    if (!token) return
+    setJobBusy(true); setJobNotice('')
+    try {
+      const res = await runDbJob(undefined, true, token)
+      setJobNotice(res.started
+        ? 'Force full re-run started — building a NEW database in the background. The current one stays live.'
+        : (res.reason ?? 'Could not start.'))
+      await loadJobStatus()
+      loadDatabases(token)
+    } catch { setJobNotice('Failed to start the force re-run.') } finally { setJobBusy(false) }
+  }
+
+  const cancelRun = async () => {
+    if (!token) return
+    setJobBusy(true)
+    try { await cancelDbJob(); await loadJobStatus() } finally { setJobBusy(false) }
+  }
 
   const loadDatabases = async (t: string) => {
     try {
@@ -561,6 +518,71 @@ function AdminDashboardModal({ onClose }: { onClose: () => void }) {
               <div className="rounded-xl bg-amber-50 p-3">
                 <p className="text-[10px] text-amber-500 uppercase">Connection errors</p>
                 <p className="text-2xl font-bold text-amber-700">{data?.metrics.by_type?.connection ?? 0}</p>
+              </div>
+            </div>
+
+            {/* ── Pre-compute job (Run pending / Force full re-run) ── */}
+            <div className="rounded-xl border border-gray-200 p-3 mb-5">
+              <div className="flex items-center justify-between mb-2">
+                <h4 className="text-xs font-bold text-gray-600 uppercase tracking-wide flex items-center gap-1.5">
+                  <Database size={13} /> Pre-compute job
+                </h4>
+                {jobStatus && (
+                  <span className="text-[10px] text-gray-400">
+                    {jobStatus.running ? 'Running…' : `Last run: ${fmtDateTime(jobStatus.last_run_at)}`}
+                  </span>
+                )}
+              </div>
+
+              {jobStatus?.running ? (
+                <div className="mb-2">
+                  <div className="flex justify-between text-[11px] text-gray-500 mb-1">
+                    <span>{jobStatus.processed} / {jobStatus.total}</span>
+                    <span>{jobStatus.success} ok · {jobStatus.errors} err</span>
+                  </div>
+                  <div className="h-2 rounded-full bg-gray-100 overflow-hidden">
+                    <div className="h-full bg-blue-500 transition-all" style={{ width: `${jobStatus.total > 0 ? Math.round((jobStatus.processed / jobStatus.total) * 100) : 0}%` }} />
+                  </div>
+                </div>
+              ) : (
+                <p className="text-[10px] text-gray-400 mb-2">
+                  Run only pending MPNs, or force a full rebuild into a fresh versioned database (the current one stays live — no data loss).
+                </p>
+              )}
+
+              {jobNotice && <p className="text-[11px] text-blue-600 mb-2">{jobNotice}</p>}
+
+              <div className="flex flex-wrap gap-2">
+                {jobStatus?.running ? (
+                  <button
+                    onClick={cancelRun} disabled={jobBusy}
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-red-50 text-red-700 border border-red-200 hover:bg-red-100 disabled:opacity-50"
+                  >
+                    <Square size={12} /> Cancel job
+                  </button>
+                ) : (
+                  <>
+                    <button
+                      onClick={runPending} disabled={jobBusy}
+                      className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50"
+                    >
+                      {jobBusy ? <Loader2 size={12} className="animate-spin" /> : <Play size={12} />} Run job (pending only)
+                    </button>
+                    <button
+                      onClick={forceRun} disabled={jobBusy}
+                      className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-amber-500 text-white hover:bg-amber-600 disabled:opacity-50"
+                      title="Build a fresh database from scratch in the background; current data is preserved until you switch."
+                    >
+                      {jobBusy ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />} Force full re-run
+                    </button>
+                  </>
+                )}
+                <a
+                  href={dbJobExportUrl()}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100"
+                >
+                  <Download size={12} /> Export results
+                </a>
               </div>
             </div>
 
