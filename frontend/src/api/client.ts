@@ -454,6 +454,8 @@ export async function adminRemoveDatabase(token: string, file: string, deleteFil
 export interface DemandRow {
   plantCode:   string
   plantName:   string
+  sourceVendorName?: string
+  mpnKey?:     string
   totalEau:    number | null
   onhandQty:   number | null
   grossDemand: number | null
@@ -461,6 +463,22 @@ export interface DemandRow {
 
 export async function lookupDemand(mpns: string[]): Promise<{ results: Record<string, DemandRow[]>; active_db: string | null }> {
   const { data } = await http.post('/demand/lookup', { mpns }, { timeout: 30_000 })
+  return data
+}
+
+/** Full demand rows (all columns) for a set of MPNs, for the modal's full-data view. */
+export interface DemandFullResponse {
+  columns: string[]
+  results: Record<string, Array<Record<string, string | number | null>>>
+  active_db: string | null
+  last_po_price_col: string
+  po_qty_col: string
+  total_eau_col: string
+  plant_name_col: string
+}
+
+export async function lookupDemandFull(mpns: string[]): Promise<DemandFullResponse> {
+  const { data } = await http.post<DemandFullResponse>('/demand/full', { mpns }, { timeout: 30_000 })
   return data
 }
 
@@ -508,6 +526,24 @@ export async function adminActivateDemand(token: string, file: string): Promise<
 export async function adminRemoveDemand(token: string, file: string, deleteFile = false): Promise<{ active: string | null; databases: DemandDbVersion[] }> {
   const { data } = await http.post('/admin/demand/remove', { file, delete_file: deleteFile }, {
     timeout: 15_000, headers: { Authorization: `Bearer ${token}` },
+  })
+  return data
+}
+
+/** Create a derived table in the active demand DB with best-price & savings. */
+export async function adminCreateDemandBestTable(
+  token: string,
+  mpns?: string[] | null,
+  windowDays?: number | null,
+  tableName?: string | null,
+): Promise<{ table: string | null; rows: number; total_potential_saving: number; per_mpn: Record<string, number | null> }> {
+  const body: Record<string, unknown> = {}
+  if (mpns) body.mpns = mpns
+  if (windowDays != null) body.window_days = windowDays
+  if (tableName) body.table_name = tableName
+  const { data } = await http.post('/admin/demand/create_best_table', body, {
+    timeout: 120_000,
+    headers: { Authorization: `Bearer ${token}` },
   })
   return data
 }

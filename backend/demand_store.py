@@ -45,6 +45,9 @@ PLANT_COL        = "Plant"
 TOTAL_EAU_COL    = "Total EAU"
 ONHAND_COL       = "Onhand Qty"
 GROSS_DEMAND_COL = "Gross Demand"
+LAST_PO_PRICE_COL = "Last PO Item Price"
+PO_QTY_COL        = "Purchase Order Quantity"
+SOURCE_VENDOR_NAME_COL = "Source Vendor Name"
 
 _LOCK = threading.RLock()
 REGISTRY_PATH = os.path.join(DBQUERY_DIR, "demand_registry.json")
@@ -336,9 +339,10 @@ def lookup_demand(mpns: Iterable[str]) -> dict[str, list[dict]]:
     conn.row_factory = sqlite3.Row
     # Discover which of the demand columns actually exist in this DB.
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(demand)").fetchall()}
-    sel_total = q(TOTAL_EAU_COL)    if TOTAL_EAU_COL    in cols else "NULL"
-    sel_onh   = q(ONHAND_COL)       if ONHAND_COL       in cols else "NULL"
-    sel_gross = q(GROSS_DEMAND_COL) if GROSS_DEMAND_COL in cols else "NULL"
+    sel_total  = q(TOTAL_EAU_COL)            if TOTAL_EAU_COL            in cols else "NULL"
+    sel_onh    = q(ONHAND_COL)               if ONHAND_COL               in cols else "NULL"
+    sel_gross  = q(GROSS_DEMAND_COL)         if GROSS_DEMAND_COL         in cols else "NULL"
+    sel_vendor = q(SOURCE_VENDOR_NAME_COL)   if SOURCE_VENDOR_NAME_COL   in cols else "NULL"
 
     out: dict[str, list[dict]] = {}
     try:
@@ -347,7 +351,8 @@ def lookup_demand(mpns: Iterable[str]) -> dict[str, list[dict]]:
             placeholders = ",".join("?" * len(chunk))
             sql = (
                 f"SELECT mpn_key, plant_code, plant_name, "
-                f"{sel_total} AS total_eau, {sel_onh} AS onhand_qty, {sel_gross} AS gross_demand "
+                f"{sel_total} AS total_eau, {sel_onh} AS onhand_qty, {sel_gross} AS gross_demand, "
+                f"{sel_vendor} AS source_vendor_name "
                 f"FROM demand WHERE mpn_key IN ({placeholders})"
             )
             for row in conn.execute(sql, tuple(chunk)).fetchall():
@@ -355,6 +360,8 @@ def lookup_demand(mpns: Iterable[str]) -> dict[str, list[dict]]:
                 out.setdefault(key, []).append({
                     "plantCode": row["plant_code"] or "",
                     "plantName": row["plant_name"] or "",
+                    "sourceVendorName": (row["source_vendor_name"] or "") if "source_vendor_name" in row.keys() else "",
+                    "mpnKey": key,
                     "totalEau": _f(row["total_eau"]),
                     "onhandQty": _f(row["onhand_qty"]),
                     "grossDemand": _f(row["gross_demand"]),
@@ -362,3 +369,166 @@ def lookup_demand(mpns: Iterable[str]) -> dict[str, list[dict]]:
     finally:
         conn.close()
     return out
+
+
+def lookup_full_rows(mpns: Iterable[str]) -> dict:
+    """Return ALL columns of every demand row for the given MPNs.
+
+    Shape: {
+      "columns": [<every column name in the demand table, in order>],
+      "results": { MPN_UPPER: [ {col: value, …}, … ] }
+    }
+    Used by the modal's "Full demand data" view, which renders the entire row
+    plus computed best-price / savings columns on the frontend.
+    """
+    path = active_db_path()
+    if not path or not os.path.exists(path):
+        return {"columns": [], "results": {}}
+    keys = list({(m or "").strip().upper() for m in mpns if m})
+    if not keys:
+        return {"columns": [], "results": {}}
+
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    # Column order as stored; drop the internal helper columns from the display
+    # list (but keep plant_code/plant_name which are useful).
+    all_cols = [r["name"] for r in conn.execute("PRAGMA table_info(demand)").fetchall()]
+    display_cols = [c for c in all_cols if c != "mpn_key"]
+
+    out: dict[str, list[dict]] = {}
+    try:
+        for i in range(0, len(keys), 400):
+            chunk = keys[i : i + 400]
+            placeholders = ",".join("?" * len(chunk))
+            sql = f"SELECT * FROM demand WHERE mpn_key IN ({placeholders})"
+            for row in conn.execute(sql, tuple(chunk)).fetchall():
+                d = dict(row)
+                key = d.get("mpn_key") or ""
+                # Strip the join helper from the row payload.
+                d.pop("mpn_key", None)
+                out.setdefault(key, []).append(d)
+    finally:
+        conn.close()
+    return {"columns": display_cols, "results": out}
+
+
+def create_best_price_table(mpns: Iterable[str] | None = None, window_days: int = 45, table_name: str | None = None) -> dict:
+    """Create a derived table in the active demand .db containing every original
+    demand row (for the provided MPNs or all rows) plus two computed columns:
+      - 'Best Price for this MPN' : cheapest Last PO price across plants within
+         the window_days before the latest PO date for that MPN (fallback to
+         any available price if none in window).
+      - 'Potential Saving' : max(0, (Last PO Item Price - Best Price) * PO Qty)
+
+    Returns a summary dict with created table name, rows written and totals.
+    Requires the active DB to be set.
+    """
+    path = active_db_path()
+    if not path or not os.path.exists(path):
+        raise ValueError("No active demand database available.")
+
+    # Read relevant rows from the demand table.
+    conn = sqlite3.connect(path)
+    try:
+        conn.row_factory = sqlite3.Row
+        if mpns:
+            keys = list({(m or "").strip().upper() for m in mpns if m})
+            if not keys:
+                raise ValueError("No valid MPNs provided.")
+            placeholders = ",".join("?" * len(keys))
+            sql = f"SELECT * FROM demand WHERE mpn_key IN ({placeholders})"
+            rows = [dict(r) for r in conn.execute(sql, tuple(keys)).fetchall()]
+        else:
+            rows = [dict(r) for r in conn.execute("SELECT * FROM demand").fetchall()]
+    finally:
+        conn.close()
+
+    import pandas as _pd
+    if not rows:
+        return {"table": None, "rows": 0, "total_potential_saving": 0.0, "per_mpn": {}}
+
+    df = _pd.DataFrame(rows)
+
+    # Detect date column (common variants)
+    date_col_candidates = ["Last PO Date", "PO Date", "PODate", "last_po_date", "po_date"]
+    date_col = next((c for c in df.columns if c in date_col_candidates), None)
+    if date_col:
+        df['_last_po_dt'] = _pd.to_datetime(df[date_col], errors='coerce')
+    else:
+        df['_last_po_dt'] = _pd.NaT
+
+    # Coerce numeric price and qty columns
+    if LAST_PO_PRICE_COL in df.columns:
+        df['_last_po_price_num'] = _pd.to_numeric(df[LAST_PO_PRICE_COL], errors='coerce')
+    else:
+        df['_last_po_price_num'] = _pd.Series([_pd.NA] * len(df))
+    if PO_QTY_COL in df.columns:
+        df['_po_qty_num'] = _pd.to_numeric(df[PO_QTY_COL], errors='coerce').fillna(0.0)
+    else:
+        df['_po_qty_num'] = 0.0
+
+    per_mpn: dict[str, float | None] = {}
+    total_saving = 0.0
+
+    # Group by mpn_key (if missing, use empty string)
+    df['_mpn_key_local'] = df.get('mpn_key') if 'mpn_key' in df.columns else df.get(MPN_COL).astype(str).str.strip().str.upper()
+    grouped = df.groupby('_mpn_key_local')
+    out_frames = []
+    for mpn_key, group in grouped:
+        if mpn_key is None or str(mpn_key).strip() == "":
+            best_price = None
+        else:
+            # Latest PO date within the group (consider only rows with parseable dates)
+            max_dt = group['_last_po_dt'].dropna()
+            if not max_dt.empty:
+                max_date = max_dt.max()
+                window_start = max_date - _pd.Timedelta(days=int(window_days))
+                candidate = group[(group['_last_po_dt'] >= window_start) & (group['_last_po_dt'] <= max_date) & (group['_last_po_price_num'].notna())]
+                if candidate.empty:
+                    # fallback to any available price in the group
+                    candidate = group[group['_last_po_price_num'].notna()]
+                if candidate.empty:
+                    best_price = None
+                else:
+                    best_price = float(candidate['_last_po_price_num'].min())
+            else:
+                # No dates parseable — fall back to any available price
+                candidate = group[group['_last_po_price_num'].notna()]
+                best_price = float(candidate['_last_po_price_num'].min()) if not candidate.empty else None
+
+        per_mpn[str(mpn_key or "")] = best_price
+        # Assign best price to all rows in this group and compute saving
+        group = group.copy()
+        group['Best Price for this MPN'] = best_price
+        lp = group['_last_po_price_num'].fillna(0.0)
+        pq = group['_po_qty_num'].fillna(0.0)
+        if best_price is None:
+            group['Potential Saving'] = 0.0
+        else:
+            saving = (lp - float(best_price)).clip(lower=0.0) * pq
+            group['Potential Saving'] = saving
+            total_saving += float(saving.sum())
+        out_frames.append(group)
+
+    if out_frames:
+        final = _pd.concat(out_frames, ignore_index=True)
+    else:
+        final = df.copy()
+
+    # Drop internal helper columns we added before persisting
+    for c in ['_last_po_dt', '_last_po_price_num', '_po_qty_num', '_mpn_key_local']:
+        if c in final.columns:
+            final.drop(columns=[c], inplace=True)
+
+    # Choose a table name
+    if not table_name:
+        table_name = f"demand_with_best_{datetime.now():%Y%m%d_%H%M%S}"
+
+    # Persist into the same SQLite file (replace if exists)
+    conn = sqlite3.connect(path)
+    try:
+        final.to_sql(table_name, conn, if_exists='replace', index=False)
+    finally:
+        conn.close()
+
+    return {"table": table_name, "rows": len(final), "total_potential_saving": float(total_saving), "per_mpn": per_mpn}

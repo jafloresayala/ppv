@@ -4,7 +4,10 @@
 // purchase records by plant, lets the user pick a "base" plant and (optionally) a
 // "target" plant, and quantifies how much money could be saved if every supplier
 // in the comparison aligned to the cheapest Last PO (USD) price found.
-import { useMemo, useState } from 'react'
+import { useMemo, useState, useEffect } from 'react'
+import { lookupDemandFull } from '../api/client'
+import DataGrid, { DataGridColumn } from './DataGrid'
+import { adminCreateDemandBestTable } from '../api/client'
 import { X, TrendingDown, ArrowRight, Building2, Trophy, CalendarClock } from 'lucide-react'
 
 // ── Types ──────────────────────────────────────────────────────────────────
@@ -22,13 +25,118 @@ export interface CompareRecord {
   lastPoLocal: number | null
 }
 
+function FullDemandView({ mpn, data, loading, bestPrice, windowDays }: { mpn: string; data: FullDemandData | null; loading: boolean; bestPrice: number | null; windowDays: number }) {
+  const [creating, setCreating] = useState(false)
+  if (loading) return (
+    <div className="p-6 flex items-center justify-center">
+      <div className="text-sm text-gray-500">Loading full demand data…</div>
+    </div>
+  )
+  if (!data || !data.columns.length) return (
+    <div className="p-6 text-sm text-gray-500">No demand rows available in the active demand database.</div>
+  )
+
+  // Use DataGrid for filtering/export. Filter out rows where Total EAU == 0.
+  const rawRows = data.rows || []
+  const totalCol = data.totalEauCol
+  const filteredRows = rawRows.filter(r => {
+    const v = r[totalCol]
+    if (v == null || v === '') return true
+    const n = Number(v)
+    if (isNaN(n)) return true
+    return n !== 0
+  })
+
+  const bp = bestPrice
+  const poCol = data.poQtyCol
+  const lastCol = data.lastPoPriceCol
+
+  // Build DataGrid columns from the DB columns and append Best Price + Potential Saving
+  const cols: DataGridColumn<Record<string, any>>[] = data.columns.map(c => ({
+    key: c,
+    header: c,
+    accessor: (r) => r[c] ?? '',
+    render: (r) => String(r[c] ?? ''),
+    type: 'text',
+    align: 'left',
+    noSort: false,
+  }))
+  cols.push({
+    key: 'best_price_for_mpn', header: 'Best Price for this MPN', accessor: () => (bp == null ? '' : String(bp)), render: () => (bp == null ? '—' : String(bp)), type: 'number', align: 'right',
+  })
+  cols.push({
+    key: 'potential_saving', header: 'Potential Saving', accessor: (r) => {
+      const last = Number(r[lastCol] ?? 0) || 0
+      const qty = Number(r[poCol] ?? 0) || 0
+      const saving = bp != null && last > bp ? (last - bp) * qty : 0
+      return Number(saving.toFixed(2))
+    }, render: (r) => {
+      const val = Number(((bp != null && Number(r[lastCol] ?? 0) > bp) ? ((Number(r[lastCol] ?? 0) - bp) * (Number(r[poCol] ?? 0) || 0)) : 0))
+      return val > 0 ? val.toFixed(2) : '—'
+    }, type: 'number', align: 'right',
+  })
+
+  return (
+    <div className="p-4">
+      <div className="mb-3 flex items-center justify-between">
+        <div className="text-[11px] text-gray-600">Full demand rows from <span className="font-mono">{mpn}</span> · Best price (window {windowDays}d): <span className="font-mono font-bold">{bp != null ? String(bp) : '—'}</span></div>
+        <div>
+          <button
+            disabled={creating}
+            onClick={async () => {
+              const token = window.prompt('Admin token required to create table in demand DB (Paste token)')
+              if (!token) return
+              try {
+                setCreating(true)
+                const res = await adminCreateDemandBestTable(token, [mpn], windowDays, null)
+                window.alert(`Created table ${res.table} with ${res.rows} rows. Total potential saving: ${res.total_potential_saving.toFixed(2)}`)
+              } catch (e: any) {
+                window.alert('Failed to create table: ' + (e?.response?.data?.detail || e?.message || String(e)))
+              } finally {
+                setCreating(false)
+              }
+            }}
+            className="px-2.5 py-1 rounded bg-emerald-600 text-white text-[12px] font-semibold hover:bg-emerald-700 disabled:opacity-60"
+          >
+            {creating ? 'Saving…' : 'Save to .db'}
+          </button>
+        </div>
+      </div>
+
+      <DataGrid
+        rows={filteredRows}
+        columns={cols}
+        rowKey={(r, i) => `${mpn}-${i}`}
+        pageSize={50}
+        exportFileName={`demand_${mpn}_${new Date().toISOString().slice(0,10)}`}
+        exportSheetName={`Demand_${mpn}`}
+        defaultShowFilters={true}
+      />
+    </div>
+  )
+}
+
 /** Per-plant demand for the MPN, pulled from the active dbquery demand DB. */
 export interface DemandRow {
   plantCode: string
   plantName: string
+  /** Source Vendor Name from the dbquery 'Source Vendor Name' column (when present). */
+  sourceVendorName?: string
+  /** MPN key (uppercased Manufacturer Part No.) the row belongs to. */
+  mpnKey?: string
   totalEau: number | null
   onhandQty: number | null
   grossDemand: number | null
+}
+
+/** Full demand rows (every .db column) + the column names used for savings calc. */
+export interface FullDemandData {
+  columns: string[]
+  rows: Array<Record<string, string | number | null>>
+  lastPoPriceCol: string
+  poQtyCol: string
+  totalEauCol: string
+  plantNameCol: string
 }
 
 interface SupplierComparePanelProps {
@@ -38,6 +146,10 @@ interface SupplierComparePanelProps {
   demand?: DemandRow[]
   /** True while demand is being fetched. */
   demandLoading?: boolean
+  /** Full demand rows (all columns) for the "Full demand data" view. */
+  fullDemand?: FullDemandData | null
+  /** True while full demand data is being fetched. */
+  fullDemandLoading?: boolean
   onClose: () => void
 }
 
@@ -77,18 +189,56 @@ function groupByPlant(records: CompareRecord[]): PlantGroup[] {
 
 // ── Component ──────────────────────────────────────────────────────────────
 
-export default function SupplierComparePanel({ mpn, records, demand = [], demandLoading = false, onClose }: SupplierComparePanelProps) {
+export default function SupplierComparePanel({ mpn, records, demand = [], demandLoading = false, fullDemand = null, fullDemandLoading = false, onClose }: SupplierComparePanelProps) {
   const plantGroups = useMemo(() => groupByPlant(records), [records])
 
-  // Map plant name → demand row (Total EAU / Onhand / Gross Demand). The SAP
-  // records' plant is a short name (KEMX); the demand DB exposes plantName too.
-  const demandByPlant = useMemo(() => {
+  // View toggle: savings comparison (default) ↔ full demand data table.
+  const [view, setView] = useState<'savings' | 'full'>('savings')
+
+  // Local fetch for full-demand rows when the view is switched to 'full' and
+  // the parent did not supply `fullDemand` props. This keeps the panel
+  // self-contained and avoids changing the parent component.
+  const [fullLocal, setFullLocal] = useState<FullDemandData | null>(null)
+  const [fullLocalLoading, setFullLocalLoading] = useState(false)
+
+  useEffect(() => {
+    let cancelled = false
+    if (view !== 'full') return
+    // If parent provided fullDemand, no need to fetch.
+    if (fullDemand) { setFullLocal(fullDemand); return }
+    setFullLocal(null)
+    setFullLocalLoading(true)
+    lookupDemandFull([mpn])
+      .then(res => { if (cancelled) return; setFullLocal({ columns: res.columns, rows: Object.values(res.results).flat(), lastPoPriceCol: res.last_po_price_col, poQtyCol: res.po_qty_col, totalEauCol: res.total_eau_col, plantNameCol: res.plant_name_col }) })
+      .catch(() => { if (!cancelled) setFullLocal(null) })
+      .finally(() => { if (!cancelled) setFullLocalLoading(false) })
+    return () => { cancelled = true }
+  }, [view, mpn, fullDemand])
+
+  // Map "PLANT|SOURCE_VENDOR_NAME" → demand row. The dbquery 'Source Vendor
+  // Name' column identifies the supplier, and the demand is plant-specific, so
+  // we key by BOTH plant and vendor to avoid attaching another plant's demand.
+  const demandByPlantVendor = useMemo(() => {
     const m = new Map<string, DemandRow>()
     for (const d of demand) {
-      if (d.plantName) m.set(d.plantName.toUpperCase(), d)
+      const plantKey = (d.plantName || '').trim().toUpperCase()
+      const vendorKey = (d.sourceVendorName || '').trim().toUpperCase()
+      if (!plantKey || !vendorKey) continue
+      m.set(`${plantKey}|${vendorKey}`, d)
     }
     return m
   }, [demand])
+
+  /** Resolve the demand row for a supplier record by matching BOTH the plant
+   * and the supplier (Source Vendor Name == Supplier). No cross-plant fallback:
+   * even if the same MPN/vendor exists in another plant, that demand belongs to
+   * a different plant and must NOT be shown here. Returns undefined on no match. */
+  const demandForRecord = (r: CompareRecord): DemandRow | undefined => {
+    const plantKey = (r.plant || '').trim().toUpperCase()
+    const supplierKey = (r.supplier || '').trim().toUpperCase()
+    if (!plantKey || !supplierKey) return undefined
+    return demandByPlantVendor.get(`${plantKey}|${supplierKey}`)
+  }
 
   // Overall MPN demand totals (summed across all plants in the demand file).
   const demandTotals = useMemo(() => {
@@ -172,7 +322,7 @@ export default function SupplierComparePanel({ mpn, records, demand = [], demand
   return (
     <div className="fixed inset-0 z-[120] flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm" onClick={onClose}>
       <div
-        className="bg-white rounded-2xl shadow-2xl w-full max-w-4xl max-h-[88vh] flex flex-col overflow-hidden"
+        className={`bg-white rounded-2xl shadow-2xl w-full ${view === 'full' ? 'max-w-7xl' : 'max-w-4xl'} max-h-[88vh] flex flex-col overflow-hidden`}
         onClick={e => e.stopPropagation()}
       >
         {/* Header */}
@@ -186,11 +336,29 @@ export default function SupplierComparePanel({ mpn, records, demand = [], demand
               <p className="text-[11px] text-gray-500 font-mono">{mpn}</p>
             </div>
           </div>
-          <button onClick={onClose} className="p-1 rounded-lg text-gray-400 hover:text-gray-700 hover:bg-white/60 transition-colors">
-            <X className="h-4 w-4" />
-          </button>
+          <div className="flex items-center gap-3">
+            {/* View toggle */}
+            <div className="flex gap-0.5 bg-white/70 rounded-lg p-0.5 border border-gray-200">
+              <button
+                onClick={() => setView('savings')}
+                className={`px-2.5 py-1 text-[11px] font-semibold rounded-md transition-colors ${view === 'savings' ? 'bg-blue-600 text-white shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+              >
+                Savings
+              </button>
+              <button
+                onClick={() => setView('full')}
+                className={`px-2.5 py-1 text-[11px] font-semibold rounded-md transition-colors ${view === 'full' ? 'bg-indigo-600 text-white shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+              >
+                Full demand data
+              </button>
+            </div>
+            <button onClick={onClose} className="p-1 rounded-lg text-gray-400 hover:text-gray-700 hover:bg-white/60 transition-colors">
+              <X className="h-4 w-4" />
+            </button>
+          </div>
         </div>
 
+        {view === 'savings' && <>
         {/* Plant selectors */}
         <div className="px-5 py-3 border-b border-gray-100 flex flex-wrap items-end gap-4">
           <label className="flex flex-col gap-1">
@@ -343,12 +511,15 @@ export default function SupplierComparePanel({ mpn, records, demand = [], demand
                         {l.saveTotal && l.saveTotal > 0 ? fmtUsd2(l.saveTotal) : (l.saveTotal == null ? 'n/a (no qty)' : '—')}
                       </td>
                       {(() => {
-                        const d = demandByPlant.get((l.r.plant || '').toUpperCase())
+                        const d = demandForRecord(l.r)
+                        const matchedBy = d
+                          ? `Matched by plant + Source Vendor Name: ${d.plantName} · ${d.sourceVendorName}`
+                          : `No demand for this supplier in plant ${l.r.plant || '—'} (Source Vendor Name must match the Supplier)`
                         return (
                           <>
-                            <td className="px-2.5 py-2 text-right font-mono text-indigo-700 whitespace-nowrap bg-indigo-50/30">{d?.totalEau != null ? d.totalEau.toLocaleString() : '—'}</td>
-                            <td className="px-2.5 py-2 text-right font-mono text-indigo-700 whitespace-nowrap bg-indigo-50/30">{d?.onhandQty != null ? d.onhandQty.toLocaleString() : '—'}</td>
-                            <td className="px-2.5 py-2 text-right font-mono text-indigo-700 whitespace-nowrap bg-indigo-50/30">{d?.grossDemand != null ? d.grossDemand.toLocaleString() : '—'}</td>
+                            <td className="px-2.5 py-2 text-right font-mono text-indigo-700 whitespace-nowrap bg-indigo-50/30" title={matchedBy}>{d?.totalEau != null ? d.totalEau.toLocaleString() : '—'}</td>
+                            <td className="px-2.5 py-2 text-right font-mono text-indigo-700 whitespace-nowrap bg-indigo-50/30" title={matchedBy}>{d?.onhandQty != null ? d.onhandQty.toLocaleString() : '—'}</td>
+                            <td className="px-2.5 py-2 text-right font-mono text-indigo-700 whitespace-nowrap bg-indigo-50/30" title={matchedBy}>{d?.grossDemand != null ? d.grossDemand.toLocaleString() : '—'}</td>
                           </>
                         )
                       })()}
@@ -370,6 +541,17 @@ export default function SupplierComparePanel({ mpn, records, demand = [], demand
             saved by buying that volume at the reference price. Pick a second plant to compare cross-plant suppliers.
           </p>
         </div>
+        </>}
+
+        {view === 'full' && (
+          <FullDemandView
+            mpn={mpn}
+            data={fullDemand ?? fullLocal}
+            loading={fullDemandLoading || fullLocalLoading}
+            bestPrice={analysis.refPrice}
+            windowDays={windowDays}
+          />
+        )}
       </div>
     </div>
   )

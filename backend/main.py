@@ -1852,6 +1852,12 @@ class DemandRemoveRequest(BaseModel):
     delete_file: bool = False
 
 
+class DemandCreateBestTableRequest(BaseModel):
+    mpns: list[str] | None = None
+    window_days: int | None = None
+    table_name: str | None = None
+
+
 @app.post("/api/demand/lookup")
 def demand_lookup(req: DemandLookupRequest):
     """Per-MPN demand (Total EAU / Onhand Qty / Gross Demand) per plant from the
@@ -1859,6 +1865,22 @@ def demand_lookup(req: DemandLookupRequest):
     return {
         "results": demand_store.lookup_demand(req.mpns),
         "active_db": demand_store.active_db_file(),
+    }
+
+
+@app.post("/api/demand/full")
+def demand_full(req: DemandLookupRequest):
+    """Full demand rows (ALL columns) for the given MPNs from the active demand
+    DB. Public — used by the modal's 'Full demand data' table view."""
+    data = demand_store.lookup_full_rows(req.mpns)
+    return {
+        "columns": data["columns"],
+        "results": data["results"],
+        "active_db": demand_store.active_db_file(),
+        "last_po_price_col": demand_store.LAST_PO_PRICE_COL,
+        "po_qty_col": demand_store.PO_QTY_COL,
+        "total_eau_col": demand_store.TOTAL_EAU_COL,
+        "plant_name_col": "plant_name",
     }
 
 
@@ -1895,6 +1917,23 @@ def admin_demand_remove(req: DemandRemoveRequest, authorization: str = Header(de
     _require_admin(authorization)
     demand_store.remove_database(req.file, delete_file=req.delete_file)
     return {"active": demand_store.active_db_file(), "databases": demand_store.list_databases()}
+
+
+@app.post("/api/admin/demand/create_best_table")
+def admin_demand_create_best_table(req: DemandCreateBestTableRequest, authorization: str = Header(default="")):
+    """Create and persist a derived table in the active demand DB containing
+    every original row plus 'Best Price for this MPN' and 'Potential Saving'.
+    Requires admin auth.
+    """
+    _require_admin(authorization)
+    window = req.window_days or DBJOB_WINDOW_DAYS
+    try:
+        res = demand_store.create_best_price_table(mpns=req.mpns, window_days=window, table_name=req.table_name)
+        return res
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 # ── SAP batch pricing for MG drilldown modal ─────────────────────────────────
