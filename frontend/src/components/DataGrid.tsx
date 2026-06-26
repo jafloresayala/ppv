@@ -295,7 +295,7 @@ export default function DataGrid<T>({
       {/* ── Table ── */}
       <div className="overflow-x-auto rounded-xl border border-gray-200 shadow-sm">
         <table className="min-w-max w-full text-xs border-collapse">
-          <thead className="bg-gray-50 text-[10px] uppercase tracking-wide text-gray-500 sticky top-0 z-10">
+          <thead className="bg-gray-50 text-[10px] uppercase tracking-wide text-gray-500 sticky top-0 z-[1]">
             <tr>
               {columns.map(col => {
                 const isSorted = sortKey === col.key

@@ -156,7 +156,7 @@ export default function TabTrend() {
             </p>
             <div className="overflow-auto max-h-[480px]">
               <table className="tbl">
-                <thead className="sticky top-0 z-10 bg-white shadow-[0_1px_0_0_#e2e8f0]">
+                <thead className="sticky top-0 z-[1] bg-white shadow-[0_1px_0_0_#e2e8f0]">
                   <tr>
                     <th>{data.granularity === 'daily' ? 'Date' : 'Month'}</th>
                     {Object.keys(data.by_plant!).sort().map(p => (
@@ -279,7 +279,7 @@ export default function TabTrend() {
                 <div className="flex items-center justify-center h-40 text-slate-400 text-sm italic">No records found</div>
               ) : (
                 <table className="tbl w-full text-xs">
-                  <thead className="sticky top-0 bg-white z-10 shadow-[0_1px_0_0_#e2e8f0]">
+                  <thead className="sticky top-0 bg-white z-[1] shadow-[0_1px_0_0_#e2e8f0]">
                     <tr>
                       <th className="text-left">Date</th>
                       <th className="text-left">Material</th>

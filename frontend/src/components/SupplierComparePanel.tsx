@@ -22,9 +22,22 @@ export interface CompareRecord {
   lastPoLocal: number | null
 }
 
+/** Per-plant demand for the MPN, pulled from the active dbquery demand DB. */
+export interface DemandRow {
+  plantCode: string
+  plantName: string
+  totalEau: number | null
+  onhandQty: number | null
+  grossDemand: number | null
+}
+
 interface SupplierComparePanelProps {
   mpn: string
   records: CompareRecord[]
+  /** Per-plant demand rows for this MPN (keyed visually by plant name). */
+  demand?: DemandRow[]
+  /** True while demand is being fetched. */
+  demandLoading?: boolean
   onClose: () => void
 }
 
@@ -64,8 +77,30 @@ function groupByPlant(records: CompareRecord[]): PlantGroup[] {
 
 // ── Component ──────────────────────────────────────────────────────────────
 
-export default function SupplierComparePanel({ mpn, records, onClose }: SupplierComparePanelProps) {
+export default function SupplierComparePanel({ mpn, records, demand = [], demandLoading = false, onClose }: SupplierComparePanelProps) {
   const plantGroups = useMemo(() => groupByPlant(records), [records])
+
+  // Map plant name → demand row (Total EAU / Onhand / Gross Demand). The SAP
+  // records' plant is a short name (KEMX); the demand DB exposes plantName too.
+  const demandByPlant = useMemo(() => {
+    const m = new Map<string, DemandRow>()
+    for (const d of demand) {
+      if (d.plantName) m.set(d.plantName.toUpperCase(), d)
+    }
+    return m
+  }, [demand])
+
+  // Overall MPN demand totals (summed across all plants in the demand file).
+  const demandTotals = useMemo(() => {
+    let eau = 0, onhand = 0, gross = 0
+    let any = false
+    for (const d of demand) {
+      if (d.totalEau != null) { eau += d.totalEau; any = true }
+      if (d.onhandQty != null) { onhand += d.onhandQty; any = true }
+      if (d.grossDemand != null) { gross += d.grossDemand; any = true }
+    }
+    return any ? { eau, onhand, gross } : null
+  }, [demand])
 
   // Default base plant = the one with the most records (likely the main buyer).
   const [basePlant, setBasePlant] = useState<string>(() => {
@@ -201,13 +236,37 @@ export default function SupplierComparePanel({ mpn, records, onClose }: Supplier
           </div>
         </div>
 
+        {/* Demand band (from the active dbquery demand DB) */}
+        <div className="px-5 py-2.5 border-b border-gray-100 bg-indigo-50/40">
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="text-[10px] font-bold uppercase tracking-wide text-indigo-500">MPN Demand</span>
+            {demandLoading ? (
+              <span className="inline-flex items-center gap-1 text-[11px] text-indigo-500">
+                <svg className="animate-spin h-3 w-3" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" /></svg>
+                loading…
+              </span>
+            ) : demandTotals ? (
+              <>
+                <span className="text-[11px] text-gray-600">Total EAU <span className="font-bold text-indigo-700 font-mono">{demandTotals.eau.toLocaleString()}</span></span>
+                <span className="text-gray-300">·</span>
+                <span className="text-[11px] text-gray-600">Onhand Qty <span className="font-bold text-indigo-700 font-mono">{demandTotals.onhand.toLocaleString()}</span></span>
+                <span className="text-gray-300">·</span>
+                <span className="text-[11px] text-gray-600">Gross Demand <span className="font-bold text-indigo-700 font-mono">{demandTotals.gross.toLocaleString()}</span></span>
+                <span className="ml-1 text-[10px] text-gray-400">(sum across {demand.length} plant{demand.length !== 1 ? 's' : ''})</span>
+              </>
+            ) : (
+              <span className="text-[11px] text-gray-400 italic">No demand data for this MPN in the active demand database.</span>
+            )}
+          </div>
+        </div>
+
         {/* Comparison table */}
         <div className="flex-1 overflow-auto px-5 py-3">
           {analysis.lines.length === 0 ? (
             <p className="text-sm text-gray-400 italic text-center py-8">No priced records available for the selected plant(s).</p>
           ) : (
             <table className="min-w-full text-xs border-collapse">
-              <thead className="bg-gray-50 text-[10px] uppercase tracking-wide text-gray-500 sticky top-0">
+              <thead className="bg-gray-50 text-[10px] uppercase tracking-wide text-gray-500 sticky top-0 z-[1]">
                 <tr>
                   <th className="px-2.5 py-2 text-left whitespace-nowrap border-b border-gray-200">Plant</th>
                   <th className="px-2.5 py-2 text-left whitespace-nowrap border-b border-gray-200">Supplier</th>
@@ -215,6 +274,9 @@ export default function SupplierComparePanel({ mpn, records, onClose }: Supplier
                   <th className="px-2.5 py-2 text-right whitespace-nowrap border-b border-gray-200">Δ / unit</th>
                   <th className="px-2.5 py-2 text-right whitespace-nowrap border-b border-gray-200">PO Qty</th>
                   <th className="px-2.5 py-2 text-right whitespace-nowrap border-b border-gray-200">Potential Saving</th>
+                  <th className="px-2.5 py-2 text-right whitespace-nowrap border-b border-indigo-200 bg-indigo-50/60 text-indigo-600">Total EAU</th>
+                  <th className="px-2.5 py-2 text-right whitespace-nowrap border-b border-indigo-200 bg-indigo-50/60 text-indigo-600">Onhand Qty</th>
+                  <th className="px-2.5 py-2 text-right whitespace-nowrap border-b border-indigo-200 bg-indigo-50/60 text-indigo-600">Gross Demand</th>
                   <th className="px-2.5 py-2 text-left whitespace-nowrap border-b border-gray-200">Date</th>
                 </tr>
               </thead>
@@ -236,6 +298,16 @@ export default function SupplierComparePanel({ mpn, records, onClose }: Supplier
                       <td className={`px-2.5 py-2 text-right font-mono font-semibold whitespace-nowrap ${l.saveTotal && l.saveTotal > 0 ? 'text-emerald-700' : 'text-gray-300'}`}>
                         {l.saveTotal && l.saveTotal > 0 ? fmtUsd2(l.saveTotal) : (l.saveTotal == null ? 'n/a (no qty)' : '—')}
                       </td>
+                      {(() => {
+                        const d = demandByPlant.get((l.r.plant || '').toUpperCase())
+                        return (
+                          <>
+                            <td className="px-2.5 py-2 text-right font-mono text-indigo-700 whitespace-nowrap bg-indigo-50/30">{d?.totalEau != null ? d.totalEau.toLocaleString() : '—'}</td>
+                            <td className="px-2.5 py-2 text-right font-mono text-indigo-700 whitespace-nowrap bg-indigo-50/30">{d?.onhandQty != null ? d.onhandQty.toLocaleString() : '—'}</td>
+                            <td className="px-2.5 py-2 text-right font-mono text-indigo-700 whitespace-nowrap bg-indigo-50/30">{d?.grossDemand != null ? d.grossDemand.toLocaleString() : '—'}</td>
+                          </>
+                        )
+                      })()}
                       <td className="px-2.5 py-2 text-gray-500 whitespace-nowrap">{l.r.lastPoDate || '—'}</td>
                     </tr>
                   ))}

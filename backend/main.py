@@ -6,6 +6,7 @@ import asyncio
 import calendar
 import json as _json
 import logging
+import os
 import time
 import uuid
 import requests
@@ -28,6 +29,8 @@ from analytics import compute_all_analytics, compute_forecast, search_material, 
 import cache
 import mpn_store
 import batch_job
+import db_registry
+import demand_store
 from sourcing import router as sourcing_router
 
 app = FastAPI(title="PPV API", version="2.0.0")
@@ -1360,6 +1363,14 @@ def mpn_best_resolve(req: MpnResolveRequest):
             entry = batch_job.process_mpn(mpn, req.window_days)
             entry["origin"] = "realtime"
             mpn_store.upsert_best(entry)
+            # Cache the separate Multi-MPN / Multi-Component bests for Deep Analysis.
+            _deep = entry.get("deep")
+            if _deep:
+                _deep["origin"] = "realtime"
+                try:
+                    mpn_store.upsert_deep(_deep)
+                except Exception:
+                    pass
             result[mpn] = _entry_public({**entry, "internal_pn": entry.get("internal_pn")})
         except Exception as exc:  # surface as null; caller can fall back
             result[mpn] = None
@@ -1371,6 +1382,124 @@ def mpn_best_resolve(req: MpnResolveRequest):
             logging.getLogger(__name__).info("resolve miss for %s: %s", mpn, exc)
 
     return {"results": result, "from_db": [k for k in keys if k in found], "computed": misses}
+
+
+# ── Deep Analysis cache (Multi-MPN vs Multi-Component, per Internal PN) ────────
+
+class MpnDeepResolveRequest(BaseModel):
+    internal_pns: list[str]
+    window_days:  int = DBJOB_WINDOW_DAYS
+
+
+def _deep_public(e: dict | None) -> dict | None:
+    """Shape an mpn_deep row for the frontend Deep Analysis table."""
+    if not e:
+        return None
+    return {
+        "internalPN":      e.get("internal_pn"),
+        "status":          "done",
+        # Multi-MPN best
+        "mpnBestPriceUsd": e.get("mpn_price_usd"),
+        "mpnBestStdUsd":   e.get("mpn_std_usd"),
+        "mpnBestSupplier": e.get("mpn_supplier"),
+        "mpnBestPlant":    e.get("mpn_plant"),
+        "mpnBestMpn":      e.get("mpn_best_mpn"),
+        "mpnLastPoDate":   e.get("mpn_last_po_date"),
+        # Multi-Component best
+        "mcBestPriceUsd":  e.get("mc_price_usd"),
+        "mcStdPriceUsd":   e.get("mc_std_usd"),
+        "mcBestSupplier":  e.get("mc_supplier"),
+        "mcBestPlant":     e.get("mc_plant"),
+        "mcBestMpn":       e.get("mc_best_mpn"),
+        "mcBestInternalPN": e.get("mc_internal_pn") or e.get("internal_pn"),
+        "mcLastPoDate":    e.get("mc_last_po_date"),
+        "origin":          e.get("origin"),
+        "computedAt":      e.get("computed_at"),
+        "fromCache":       True,
+    }
+
+
+def _compute_deep_for_internal(internal_pn: str, window_days: int) -> dict:
+    """Compute the best Multi-MPN and Multi-Component rows for one Internal PN.
+
+    Mirrors the frontend Deep Analysis flow (AMPL → internal-query) plus the
+    direct-MPN side, then persists into mpn_deep for instant future lookups.
+    """
+    ip = (internal_pn or "").strip().upper()
+    window_ms = window_days * 86_400_000
+
+    # Multi-Component side: AMPL → query all active/blocked/deleted MPNs.
+    ampl = batch_job._post("/ampl-by-material", {"internal_part_number": ip})
+    query_mpns = ampl.get("mpns_list") or []
+    if not query_mpns:
+        query_mpns = list({
+            i.get("MfgPartNumber")
+            for i in (ampl.get("blocked") or []) + (ampl.get("deleted") or [])
+            if i.get("MfgPartNumber")
+        })
+    mc_rows = []
+    best_mc = None
+    if query_mpns:
+        iq = batch_job._post("/internal-query", {"mpns": query_mpns})
+        mc_rows = iq.get("data") or []
+        best_mc = mpn_store.compute_best_row(mc_rows, window_ms)
+
+    # Multi-MPN side: use the cheapest active MPN's direct search as the
+    # representative. We reuse the MC rows' best MPN to keep it light; the
+    # batch job stores a richer split, this realtime path is a good-enough miss.
+    best_mpn_row = best_mc  # for a pure-internal-PN request these coincide
+    p_mpn = mpn_store.resolve_last_po_price(best_mpn_row) if best_mpn_row else None
+    p_mc  = mpn_store.resolve_last_po_price(best_mc) if best_mc else None
+
+    deep = {
+        "internal_pn": ip,
+        "mpn": best_mpn_row.get("mpn") if best_mpn_row else None,
+        "window_days": window_days,
+        "origin": "realtime",
+        "status": "ok" if (p_mpn is not None or p_mc is not None) else "no_price",
+        "mpn_price_usd":    p_mpn,
+        "mpn_std_usd":      mpn_store._f(best_mpn_row.get("standardPriceUsd")) if best_mpn_row else None,
+        "mpn_supplier":     (best_mpn_row.get("supplierName") or best_mpn_row.get("englishName")) if best_mpn_row else None,
+        "mpn_plant":        best_mpn_row.get("siteName") if best_mpn_row else None,
+        "mpn_best_mpn":     best_mpn_row.get("mpn") if best_mpn_row else None,
+        "mpn_last_po_date": best_mpn_row.get("lastPoDate") if best_mpn_row else None,
+        "mc_price_usd":     p_mc,
+        "mc_std_usd":       mpn_store._f(best_mc.get("standardPriceUsd")) if best_mc else None,
+        "mc_supplier":      (best_mc.get("supplierName") or best_mc.get("englishName")) if best_mc else None,
+        "mc_plant":         best_mc.get("siteName") if best_mc else None,
+        "mc_best_mpn":      best_mc.get("mpn") if best_mc else None,
+        "mc_internal_pn":   best_mc.get("internalPN") if best_mc else ip,
+        "mc_last_po_date":  best_mc.get("lastPoDate") if best_mc else None,
+    }
+    mpn_store.upsert_deep(deep)
+    return deep
+
+
+@app.post("/api/mpn-deep/resolve")
+def mpn_deep_resolve(req: MpnDeepResolveRequest):
+    """DB-first Deep Analysis resolver.
+
+    Returns cached deep rows instantly for Internal PNs already computed, and
+    computes any misses in real time (SAP), storing them for next time.
+    """
+    keys = list(dict.fromkeys((p or "").strip().upper() for p in req.internal_pns if p))
+    found = mpn_store.get_deep_many(keys)
+    result: dict[str, dict | None] = {k: _deep_public(found[k]) for k in keys if k in found}
+
+    misses = [k for k in keys if k not in found]
+    for ip in misses:
+        try:
+            deep = _compute_deep_for_internal(ip, req.window_days)
+            result[ip] = _deep_public({**deep, "internal_pn": ip})
+        except Exception as exc:  # surface as null; frontend can fall back
+            result[ip] = None
+            logging.getLogger(__name__).info("deep resolve miss for %s: %s", ip, exc)
+
+    return {
+        "results": result,
+        "from_db": [k for k in keys if k in found],
+        "computed": misses,
+    }
 
 
 @app.post("/api/dbjob/run")
@@ -1487,12 +1616,24 @@ def admin_login(req: AdminLoginRequest):
 @app.get("/api/admin/dashboard")
 def admin_dashboard(authorization: str = Header(default="")):
     _require_admin(authorization)
+    # Hide errors that have since been resolved: an MPN is considered fixed when
+    # its current cached status is 'ok'. We drop those from the recent-errors list
+    # so only outstanding issues are shown.
+    raw_errors = mpn_store.list_errors(limit=600)
+    resolved = mpn_store.mpns_by_status(["ok"])
+    resolved_set = {(m or "").strip().upper() for m in resolved}
+    recent_errors = [
+        e for e in raw_errors
+        if (str(e.get("mpn") or "").strip().upper()) not in resolved_set
+    ][:300]
     return {
         "metrics":     mpn_store.error_metrics(),
         "runs":        mpn_store.list_runs(30),
-        "recent_errors": mpn_store.list_errors(limit=300),
+        "recent_errors": recent_errors,
         "cached_count": mpn_store.count_cached(),
+        "deep_count":   mpn_store.count_deep(),
         "status_counts": mpn_store.status_counts(),
+        "active_db":    db_registry.active_db_file(),
     }
 
 
@@ -1507,17 +1648,60 @@ class AdminRequeryFailedRequest(BaseModel):
     window_days: int | None = None
 
 
+def _split_terms(q: str) -> list[str]:
+    """Split a search box value into individual terms.
+
+    Accepts a single term or a pasted list separated by newlines, commas,
+    semicolons, tabs or whitespace. De-duplicates (case-insensitive) and
+    preserves order.
+    """
+    import re
+    raw = re.split(r"[\s,;]+", (q or "").strip())
+    seen: set[str] = set()
+    out: list[str] = []
+    for t in raw:
+        t = t.strip()
+        if not t:
+            continue
+        key = t.upper()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(t)
+    return out
+
+
 @app.get("/api/admin/mpn-search")
 def admin_mpn_search(q: str = "", status: str = "", authorization: str = Header(default="")):
-    """Search cached entries by MPN / internal PN, optionally filtered by status."""
+    """Search cached entries by MPN / internal PN, optionally filtered by status.
+
+    The query may contain a single term or a pasted list of MPNs / Internal PNs
+    separated by newlines, commas, semicolons or spaces — every term is matched.
+    """
     _require_admin(authorization)
+    terms = _split_terms(q)
     if status:
         wanted = [s.strip() for s in status.split(",") if s.strip()]
         rows = mpn_store.list_by_status(wanted)
-        if q:
-            qu = q.strip().upper()
-            rows = [r for r in rows if qu in (r.get("mpn") or "").upper()
-                    or qu in (r.get("internal_pn") or "").upper()]
+        if terms:
+            tu = [t.upper() for t in terms]
+            rows = [r for r in rows if any(
+                t in (r.get("mpn") or "").upper()
+                or t in (r.get("internal_pn") or "").upper()
+                or t in (r.get("best_mpn") or "").upper()
+                for t in tu
+            )]
+    elif len(terms) > 1:
+        # Multi-term paste: union of matches across all terms, de-duplicated.
+        seen: set[str] = set()
+        rows = []
+        for t in terms:
+            for r in mpn_store.search_best(t):
+                key = (r.get("mpn") or "")
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append(r)
     else:
         rows = mpn_store.search_best(q)
     return {
@@ -1541,6 +1725,13 @@ def _requery_mpns_sync(mpns: list[str], window_days: int) -> list[dict]:
             entry = batch_job.process_mpn(mpn, window_days)
             entry["origin"] = "realtime"
             mpn_store.upsert_best(entry)
+            _deep = entry.get("deep")
+            if _deep:
+                _deep["origin"] = "realtime"
+                try:
+                    mpn_store.upsert_deep(_deep)
+                except Exception:
+                    pass
             return _entry_public(mpn_store.get_best(mpn)) or {"mpn": mpn, "status": "no_price"}
         except Exception as exc:  # noqa: BLE001
             try:
@@ -1589,6 +1780,121 @@ def admin_mpn_requery_failed(req: AdminRequeryFailedRequest, authorization: str 
     wd = req.window_days or DBJOB_WINDOW_DAYS
     res = batch_job.start_job(trigger="requery", mpns=mpns, window_days=wd)
     return {**res, "count": len(mpns)}
+
+
+# ── Admin: local database version control ─────────────────────────────────────
+
+class AdminDbActivateRequest(BaseModel):
+    file: str
+
+class AdminDbRemoveRequest(BaseModel):
+    file: str
+    delete_file: bool = False
+
+
+@app.get("/api/admin/databases")
+def admin_databases(authorization: str = Header(default="")):
+    """List all local cache database versions and which one is active."""
+    _require_admin(authorization)
+    return {
+        "active": db_registry.active_db_file(),
+        "databases": db_registry.list_databases(),
+        "job_running": batch_job.is_running(),
+    }
+
+
+@app.post("/api/admin/databases/activate")
+def admin_databases_activate(req: AdminDbActivateRequest, authorization: str = Header(default="")):
+    """Hot-swap the active database (no restart). Old DB data is preserved."""
+    _require_admin(authorization)
+    if batch_job.is_running():
+        raise HTTPException(status_code=409,
+                            detail="A job is running. Wait for it to finish before switching DB.")
+    try:
+        db_registry.set_active(req.file)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    new_path = mpn_store.reopen()   # re-point the live connection
+    mpn_store.init_db()             # ensure schema on the newly-active DB
+    return {
+        "active": db_registry.active_db_file(),
+        "path": new_path,
+        "cached_count": mpn_store.count_cached(),
+        "deep_count": mpn_store.count_deep(),
+        "databases": db_registry.list_databases(),
+    }
+
+
+@app.post("/api/admin/databases/remove")
+def admin_databases_remove(req: AdminDbRemoveRequest, authorization: str = Header(default="")):
+    """Remove a non-active database from the registry (optionally delete the file)."""
+    _require_admin(authorization)
+    try:
+        db_registry.remove_database(req.file, delete_file=req.delete_file)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"active": db_registry.active_db_file(), "databases": db_registry.list_databases()}
+
+
+# ── Demand databases (dbquery Excel → .db; Total EAU / Onhand / Gross Demand) ───
+
+class DemandLookupRequest(BaseModel):
+    mpns: list[str]
+
+class DemandConvertRequest(BaseModel):
+    force: bool = False
+
+class DemandActivateRequest(BaseModel):
+    file: str
+
+class DemandRemoveRequest(BaseModel):
+    file: str
+    delete_file: bool = False
+
+
+@app.post("/api/demand/lookup")
+def demand_lookup(req: DemandLookupRequest):
+    """Per-MPN demand (Total EAU / Onhand Qty / Gross Demand) per plant from the
+    active dbquery demand database. Public — used by the Supplier Savings modal."""
+    return {
+        "results": demand_store.lookup_demand(req.mpns),
+        "active_db": demand_store.active_db_file(),
+    }
+
+
+@app.get("/api/admin/demand/databases")
+def admin_demand_databases(authorization: str = Header(default="")):
+    _require_admin(authorization)
+    return {
+        "active": demand_store.active_db_file(),
+        "databases": demand_store.list_databases(),
+        "xlsx_files": [os.path.basename(p) for p in demand_store.list_xlsx_files()],
+        "convert": demand_store.convert_state(),
+    }
+
+
+@app.post("/api/admin/demand/convert")
+def admin_demand_convert(req: DemandConvertRequest, authorization: str = Header(default="")):
+    """Convert every .xlsx in dbquery to a .db (keeps the originals). Async."""
+    _require_admin(authorization)
+    return demand_store.start_convert(force=req.force)
+
+
+@app.post("/api/admin/demand/activate")
+def admin_demand_activate(req: DemandActivateRequest, authorization: str = Header(default="")):
+    _require_admin(authorization)
+    try:
+        demand_store.set_active(req.file)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"active": demand_store.active_db_file(), "databases": demand_store.list_databases()}
+
+
+@app.post("/api/admin/demand/remove")
+def admin_demand_remove(req: DemandRemoveRequest, authorization: str = Header(default="")):
+    _require_admin(authorization)
+    demand_store.remove_database(req.file, delete_file=req.delete_file)
+    return {"active": demand_store.active_db_file(), "databases": demand_store.list_databases()}
 
 
 # ── SAP batch pricing for MG drilldown modal ─────────────────────────────────

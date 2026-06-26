@@ -263,7 +263,7 @@ export default function TabMaterialGroup() {
           <p className="section-title">Plant Ranking by Material Group</p>
           <div className="overflow-auto max-h-[520px]">
             <table className="tbl">
-              <thead className="sticky top-0 z-10 bg-white shadow-[0_1px_0_0_#e2e8f0]">
+              <thead className="sticky top-0 z-[1] bg-white shadow-[0_1px_0_0_#e2e8f0]">
                 <tr>
                   <th className="text-left">Material Group</th>
                   <th>Total PPV</th>

@@ -8,7 +8,10 @@ import {
   getDbJobStatus, runDbJob, retryDbJobErrors, cancelDbJob, dbJobExportUrl,
   adminLogin, getAdminDashboard,
   adminSearchMpns, adminRequeryMpns, adminRequeryFailed,
-  type DbJobStatus, type AdminDashboard, type MpnBestEntry,
+  adminListDatabases, adminActivateDatabase, adminRemoveDatabase,
+  adminListDemandDatabases, adminConvertDemand, adminActivateDemand, adminRemoveDemand,
+  type DbJobStatus, type AdminDashboard, type MpnBestEntry, type DbVersion,
+  type DemandDbVersion, type DemandConvertState,
 } from '../api/client'
 
 function fmtDateTime(iso: string | null): string {
@@ -309,6 +312,81 @@ function AdminDashboardModal({ onClose }: { onClose: () => void }) {
   const [bulkBusy, setBulkBusy]     = useState(false)
   const [notice, setNotice]         = useState('')
 
+  // ── Local DB version control ──
+  const [dbVersions, setDbVersions] = useState<DbVersion[]>([])
+  const [dbBusy, setDbBusy]         = useState(false)
+  const [dbNotice, setDbNotice]     = useState('')
+
+  // ── Demand (dbquery) DB control ──
+  const [demandDbs, setDemandDbs]       = useState<DemandDbVersion[]>([])
+  const [demandXlsx, setDemandXlsx]     = useState<string[]>([])
+  const [demandConvert, setDemandConvert] = useState<DemandConvertState | null>(null)
+  const [demandBusy, setDemandBusy]     = useState(false)
+  const [demandNotice, setDemandNotice] = useState('')
+
+  const loadDatabases = async (t: string) => {
+    try {
+      const res = await adminListDatabases(t)
+      setDbVersions(res.databases)
+    } catch { /* ignore */ }
+  }
+
+  const loadDemand = async (t: string) => {
+    try {
+      const res = await adminListDemandDatabases(t)
+      setDemandDbs(res.databases)
+      setDemandXlsx(res.xlsx_files)
+      setDemandConvert(res.convert)
+      return res.convert
+    } catch { return null }
+  }
+
+  const convertDemand = async (force: boolean) => {
+    if (!token) return
+    setDemandBusy(true); setDemandNotice('')
+    try {
+      const res = await adminConvertDemand(token, force)
+      if (!res.started) { setDemandNotice(res.reason ?? 'Already running.'); setDemandBusy(false); return }
+      setDemandNotice('Converting Excel files to .db…')
+      // Poll until the background conversion finishes.
+      const poll = setInterval(async () => {
+        const st = await loadDemand(token)
+        if (st && !st.running) {
+          clearInterval(poll)
+          setDemandBusy(false)
+          setDemandNotice(st.message || 'Conversion finished.')
+        }
+      }, 1500)
+    } catch (e) {
+      setDemandBusy(false)
+      setDemandNotice(e instanceof Error ? e.message : 'Conversion failed.')
+    }
+  }
+
+  const activateDemand = async (file: string) => {
+    if (!token) return
+    setDemandBusy(true); setDemandNotice('')
+    try {
+      const res = await adminActivateDemand(token, file)
+      setDemandDbs(res.databases)
+      setDemandNotice(`Active demand DB: "${res.active}".`)
+    } catch (e) {
+      setDemandNotice(e instanceof Error ? e.message : 'Failed to switch demand DB.')
+    } finally { setDemandBusy(false) }
+  }
+
+  const removeDemand = async (file: string) => {
+    if (!token) return
+    setDemandBusy(true); setDemandNotice('')
+    try {
+      const res = await adminRemoveDemand(token, file, false)
+      setDemandDbs(res.databases)
+      setDemandNotice(`Removed "${file}" from the demand registry.`)
+    } catch (e) {
+      setDemandNotice(e instanceof Error ? e.message : 'Failed to remove demand DB.')
+    } finally { setDemandBusy(false) }
+  }
+
   const login = async () => {
     setBusy(true); setError('')
     try {
@@ -317,9 +395,38 @@ function AdminDashboardModal({ onClose }: { onClose: () => void }) {
       const d = await getAdminDashboard(t)
       setData(d)
       setCounts(d.status_counts ?? {})
+      loadDatabases(t)
+      loadDemand(t)
     } catch {
       setError('Invalid credentials')
     } finally { setBusy(false) }
+  }
+
+  const activateDb = async (file: string) => {
+    if (!token) return
+    setDbBusy(true); setDbNotice('')
+    try {
+      const res = await adminActivateDatabase(token, file)
+      setDbVersions(res.databases)
+      setDbNotice(`Switched to "${res.active}" — ${res.cached_count.toLocaleString()} MPNs, ${res.deep_count.toLocaleString()} deep rows now live.`)
+      // Refresh dashboard counts against the newly-active DB.
+      const d = await getAdminDashboard(token)
+      setData(d); setCounts(d.status_counts ?? {})
+    } catch (e) {
+      setDbNotice(e instanceof Error ? e.message : 'Failed to switch database.')
+    } finally { setDbBusy(false) }
+  }
+
+  const removeDb = async (file: string) => {
+    if (!token) return
+    setDbBusy(true); setDbNotice('')
+    try {
+      const res = await adminRemoveDatabase(token, file, false)
+      setDbVersions(res.databases)
+      setDbNotice(`Removed "${file}" from the registry (file kept on disk).`)
+    } catch (e) {
+      setDbNotice(e instanceof Error ? e.message : 'Failed to remove database.')
+    } finally { setDbBusy(false) }
   }
 
   const reload = async () => {
@@ -373,6 +480,36 @@ function AdminDashboardModal({ onClose }: { onClose: () => void }) {
     } catch {
       setNotice('Failed to start bulk re-query.')
     } finally { setBulkBusy(false) }
+  }
+
+  // Re-query every MPN currently shown in the search results (synchronous,
+  // chunked into batches of 50 to respect the backend's sync limit).
+  const requeryAllResults = async () => {
+    if (!token || !results || results.length === 0) return
+    const mpns = [...new Set(results.map(r => r.mpn).filter(Boolean))]
+    if (mpns.length === 0) return
+    setBulkBusy(true); setNotice('')
+    setRequerying(new Set(mpns))
+    try {
+      const CHUNK = 50
+      let okTotal = 0
+      const merged = new Map(results.map(r => [r.mpn, r]))
+      for (let i = 0; i < mpns.length; i += CHUNK) {
+        const batch = mpns.slice(i, i + CHUNK)
+        const res = await adminRequeryMpns(token, batch)
+        for (const u of res.results) if (u?.mpn) merged.set(u.mpn, u)
+        okTotal += res.summary?.ok ?? 0
+        setResults(Array.from(merged.values()))
+        setCounts(res.status_counts ?? {})
+        setNotice(`Re-querying… ${Math.min(i + CHUNK, mpns.length)}/${mpns.length} done`)
+      }
+      setNotice(`Re-queried ${mpns.length} MPN(s) — ${okTotal} resolved with a price.`)
+    } catch {
+      setNotice('Bulk re-query of searched MPNs failed.')
+    } finally {
+      setRequerying(new Set())
+      setBulkBusy(false)
+    }
   }
 
   return (
@@ -438,55 +575,76 @@ function AdminDashboardModal({ onClose }: { onClose: () => void }) {
                 </div>
               </div>
 
-              <div className="flex items-center gap-2 mb-2">
+              <div className="flex items-start gap-2 mb-2">
                 <div className="relative flex-1">
-                  <Search size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-400" />
-                  <input
+                  <Search size={13} className="absolute left-2.5 top-2.5 text-gray-400" />
+                  <textarea
                     value={query}
                     onChange={e => setQuery(e.target.value)}
-                    onKeyDown={e => e.key === 'Enter' && runSearch()}
-                    placeholder="MPN or Internal PN…"
-                    className="w-full pl-8 pr-3 py-1.5 text-xs border border-gray-300 rounded-lg focus:outline-none focus:border-blue-400"
+                    onKeyDown={e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); runSearch() } }}
+                    placeholder="Paste one or many MPNs / Internal PNs (one per line, or comma/space separated)…"
+                    rows={2}
+                    className="w-full pl-8 pr-3 py-1.5 text-xs border border-gray-300 rounded-lg focus:outline-none focus:border-blue-400 resize-y font-mono leading-relaxed"
                   />
                 </div>
-                <select
-                  value={statusFilter}
-                  onChange={e => setStatusFilter(e.target.value)}
-                  className="px-2 py-1.5 text-xs border border-gray-300 rounded-lg focus:outline-none focus:border-blue-400 bg-white"
-                >
-                  <option value="">All statuses</option>
-                  <option value="ok">OK</option>
-                  <option value="no_price">No price</option>
-                  <option value="error">Error</option>
-                </select>
-                <button
-                  onClick={runSearch} disabled={searching}
-                  className="flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-semibold bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50"
-                >
-                  {searching ? <Loader2 size={12} className="animate-spin" /> : <Search size={12} />} Search
-                </button>
-                <button
-                  onClick={requeryAllFailed} disabled={bulkBusy}
-                  title="Re-query all no_price + error entries (background job)"
-                  className="flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-semibold bg-amber-500 text-white hover:bg-amber-600 disabled:opacity-50"
-                >
-                  {bulkBusy ? <Loader2 size={12} className="animate-spin" /> : <RotateCw size={12} />} Re-query all failed
-                </button>
+                <div className="flex flex-col gap-1.5 w-[150px] shrink-0">
+                  <select
+                    value={statusFilter}
+                    onChange={e => setStatusFilter(e.target.value)}
+                    className="px-2 py-1.5 text-xs border border-gray-300 rounded-lg focus:outline-none focus:border-blue-400 bg-white"
+                  >
+                    <option value="">All statuses</option>
+                    <option value="ok">OK</option>
+                    <option value="no_price">No price</option>
+                    <option value="error">Error</option>
+                  </select>
+                  <button
+                    onClick={runSearch} disabled={searching}
+                    className="flex items-center justify-center gap-1 px-3 py-1.5 rounded-lg text-xs font-semibold bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50"
+                  >
+                    {searching ? <Loader2 size={12} className="animate-spin" /> : <Search size={12} />} Search
+                  </button>
+                  <button
+                    onClick={requeryAllFailed} disabled={bulkBusy}
+                    title="Re-query all no_price + error entries (background job)"
+                    className="flex items-center justify-center gap-1 px-3 py-1.5 rounded-lg text-xs font-semibold bg-amber-500 text-white hover:bg-amber-600 disabled:opacity-50"
+                  >
+                    {bulkBusy ? <Loader2 size={12} className="animate-spin" /> : <RotateCw size={12} />} Re-query all failed
+                  </button>
+                </div>
+              </div>
+
+              <div className="flex items-center justify-between mb-2 gap-2">
+                <p className="text-[10px] text-gray-400">
+                  {(() => {
+                    const n = query.split(/[\s,;]+/).map(s => s.trim()).filter(Boolean).length
+                    return n > 1 ? `${n} terms entered · Ctrl+Enter to search` : 'Tip: paste a list — one MPN/Internal PN per line. Ctrl+Enter to search.'
+                  })()}
+                </p>
+                {results !== null && results.length > 0 && (
+                  <button
+                    onClick={requeryAllResults} disabled={bulkBusy}
+                    title="Re-query every MPN in the results below (synchronous, updates in place)"
+                    className="flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-semibold bg-blue-50 text-blue-700 border border-blue-200 hover:bg-blue-100 disabled:opacity-50 whitespace-nowrap"
+                  >
+                    {bulkBusy ? <Loader2 size={12} className="animate-spin" /> : <RotateCw size={12} />} Re-query searched ({results.length})
+                  </button>
+                )}
               </div>
 
               {notice && <p className="text-[11px] text-blue-600 mb-2">{notice}</p>}
 
               {results !== null && (
                 <div className="overflow-x-auto rounded-lg border border-gray-200 max-h-72 overflow-y-auto">
-                  <table className="min-w-full text-xs">
-                    <thead className="bg-gray-50 text-gray-500 sticky top-0">
+                  <table className="min-w-full text-xs border-separate border-spacing-0">
+                    <thead className="text-gray-500 sticky top-0 z-[1]">
                       <tr>
-                        <th className="px-3 py-2 text-left">MPN</th>
-                        <th className="px-3 py-2 text-left">Internal PN</th>
-                        <th className="px-3 py-2 text-left">Status</th>
-                        <th className="px-3 py-2 text-right">Best USD</th>
-                        <th className="px-3 py-2 text-left">Source</th>
-                        <th className="px-3 py-2 text-right">Action</th>
+                        <th className="px-3 py-2 text-left bg-gray-50 border-b border-gray-200">MPN</th>
+                        <th className="px-3 py-2 text-left bg-gray-50 border-b border-gray-200">Internal PN</th>
+                        <th className="px-3 py-2 text-left bg-gray-50 border-b border-gray-200">Status</th>
+                        <th className="px-3 py-2 text-right bg-gray-50 border-b border-gray-200">Best USD</th>
+                        <th className="px-3 py-2 text-left bg-gray-50 border-b border-gray-200">Source</th>
+                        <th className="px-3 py-2 text-right bg-gray-50 border-b border-gray-200">Action</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-gray-100">
@@ -525,6 +683,127 @@ function AdminDashboardModal({ onClose }: { onClose: () => void }) {
                       )}
                     </tbody>
                   </table>
+                </div>
+              )}
+            </div>
+
+            {/* ── Local database version control ── */}
+            <div className="rounded-xl border border-gray-200 p-3 mb-5">
+              <div className="flex items-center justify-between mb-2">
+                <h4 className="text-xs font-bold text-gray-600 uppercase tracking-wide flex items-center gap-1.5">
+                  <Database size={13} /> Local databases (version control)
+                </h4>
+                <button onClick={() => token && loadDatabases(token)} className="flex items-center gap-1 text-xs text-blue-600 hover:underline">
+                  <RefreshCw size={12} /> Refresh
+                </button>
+              </div>
+              <p className="text-[10px] text-gray-400 mb-2">
+                A Force full re-run builds a fresh database in the background — the current one stays live so no data is lost.
+                Switch to the new version here when it's ready.
+              </p>
+              {dbNotice && <p className="text-[11px] text-blue-600 mb-2">{dbNotice}</p>}
+              {dbVersions.length === 0 ? (
+                <p className="text-xs text-gray-400 py-2 text-center">No databases registered.</p>
+              ) : (
+                <div className="space-y-1.5">
+                  {dbVersions.map(db => (
+                    <div key={db.file} className={`flex items-center gap-2 px-3 py-2 rounded-lg border ${db.active ? 'bg-emerald-50 border-emerald-200' : 'bg-gray-50 border-gray-200'}`}>
+                      <Database size={14} className={db.active ? 'text-emerald-600' : 'text-gray-400'} />
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2">
+                          <span className="font-mono text-xs text-gray-800 truncate">{db.file}</span>
+                          {db.active && <span className="text-[9px] font-bold bg-emerald-200 text-emerald-800 px-1.5 py-0.5 rounded-full">ACTIVE</span>}
+                          {!db.exists && <span className="text-[9px] font-bold bg-amber-200 text-amber-800 px-1.5 py-0.5 rounded-full">MISSING</span>}
+                        </div>
+                        <div className="text-[10px] text-gray-400">
+                          {db.label} · {(db.size_bytes / 1_048_576).toFixed(1)} MB · {fmtDateTime(db.created_at)}
+                        </div>
+                      </div>
+                      {!db.active && db.exists && (
+                        <button
+                          onClick={() => activateDb(db.file)} disabled={dbBusy}
+                          className="flex items-center gap-1 px-2.5 py-1 rounded-md text-[11px] font-semibold bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50"
+                        >
+                          {dbBusy ? <Loader2 size={11} className="animate-spin" /> : <CheckCircle2 size={11} />} Activate
+                        </button>
+                      )}
+                      {!db.active && (
+                        <button
+                          onClick={() => removeDb(db.file)} disabled={dbBusy}
+                          className="px-2 py-1 rounded-md text-[11px] font-medium text-gray-500 hover:text-red-600 hover:bg-red-50 disabled:opacity-50"
+                          title="Remove from registry (keeps the file on disk)"
+                        >
+                          <X size={12} />
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* ── Demand databases (dbquery Excel → .db) ── */}
+            <div className="rounded-xl border border-gray-200 p-3 mb-5">
+              <div className="flex items-center justify-between mb-2">
+                <h4 className="text-xs font-bold text-gray-600 uppercase tracking-wide flex items-center gap-1.5">
+                  <Database size={13} /> Demand databases (dbquery)
+                </h4>
+                <div className="flex items-center gap-2">
+                  <button onClick={() => token && loadDemand(token)} className="flex items-center gap-1 text-xs text-blue-600 hover:underline">
+                    <RefreshCw size={12} /> Refresh
+                  </button>
+                  <button
+                    onClick={() => convertDemand(false)} disabled={demandBusy}
+                    title="Convert every Excel file in dbquery to a .db (keeps the originals)"
+                    className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-semibold bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50"
+                  >
+                    {demandBusy ? <Loader2 size={12} className="animate-spin" /> : <RotateCw size={12} />} Convert Excel files
+                  </button>
+                </div>
+              </div>
+              <p className="text-[10px] text-gray-400 mb-2">
+                Builds a fast .db from each Excel in <span className="font-mono">dbquery/</span> (Total EAU, Onhand Qty, Gross Demand…). Pick the active one to feed the Supplier Savings Analysis.
+                {demandXlsx.length > 0 && <span> · {demandXlsx.length} Excel file{demandXlsx.length !== 1 ? 's' : ''} found</span>}
+              </p>
+              {demandNotice && <p className="text-[11px] text-indigo-600 mb-2">{demandNotice}</p>}
+              {demandDbs.length === 0 ? (
+                <p className="text-xs text-gray-400 py-2 text-center">
+                  No demand databases yet. Click "Convert Excel files" to build them.
+                </p>
+              ) : (
+                <div className="space-y-1.5">
+                  {demandDbs.map(db => (
+                    <div key={db.file} className={`flex items-center gap-2 px-3 py-2 rounded-lg border ${db.active ? 'bg-indigo-50 border-indigo-200' : 'bg-gray-50 border-gray-200'}`}>
+                      <Database size={14} className={db.active ? 'text-indigo-600' : 'text-gray-400'} />
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2">
+                          <span className="font-mono text-xs text-gray-800 truncate">{db.file}</span>
+                          {db.active && <span className="text-[9px] font-bold bg-indigo-200 text-indigo-800 px-1.5 py-0.5 rounded-full">ACTIVE</span>}
+                          {!db.exists && <span className="text-[9px] font-bold bg-amber-200 text-amber-800 px-1.5 py-0.5 rounded-full">MISSING</span>}
+                        </div>
+                        <div className="text-[10px] text-gray-400">
+                          {db.rows != null ? `${db.rows.toLocaleString()} rows · ` : ''}{(db.size_bytes / 1_048_576).toFixed(1)} MB · {fmtDateTime(db.created_at)}
+                        </div>
+                      </div>
+                      {!db.active && db.exists && (
+                        <button
+                          onClick={() => activateDemand(db.file)} disabled={demandBusy}
+                          className="flex items-center gap-1 px-2.5 py-1 rounded-md text-[11px] font-semibold bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50"
+                        >
+                          {demandBusy ? <Loader2 size={11} className="animate-spin" /> : <CheckCircle2 size={11} />} Use this
+                        </button>
+                      )}
+                      {!db.active && (
+                        <button
+                          onClick={() => removeDemand(db.file)} disabled={demandBusy}
+                          className="px-2 py-1 rounded-md text-[11px] font-medium text-gray-500 hover:text-red-600 hover:bg-red-50 disabled:opacity-50"
+                          title="Remove from registry (keeps the file on disk)"
+                        >
+                          <X size={12} />
+                        </button>
+                      )}
+                    </div>
+                  ))}
                 </div>
               )}
             </div>
@@ -571,12 +850,12 @@ function AdminDashboardModal({ onClose }: { onClose: () => void }) {
 
             <h4 className="text-xs font-bold text-gray-600 uppercase tracking-wide mb-2">Recent errors</h4>
             <div className="overflow-x-auto rounded-lg border border-gray-200 max-h-64 overflow-y-auto">
-              <table className="min-w-full text-xs">
-                <thead className="bg-gray-50 text-gray-500 sticky top-0">
+              <table className="min-w-full text-xs border-separate border-spacing-0">
+                <thead className="text-gray-500 sticky top-0 z-[1]">
                   <tr>
-                    <th className="px-3 py-2 text-left">MPN</th>
-                    <th className="px-3 py-2 text-left">Type</th>
-                    <th className="px-3 py-2 text-left">Message</th>
+                    <th className="px-3 py-2 text-left bg-gray-50 border-b border-gray-200">MPN</th>
+                    <th className="px-3 py-2 text-left bg-gray-50 border-b border-gray-200">Type</th>
+                    <th className="px-3 py-2 text-left bg-gray-50 border-b border-gray-200">Message</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-100">

@@ -24,26 +24,117 @@ from datetime import datetime, date
 from typing import Any, Iterable
 
 from config import MPN_DB_PATH
+import db_registry
 
 # SQLite from multiple threads → single connection guarded by a lock.
 _LOCK = threading.RLock()
 _conn: sqlite3.Connection | None = None
+_conn_path: str | None = None   # absolute path the live connection points at
 
 
 # ── Connection ────────────────────────────────────────────────────────────────
 
 def _connect() -> sqlite3.Connection:
-    global _conn
-    if _conn is None:
-        os.makedirs(os.path.dirname(MPN_DB_PATH), exist_ok=True)
-        _conn = sqlite3.connect(MPN_DB_PATH, check_same_thread=False)
-        _conn.row_factory = sqlite3.Row
-        _conn.execute("PRAGMA journal_mode=WAL;")
+    """Open (or reuse) the connection to the *active* database file.
+
+    The active database is resolved from the version registry, so an admin can
+    hot-swap which local DB is in use without restarting the backend. If the
+    active file changed since the connection was opened, it is transparently
+    reopened against the new file.
+    """
+    global _conn, _conn_path
+    target = db_registry.active_db_path()
+    if _conn is not None and _conn_path == target:
+        return _conn
+    # Active DB changed (or first open) → (re)connect.
+    if _conn is not None:
+        try:
+            _conn.close()
+        except Exception:
+            pass
+        _conn = None
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    _conn = sqlite3.connect(target, check_same_thread=False)
+    _conn.row_factory = sqlite3.Row
+    _conn.execute("PRAGMA journal_mode=WAL;")
+    _conn_path = target
+    # Make sure the freshly-opened DB has all tables.
+    _ensure_schema(_conn)
     return _conn
+
+
+def reopen() -> str:
+    """Force the connection to point at the current active DB (hot-swap).
+
+    Returns the absolute path now in use. Safe to call after an admin changes
+    the active database in the registry.
+    """
+    global _conn, _conn_path
+    with _LOCK:
+        if _conn is not None:
+            try:
+                _conn.close()
+            except Exception:
+                pass
+            _conn = None
+            _conn_path = None
+        return db_registry.active_db_path()
+
+
+# Thread-local "build target": when set, _cursor() writes to a dedicated DB file
+# (a fresh versioned cache being built by a Force full re-run) instead of the
+# active one. This keeps the live/active DB untouched so users see no data loss
+# while a rebuild runs in the background.
+_BUILD = threading.local()
+
+
+def set_build_target(db_path: str) -> None:
+    """Route all store reads/writes on THIS thread to `db_path` (a fresh build DB).
+
+    Used by a Force full re-run so the active/live DB is never touched. Call
+    clear_build_target() when done. All batch-job DB writes happen on the job's
+    main thread, so a thread-local override is sufficient and safe.
+    """
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    _ensure_schema(conn)
+    _BUILD.conn = conn
+
+
+def clear_build_target() -> None:
+    conn = getattr(_BUILD, "conn", None)
+    _BUILD.conn = None
+    if conn is not None:
+        try:
+            conn.commit()
+        finally:
+            conn.close()
+
+
+@contextmanager
+def build_into(db_path: str):
+    """Within this thread + block, route all store reads/writes to `db_path`."""
+    set_build_target(db_path)
+    try:
+        yield getattr(_BUILD, "conn", None)
+    finally:
+        clear_build_target()
 
 
 @contextmanager
 def _cursor():
+    build_conn = getattr(_BUILD, "conn", None)
+    if build_conn is not None:
+        # Build-target path: dedicated connection, no global lock (its own file).
+        cur = build_conn.cursor()
+        try:
+            yield cur
+            build_conn.commit()
+        finally:
+            cur.close()
+        return
     with _LOCK:
         conn = _connect()
         cur = conn.cursor()
@@ -55,8 +146,20 @@ def _cursor():
 
 
 def init_db() -> None:
-    """Create tables if they don't exist. Safe to call on every startup."""
-    with _cursor() as cur:
+    """Ensure the active database has its schema. Safe to call on every startup."""
+    # Triggers _connect(), which calls _ensure_schema() on the active file.
+    with _LOCK:
+        _connect()
+
+
+def _ensure_schema(conn: sqlite3.Connection) -> None:
+    """Create all tables on the given connection if they don't exist.
+
+    Operates directly on `conn` (not via _cursor) so it can be called from
+    inside _connect() without recursing.
+    """
+    cur = conn.cursor()
+    try:
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS mpn_best (
@@ -132,6 +235,43 @@ def init_db() -> None:
             )
             """
         )
+        # ── Deep-analysis cache: best Multi-MPN AND Multi-Component stored
+        #    SEPARATELY per MPN, so a Deep Analysis can be served instantly from
+        #    the DB instead of re-querying SAP. Populated by the batch job and by
+        #    real-time misses. Keyed by internal_pn (the Deep Analysis unit) with
+        #    the searched MPN kept for traceability.
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mpn_deep (
+                internal_pn        TEXT PRIMARY KEY,
+                mpn                TEXT,            -- a representative searched MPN
+                window_days        INTEGER,
+                computed_at        TEXT,
+                valid_date         TEXT,
+                origin             TEXT,            -- 'job' | 'realtime'
+                status             TEXT,            -- 'ok' | 'no_price' | 'error'
+                error_detail       TEXT,
+                -- Best Multi-MPN side
+                mpn_price_usd      REAL,
+                mpn_std_usd        REAL,
+                mpn_supplier       TEXT,
+                mpn_plant          TEXT,
+                mpn_best_mpn       TEXT,
+                mpn_last_po_date   TEXT,
+                -- Best Multi-Component (Internal PN / AMPL) side
+                mc_price_usd       REAL,
+                mc_std_usd         REAL,
+                mc_supplier        TEXT,
+                mc_plant           TEXT,
+                mc_best_mpn        TEXT,
+                mc_internal_pn     TEXT,
+                mc_last_po_date    TEXT
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        cur.close()
 
 
 # ── Best-price computation (port of frontend logic) ───────────────────────────
@@ -419,6 +559,97 @@ def status_counts() -> dict[str, int]:
         )
         return {r["s"]: int(r["c"]) for r in cur.fetchall()}
 
+
+# ── mpn_deep CRUD (Deep Analysis cache) ───────────────────────────────────────
+
+def upsert_deep(entry: dict) -> None:
+    """Insert/replace the per-Internal-PN deep-analysis result.
+
+    `entry` carries the best Multi-MPN row and the best Multi-Component row
+    separately so a Deep Analysis can be reconstructed without hitting SAP.
+    Keyed by internal_pn; ignored if no internal_pn is available.
+    """
+    ip = (entry.get("internal_pn") or "").strip().upper()
+    if not ip:
+        return
+    status = entry.get("status")
+    if not status:
+        has_price = entry.get("mpn_price_usd") is not None or entry.get("mc_price_usd") is not None
+        status = "ok" if has_price else "no_price"
+    with _cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO mpn_deep
+                (internal_pn, mpn, window_days, computed_at, valid_date, origin,
+                 status, error_detail,
+                 mpn_price_usd, mpn_std_usd, mpn_supplier, mpn_plant, mpn_best_mpn, mpn_last_po_date,
+                 mc_price_usd, mc_std_usd, mc_supplier, mc_plant, mc_best_mpn, mc_internal_pn, mc_last_po_date)
+            VALUES
+                (:internal_pn, :mpn, :window_days, :computed_at, :valid_date, :origin,
+                 :status, :error_detail,
+                 :mpn_price_usd, :mpn_std_usd, :mpn_supplier, :mpn_plant, :mpn_best_mpn, :mpn_last_po_date,
+                 :mc_price_usd, :mc_std_usd, :mc_supplier, :mc_plant, :mc_best_mpn, :mc_internal_pn, :mc_last_po_date)
+            ON CONFLICT(internal_pn) DO UPDATE SET
+                mpn=excluded.mpn, window_days=excluded.window_days,
+                computed_at=excluded.computed_at, valid_date=excluded.valid_date,
+                origin=excluded.origin, status=excluded.status, error_detail=excluded.error_detail,
+                mpn_price_usd=excluded.mpn_price_usd, mpn_std_usd=excluded.mpn_std_usd,
+                mpn_supplier=excluded.mpn_supplier, mpn_plant=excluded.mpn_plant,
+                mpn_best_mpn=excluded.mpn_best_mpn, mpn_last_po_date=excluded.mpn_last_po_date,
+                mc_price_usd=excluded.mc_price_usd, mc_std_usd=excluded.mc_std_usd,
+                mc_supplier=excluded.mc_supplier, mc_plant=excluded.mc_plant,
+                mc_best_mpn=excluded.mc_best_mpn, mc_internal_pn=excluded.mc_internal_pn,
+                mc_last_po_date=excluded.mc_last_po_date
+            """,
+            {
+                "internal_pn": ip,
+                "mpn": (entry.get("mpn") or "").strip().upper() or None,
+                "window_days": entry.get("window_days"),
+                "computed_at": entry.get("computed_at") or datetime.now().isoformat(),
+                "valid_date": entry.get("valid_date") or _today(),
+                "origin": entry.get("origin") or "job",
+                "status": status,
+                "error_detail": entry.get("error_detail"),
+                "mpn_price_usd": entry.get("mpn_price_usd"),
+                "mpn_std_usd": entry.get("mpn_std_usd"),
+                "mpn_supplier": entry.get("mpn_supplier"),
+                "mpn_plant": entry.get("mpn_plant"),
+                "mpn_best_mpn": entry.get("mpn_best_mpn"),
+                "mpn_last_po_date": entry.get("mpn_last_po_date"),
+                "mc_price_usd": entry.get("mc_price_usd"),
+                "mc_std_usd": entry.get("mc_std_usd"),
+                "mc_supplier": entry.get("mc_supplier"),
+                "mc_plant": entry.get("mc_plant"),
+                "mc_best_mpn": entry.get("mc_best_mpn"),
+                "mc_internal_pn": entry.get("mc_internal_pn"),
+                "mc_last_po_date": entry.get("mc_last_po_date"),
+            },
+        )
+
+
+def get_deep_many(internal_pns: Iterable[str]) -> dict[str, dict]:
+    """Return {INTERNAL_PN_UPPER: deep entry} for the cached internal PNs."""
+    keys = list({(p or "").strip().upper() for p in internal_pns if p})
+    if not keys:
+        return {}
+    out: dict[str, dict] = {}
+    with _cursor() as cur:
+        for i in range(0, len(keys), 400):
+            chunk = keys[i : i + 400]
+            placeholders = ",".join("?" * len(chunk))
+            cur.execute(
+                f"SELECT * FROM mpn_deep WHERE internal_pn IN ({placeholders})",
+                tuple(chunk),
+            )
+            for row in cur.fetchall():
+                out[row["internal_pn"]] = dict(row)
+    return out
+
+
+def count_deep() -> int:
+    with _cursor() as cur:
+        cur.execute("SELECT COUNT(*) AS c FROM mpn_deep")
+        return int(cur.fetchone()["c"])
 
 
 # ── job_runs CRUD ─────────────────────────────────────────────────────────────

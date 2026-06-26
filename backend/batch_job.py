@@ -23,6 +23,7 @@ import pandas as pd
 import requests
 
 import mpn_store as store
+import db_registry
 from config import (
     PRICECALC_API_URL, DBQUERY_DIR, LOGS_DIR, MPN_DB_PATH,
     DBQUERY_MPN_COL, DBQUERY_EAU_COL, DBJOB_WINDOW_DAYS, DBJOB_MAX_WORKERS,
@@ -48,6 +49,7 @@ _STATE: dict = {
     "status": "idle",          # idle | running | done | failed | cancelled
     "source_file": None,
     "message": "",
+    "build_file": None,        # set when a Force full re-run built a new DB
 }
 
 
@@ -211,6 +213,31 @@ def process_mpn(mpn: str, window_days: int = DBJOB_WINDOW_DAYS) -> dict:
             chosen_src, chosen_price, chosen_row = "None", None, None
 
     now = datetime.now().isoformat()
+    # ── Deep-analysis side: keep the BEST Multi-MPN and BEST Multi-Component
+    #    rows SEPARATELY so a Deep Analysis can be served instantly from cache. ──
+    deep = {
+        "internal_pn": internal_pn,
+        "mpn": mpn,
+        "window_days": window_days,
+        "computed_at": now,
+        "origin": "job",
+        "status": "ok" if (p_mpn is not None or p_int is not None) else "no_price",
+        # Best Multi-MPN side
+        "mpn_price_usd":    p_mpn,
+        "mpn_std_usd":      _f(best_mpn_row.get("standardPriceUsd")) if best_mpn_row else None,
+        "mpn_supplier":     (best_mpn_row.get("supplierName") or best_mpn_row.get("englishName")) if best_mpn_row else None,
+        "mpn_plant":        best_mpn_row.get("siteName") if best_mpn_row else None,
+        "mpn_best_mpn":     best_mpn_row.get("mpn") if best_mpn_row else None,
+        "mpn_last_po_date": best_mpn_row.get("lastPoDate") if best_mpn_row else None,
+        # Best Multi-Component (Internal PN / AMPL) side
+        "mc_price_usd":     p_int,
+        "mc_std_usd":       _f(best_internal_row.get("standardPriceUsd")) if best_internal_row else None,
+        "mc_supplier":      (best_internal_row.get("supplierName") or best_internal_row.get("englishName")) if best_internal_row else None,
+        "mc_plant":         best_internal_row.get("siteName") if best_internal_row else None,
+        "mc_best_mpn":      best_internal_row.get("mpn") if best_internal_row else None,
+        "mc_internal_pn":   best_internal_row.get("internalPN") if best_internal_row else internal_pn,
+        "mc_last_po_date":  best_internal_row.get("lastPoDate") if best_internal_row else None,
+    }
     return {
         "mpn": mpn,
         "internal_pn": internal_pn,
@@ -235,6 +262,8 @@ def process_mpn(mpn: str, window_days: int = DBJOB_WINDOW_DAYS) -> dict:
             "ampl": ampl_data,
             "mc_rows": mc_rows,
         },
+        # Structured per-Internal-PN deep-analysis row (separate MPN + MC bests).
+        "deep": deep,
     }
 
 
@@ -338,10 +367,20 @@ def _run(trigger: str, mpns: list[str] | None, window_days: int, skip_cached: bo
             _set_state(running=False, status="failed", message=str(e))
             return
 
-    # Force re-run ("from scratch"): an admin asked to rebuild the whole cache,
-    # so wipe every existing entry before recomputing.
-    if from_file and not skip_cached:
-        store.clear_all()
+    # ── Force full re-run: build into a NEW versioned DB so the active cache is
+    #    never wiped. Users keep hitting the old DB while this runs in the
+    #    background; an admin switches to the new DB when ready. ──
+    is_force = from_file and not skip_cached
+    build_file = None
+    build_path = None
+    if is_force:
+        build_file = db_registry.new_version_file()
+        build_path = db_registry.abspath(build_file)
+        # Register up front (inactive) so it shows up in the admin DB list as
+        # "building". It only becomes active when the admin switches to it.
+        db_registry.register_database(
+            build_file, label=f"rebuild {datetime.now():%Y-%m-%d %H:%M}"
+        )
 
     # Resume support: when running from the source file, skip MPNs already cached
     # so a re-run only processes the pending ones (no restart from 0).
@@ -364,6 +403,13 @@ def _run(trigger: str, mpns: list[str] | None, window_days: int, skip_cached: bo
         return
 
     total = len(mpns)
+
+    # For a Force full re-run, redirect ALL store writes (run history, prices,
+    # deep rows, meta) into the fresh versioned DB. The active DB is untouched.
+    if build_path:
+        store.set_build_target(build_path)
+        _set_state(message=f"Building new database {build_file} (active DB stays live)…")
+
     run_id = store.create_run(trigger, total, os.path.basename(source_file) if source_file else None)
 
     _set_state(running=True, run_id=run_id, trigger=trigger, total=total,
@@ -380,6 +426,14 @@ def _run(trigger: str, mpns: list[str] | None, window_days: int, skip_cached: bo
         if exc is None and entry is not None:
             try:
                 store.upsert_best(entry)
+                # Persist the separate Multi-MPN / Multi-Component bests for Deep
+                # Analysis (no-op when there's no internal_pn).
+                deep = entry.get("deep")
+                if deep:
+                    try:
+                        store.upsert_deep(deep)
+                    except Exception:  # never let deep-cache bookkeeping break the job
+                        pass
                 success += 1
             except Exception as db_exc:  # storing failed → treat as 'other' error
                 errors += 1
@@ -436,8 +490,19 @@ def _run(trigger: str, mpns: list[str] | None, window_days: int, skip_cached: bo
         store.set_meta("last_run_at", datetime.now().isoformat())
     store.set_meta("last_run_id", str(run_id))
 
+    # Stop redirecting writes to the build DB (back to the active one).
+    if build_path:
+        store.clear_build_target()
+
+    build_msg = ""
+    if build_file:
+        build_msg = (f" New database '{build_file}' is ready — switch to it from the "
+                     f"admin DB-version panel when you want it live.")
+
     _set_state(running=False, status=status, finished_at=datetime.now().isoformat(),
-               processed=processed, success=success, errors=errors, conn_errors=conn_errors)
+               processed=processed, success=success, errors=errors, conn_errors=conn_errors,
+               build_file=build_file,
+               message=(get_state().get("message", "") + build_msg).strip() or None)
 
 
 def start_job(trigger: str = "manual", mpns: list[str] | None = None,

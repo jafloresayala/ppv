@@ -341,7 +341,7 @@ export default function TabImpact() {
             {/* Body */}
             <div className="flex-1 overflow-y-auto">
               <table className="tbl text-xs w-full">
-                <thead className="sticky top-0 bg-white z-10">
+                <thead className="sticky top-0 bg-white z-[1]">
                   <tr>
                     <th>#</th>
                     <th>Material</th>

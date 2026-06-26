@@ -190,7 +190,7 @@ export default function TabData() {
             </div>
           ) : resp && resp.records.length > 0 ? (
             <table className="text-xs w-full border-collapse">
-              <thead className="sticky top-0 z-10 bg-slate-50 border-b border-slate-200">
+              <thead className="sticky top-0 z-[1] bg-slate-50 border-b border-slate-200">
                 <tr>
                   <th className="text-right font-medium text-slate-400 px-3 py-2 w-10">#</th>
                   {visibleCols.map(col => (

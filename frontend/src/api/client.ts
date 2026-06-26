@@ -319,6 +319,8 @@ export interface AdminDashboard {
   runs:          Array<Record<string, unknown>>
   recent_errors: Array<Record<string, unknown>>
   cached_count:  number
+  deep_count?:    number
+  active_db?:     string
   status_counts?: Record<string, number>
 }
 
@@ -373,5 +375,139 @@ export async function adminRequeryFailed(
     { statuses: statuses ?? null, window_days: windowDays ?? null },
     { timeout: 30_000, headers: { Authorization: `Bearer ${token}` } },
   )
+  return data
+}
+
+// ── Deep Analysis cache (per Internal PN) ─────────────────────────────────────
+
+export interface DeepCacheEntry {
+  internalPN:       string
+  status:           string
+  mpnBestPriceUsd:  number | null
+  mpnBestStdUsd:    number | null
+  mpnBestSupplier:  string | null
+  mpnBestPlant:     string | null
+  mpnBestMpn:       string | null
+  mpnLastPoDate:    string | null
+  mcBestPriceUsd:   number | null
+  mcStdPriceUsd:    number | null
+  mcBestSupplier:   string | null
+  mcBestPlant:      string | null
+  mcBestMpn:        string | null
+  mcBestInternalPN: string | null
+  mcLastPoDate:     string | null
+  origin?:          string
+  fromCache?:       boolean
+}
+
+export interface DeepResolveResponse {
+  results:  Record<string, DeepCacheEntry | null>
+  from_db:  string[]
+  computed: string[]
+}
+
+export async function resolveDeep(
+  internalPNs: string[], windowDays?: number,
+): Promise<DeepResolveResponse> {
+  const { data } = await http.post<DeepResolveResponse>(
+    '/mpn-deep/resolve',
+    { internal_pns: internalPNs, window_days: windowDays ?? undefined },
+    { timeout: 600_000 },
+  )
+  return data
+}
+
+// ── Admin: local database version control ─────────────────────────────────────
+
+export interface DbVersion {
+  file:       string
+  label:      string
+  created_at: string
+  active:     boolean
+  exists:     boolean
+  size_bytes: number
+}
+
+export async function adminListDatabases(token: string): Promise<{ active: string; databases: DbVersion[]; job_running: boolean }> {
+  const { data } = await http.get('/admin/databases', {
+    timeout: 15_000, headers: { Authorization: `Bearer ${token}` },
+  })
+  return data
+}
+
+export async function adminActivateDatabase(token: string, file: string): Promise<{ active: string; cached_count: number; deep_count: number; databases: DbVersion[] }> {
+  const { data } = await http.post('/admin/databases/activate', { file }, {
+    timeout: 30_000, headers: { Authorization: `Bearer ${token}` },
+  })
+  return data
+}
+
+export async function adminRemoveDatabase(token: string, file: string, deleteFile = false): Promise<{ active: string; databases: DbVersion[] }> {
+  const { data } = await http.post('/admin/databases/remove', { file, delete_file: deleteFile }, {
+    timeout: 15_000, headers: { Authorization: `Bearer ${token}` },
+  })
+  return data
+}
+
+// ── Demand databases (dbquery Excel → .db: Total EAU / Onhand / Gross Demand) ──
+
+export interface DemandRow {
+  plantCode:   string
+  plantName:   string
+  totalEau:    number | null
+  onhandQty:   number | null
+  grossDemand: number | null
+}
+
+export async function lookupDemand(mpns: string[]): Promise<{ results: Record<string, DemandRow[]>; active_db: string | null }> {
+  const { data } = await http.post('/demand/lookup', { mpns }, { timeout: 30_000 })
+  return data
+}
+
+export interface DemandDbVersion {
+  file:       string
+  label:      string
+  rows:       number | null
+  created_at: string
+  active:     boolean
+  exists:     boolean
+  size_bytes: number
+}
+
+export interface DemandConvertState {
+  running:     boolean
+  started_at:  string | null
+  finished_at: string | null
+  results:     Array<Record<string, unknown>>
+  message:     string
+}
+
+export async function adminListDemandDatabases(token: string): Promise<{
+  active: string | null; databases: DemandDbVersion[]; xlsx_files: string[]; convert: DemandConvertState
+}> {
+  const { data } = await http.get('/admin/demand/databases', {
+    timeout: 15_000, headers: { Authorization: `Bearer ${token}` },
+  })
+  return data
+}
+
+export async function adminConvertDemand(token: string, force = false): Promise<{ started: boolean; reason?: string }> {
+  const { data } = await http.post('/admin/demand/convert', { force }, {
+    timeout: 15_000, headers: { Authorization: `Bearer ${token}` },
+  })
+  return data
+}
+
+export async function adminActivateDemand(token: string, file: string): Promise<{ active: string | null; databases: DemandDbVersion[] }> {
+  const { data } = await http.post('/admin/demand/activate', { file }, {
+    timeout: 15_000, headers: { Authorization: `Bearer ${token}` },
+  })
+  return data
+}
+
+export async function adminRemoveDemand(token: string, file: string, deleteFile = false): Promise<{ active: string | null; databases: DemandDbVersion[] }> {
+  const { data } = await http.post('/admin/demand/remove', { file, delete_file: deleteFile }, {
+    timeout: 15_000, headers: { Authorization: `Bearer ${token}` },
+  })
   return data
 }

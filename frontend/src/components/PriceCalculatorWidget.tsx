@@ -1,11 +1,11 @@
 ﻿// src/components/PriceCalculatorWidget.tsx
 // Floating Price Calculator widget — wraps conexion_internalquery functionality
-import { useState, useCallback, useMemo, useRef } from 'react'
+import { useState, useCallback, useMemo, useRef, useEffect } from 'react'
 import { Calculator, X, Pin, ChevronDown, ChevronUp, ExternalLink, Download } from 'lucide-react'
 import DbJobButton from './DbJobButton'
 import DataGrid, { type DataGridColumn } from './DataGrid'
-import SupplierComparePanel, { type CompareRecord } from './SupplierComparePanel'
-import { lookupMpnBest, resolveMpnBest, type MpnBestEntry } from '../api/client'
+import SupplierComparePanel, { type CompareRecord, type DemandRow } from './SupplierComparePanel'
+import { lookupMpnBest, resolveMpnBest, resolveDeep, lookupDemand, type MpnBestEntry } from '../api/client'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -2013,6 +2013,41 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
   // Opened by clicking a row in the IQ Results grid. Holds the clicked MPN +
   // its full set of raw records so we can compare suppliers within a plant.
   const [mpnCompare, setMpnCompare]                                   = useState<{ mpn: string; allRows: IQItem[] } | null>(null)
+  // Demand (Total EAU / Onhand / Gross Demand) for the MPN open in the compare panel
+  const [mpnCompareDemand, setMpnCompareDemand]                       = useState<DemandRow[]>([])
+  const [mpnCompareDemandLoading, setMpnCompareDemandLoading]         = useState(false)
+
+  // Fetch demand for the MPN whenever the Supplier Savings panel opens.
+  useEffect(() => {
+    if (!mpnCompare) { setMpnCompareDemand([]); return }
+    let cancelled = false
+    setMpnCompareDemandLoading(true)
+    setMpnCompareDemand([])
+    // Look up by the searched MPN and the resolved best MPN(s) of the records.
+    const mpnKeys = [...new Set([
+      mpnCompare.mpn,
+      ...mpnCompare.allRows.map(r => r.mpn).filter(Boolean),
+    ])]
+    lookupDemand(mpnKeys)
+      .then(res => {
+        if (cancelled) return
+        // Merge all matched MPN keys' rows, de-duplicated by plant.
+        const byPlant = new Map<string, DemandRow>()
+        for (const rows of Object.values(res.results)) {
+          for (const d of rows) {
+            const key = d.plantCode || d.plantName
+            if (!byPlant.has(key)) byPlant.set(key, d)
+          }
+        }
+        setMpnCompareDemand([...byPlant.values()])
+      })
+      .catch(() => { if (!cancelled) setMpnCompareDemand([]) })
+      .finally(() => { if (!cancelled) setMpnCompareDemandLoading(false) })
+    return () => { cancelled = true }
+  }, [mpnCompare])
+  // Deep Analysis pagination (keeps the rich grouped table fast for large sets)
+  const [deepPage, setDeepPage]                                       = useState(0)
+  const DEEP_PAGE_SIZE = 25
   const [mpnNexarMap, setMpnNexarMap]                                 = useState<Record<string, { nexarBestUsd: number | null; nexarSeller: string; nexarManufacturer: string; nexarStock: number | null; nexarMoq: number | null; nexarMpn: string }>>({})
   // ── DB best-price cache (SQLite, populated by the daily job) ──────────────
   const [mpnDbBestMap, setMpnDbBestMap]                               = useState<Record<string, MpnBestEntry>>({})
@@ -3096,6 +3131,39 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
     setStopMpnHover(false)
   }, [multiMpnInput, searchNexar, qty, mpnComponentQtys, windowDays])
 
+  // Live fallback (SAP) for a single Internal PN — used only when the DB-cached
+  // deep resolver doesn't return a row (e.g. backend resolver failed).
+  const computeDeepLive = useCallback(async (ip: string, signal: AbortSignal) => {
+    const amplData = await apiPostWithRetry<AmplResponse>('/api/pricecalc/ampl', { internal_part_number: ip }, signal)
+    let queryMpns = amplData.mpns_list
+    if (!queryMpns.length) {
+      queryMpns = [
+        ...amplData.blocked.map(i => i.MfgPartNumber),
+        ...amplData.deleted.map(i => i.MfgPartNumber),
+      ].filter(Boolean).filter((v, i, a) => a.indexOf(v) === i)
+    }
+    if (!queryMpns.length) {
+      setDeepAnalysisRows(prev => prev.map(r => r.internalPN === ip
+        ? { ...r, status: 'error', error: 'No MPNs found in SAP' } : r))
+      return
+    }
+    const iqData = await apiPostWithRetry<{ count: number; data: IQItem[] }>(
+      '/api/pricecalc/internal-query', { mpns: queryMpns }, signal
+    )
+    const rows: IQItem[] = Array.isArray(iqData.data) ? iqData.data : []
+    const bestRow = buildPlantSummaries(rows, windowDays * 86400000)[0]?.bestRow ?? null
+    setDeepAnalysisRows(prev => prev.map(r => r.internalPN === ip ? {
+      ...r, status: 'done',
+      mcBestPriceUsd:      bestRow ? resolveLastPoPrice(bestRow) : null,
+      mcStdPriceUsd:       bestRow?.standardPriceUsd ?? null,
+      mcBestSupplier:      bestRow?.supplierName || bestRow?.englishName || '—',
+      mcBestPlant:         bestRow?.siteName || '—',
+      mcBestMpn:           bestRow?.mpn || '—',
+      mcBestInternalPN:    bestRow?.internalPN || '—',
+      mcLastPoDate:        bestRow?.lastPoDate || '—',
+    } : r))
+  }, [windowDays])
+
   const handleDeepAnalysis = useCallback(async (internalPNs: string[]) => {
     if (!internalPNs.length) return
     abortDeepRef.current?.abort()
@@ -3107,47 +3175,51 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
       internalPN: ip, status: 'loading',
       mcBestPriceUsd: null, mcStdPriceUsd: null, mcBestSupplier: '', mcBestPlant: '', mcBestMpn: '', mcBestInternalPN: '', mcLastPoDate: '',
     })))
+    setDeepPage(0)
     setMultiMpnSubTab('deep')
-    await Promise.allSettled(internalPNs.map(async ip => {
-      try {
-        const amplData = await apiPostWithRetry<AmplResponse>('/api/pricecalc/ampl', { internal_part_number: ip }, signal)
-        let queryMpns = amplData.mpns_list
-        if (!queryMpns.length) {
-          queryMpns = [
-            ...amplData.blocked.map(i => i.MfgPartNumber),
-            ...amplData.deleted.map(i => i.MfgPartNumber),
-          ].filter(Boolean).filter((v, i, a) => a.indexOf(v) === i)
-        }
-        if (!queryMpns.length) {
-          setDeepAnalysisRows(prev => prev.map(r => r.internalPN === ip
-            ? { ...r, status: 'error', error: 'No MPNs found in SAP' } : r))
-          return
-        }
-        const iqData = await apiPostWithRetry<{ count: number; data: IQItem[] }>(
-          '/api/pricecalc/internal-query', { mpns: queryMpns }, signal
-        )
-        const rows: IQItem[] = Array.isArray(iqData.data) ? iqData.data : []
-        const bestRow = buildPlantSummaries(rows, windowDays * 86400000)[0]?.bestRow ?? null
-        setDeepAnalysisRows(prev => prev.map(r => r.internalPN === ip ? {
+
+    // ── DB-first: ask the backend for cached deep rows; it computes any misses
+    //    in real time (SAP) and stores them for next time. This makes repeated
+    //    Deep Analysis on previously-seen searches instant. ──
+    try {
+      const resp = await resolveDeep(internalPNs, windowDays)
+      const stillMissing: string[] = []
+      setDeepAnalysisRows(prev => prev.map(r => {
+        const e = resp.results[r.internalPN.toUpperCase()] ?? resp.results[r.internalPN]
+        if (!e) { stillMissing.push(r.internalPN); return r }
+        return {
           ...r, status: 'done',
-          mcBestPriceUsd:      bestRow ? resolveLastPoPrice(bestRow) : null,
-          mcStdPriceUsd:       bestRow?.standardPriceUsd ?? null,
-          mcBestSupplier:      bestRow?.supplierName || bestRow?.englishName || '—',
-          mcBestPlant:         bestRow?.siteName || '—',
-          mcBestMpn:           bestRow?.mpn || '—',
-          mcBestInternalPN:    bestRow?.internalPN || '—',
-          mcLastPoDate:        bestRow?.lastPoDate || '—',
-        } : r))
-      } catch (e) {
+          mcBestPriceUsd:   e.mcBestPriceUsd,
+          mcStdPriceUsd:    e.mcStdPriceUsd,
+          mcBestSupplier:   e.mcBestSupplier || '—',
+          mcBestPlant:      e.mcBestPlant || '—',
+          mcBestMpn:        e.mcBestMpn || '—',
+          mcBestInternalPN: e.mcBestInternalPN || r.internalPN,
+          mcLastPoDate:     e.mcLastPoDate || '—',
+        }
+      }))
+      // Any internal PN the backend couldn't resolve → live SAP fallback.
+      if (stillMissing.length) {
+        await Promise.allSettled(stillMissing.map(ip => computeDeepLive(ip, signal).catch(e => {
+          const isCancelled = e instanceof DOMException && e.name === 'AbortError'
+          setDeepAnalysisRows(prev => prev.map(r => r.internalPN === ip ? {
+            ...r, status: 'error',
+            error: isCancelled ? 'Cancelled' : e instanceof Error ? e.message : String(e),
+          } : r))
+        })))
+      }
+    } catch {
+      // Backend resolver unavailable → fall back to fully-live per-PN compute.
+      await Promise.allSettled(internalPNs.map(ip => computeDeepLive(ip, signal).catch(e => {
         const isCancelled = e instanceof DOMException && e.name === 'AbortError'
         setDeepAnalysisRows(prev => prev.map(r => r.internalPN === ip ? {
           ...r, status: 'error',
           error: isCancelled ? 'Cancelled' : e instanceof Error ? e.message : String(e),
         } : r))
-      }
-    }))
+      })))
+    }
     setDeepAnalysisLoading(false)
-  }, [windowDays])
+  }, [windowDays, computeDeepLive])
 
   const handleMcDeepAnalysis = useCallback(async () => {
     const doneBmats = multiResults.filter(r => r.status === 'done')
@@ -4040,7 +4112,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                           <div className="w-full rounded-lg border border-emerald-200 bg-white overflow-hidden" style={{ height: '172px' }}>
                             <div className="overflow-y-auto h-full">
                               <table className="w-full text-xs border-collapse">
-                                <thead className="sticky top-0 bg-emerald-600 text-white text-[10px] uppercase tracking-wide">
+                                <thead className="sticky top-0 z-[1] bg-emerald-600 text-white text-[10px] uppercase tracking-wide">
                                   <tr>
                                     <th className="px-2 py-1.5 text-center w-8 font-semibold">#</th>
                                     <th className="px-3 py-1.5 text-left font-semibold">Component</th>
@@ -4211,7 +4283,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                       </div>
                       {multiSubTab === 'results' && (<div className="overflow-x-auto rounded-xl border border-gray-200 shadow-sm">
                         <table className="min-w-max w-full text-xs border-collapse">
-                          <thead className="bg-gray-50 text-[10px] uppercase tracking-wide text-gray-500 sticky top-0">
+                          <thead className="bg-gray-50 text-[10px] uppercase tracking-wide text-gray-500 sticky top-0 z-[1]">
                             <tr>
                               <th className="px-2 py-2.5 w-6 border-b border-gray-200" />
                               <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">MPN</th>
@@ -4721,7 +4793,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                       <div className="w-full rounded-lg border border-emerald-200 bg-white overflow-hidden mb-3" style={{ height: '172px' }}>
                         <div className="overflow-y-auto h-full">
                           <table className="w-full text-xs border-collapse">
-                            <thead className="sticky top-0 bg-emerald-600 text-white text-[10px] uppercase tracking-wide">
+                            <thead className="sticky top-0 z-[1] bg-emerald-600 text-white text-[10px] uppercase tracking-wide">
                               <tr>
                                 <th className="px-2 py-1.5 text-center w-8 font-semibold">#</th>
                                 <th className="px-3 py-1.5 text-left font-semibold">MPN</th>
@@ -4973,12 +5045,21 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                       // rows keeps the UI snappy even for thousands of MPNs, while
                       // small result sets still get the same filters/columns.
                       {
-                        type Entry = { mpn: string; bestRow: IQItem; allRows: IQItem[] }
+                        type Entry = { mpn: string; bestRow: IQItem; allRows: IQItem[]; _status?: 'found' | 'pending' | 'nomatch'; _reason?: string }
                         const gridCols: DataGridColumn<Entry>[] = [
                           {
                             key: 'mpn', header: 'MPN', type: 'text',
-                            accessor: e => e.bestRow.mpn,
-                            render: e => <span className="font-mono font-semibold text-emerald-700">{e.bestRow.mpn}</span>,
+                            accessor: e => e._status && e._status !== 'found' ? '' : e.bestRow.mpn,
+                            render: e => {
+                              if (e._status === 'pending') return (
+                                <span className="inline-flex items-center gap-1 text-blue-500">
+                                  <svg className="animate-spin h-3 w-3" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" /></svg>
+                                  querying…
+                                </span>
+                              )
+                              if (e._status === 'nomatch') return <span className="text-gray-300">—</span>
+                              return <span className="font-mono font-semibold text-emerald-700">{e.bestRow.mpn}</span>
+                            },
                           },
                           {
                             key: 'altPn', header: 'Alt PN', type: 'text', noSort: true,
@@ -4997,6 +5078,15 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                             key: 'searched', header: 'Searched', type: 'text',
                             accessor: e => e.mpn,
                             render: e => <span className="font-mono font-semibold text-blue-700">{e.mpn}</span>,
+                          },
+                          {
+                            key: 'status', header: 'Status', type: 'select', align: 'center',
+                            accessor: e => e._status === 'pending' ? 'querying' : e._status === 'nomatch' ? 'no match' : 'found',
+                            render: e => {
+                              if (e._status === 'pending') return <span className="text-[10px] font-semibold text-blue-700 bg-blue-100 px-1.5 py-0.5 rounded">querying…</span>
+                              if (e._status === 'nomatch') return <span className="text-[10px] font-semibold text-gray-500 bg-gray-100 px-1.5 py-0.5 rounded" title={e._reason || ''}>{e._reason || 'no match'}</span>
+                              return <span className="text-[10px] font-semibold text-emerald-700 bg-emerald-100 px-1.5 py-0.5 rounded">found</span>
+                            },
                           },
                           {
                             key: 'internalPN', header: 'Internal PN', type: 'text',
@@ -5113,37 +5203,62 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                             },
                           })
                         }
-                        const missingCount = searchedSubset.filter(m => !foundSet.has(m)).length
+                        const missingMpns = searchedSubset.filter(m => !foundSet.has(m))
+                        const missingCount = missingMpns.length
+
+                        // Placeholder IQItem for pending / no-match synthetic rows so
+                        // every searched MPN is visible in the grid (not just priced ones).
+                        const blankRow = (mpn: string): IQItem => ({
+                          rawStandardPrice: 0, rawStandardPricePer: 0,
+                          rawLastPoPrice: null, rawLastPoPer: null, uomConversion: 1,
+                          localCurrencyExchangeRate: 0, localCurrencyExchangeRateUsd: 0,
+                          mpn, internalPN: '', siteName: '', quantity: undefined as unknown as number,
+                          standardPriceLocalCurr: undefined as unknown as number, lastPoPriceLocalCurr: null,
+                          standardPriceUsd: undefined as unknown as number, lastPoPriceUsd: null,
+                          localCurrency: '', lastPoDate: '', supplierNumber: '', supplierName: '',
+                          englishName: null, manufacturerName: '', materialDescription: '',
+                        })
+
+                        // Build the full display list: priced matches first, then the
+                        // MPNs still querying SAP, then the ones that returned no match.
+                        const pendingEntries: Entry[] = pendingMpns.map(m => ({
+                          mpn: m, bestRow: blankRow(m), allRows: [], _status: 'pending',
+                        }))
+                        const nomatchEntries: Entry[] = missingMpns.map(m => {
+                          const reason = rawSet.has(m) ? 'No valid price data' : blockedSet.has(m) ? 'Blocked / Deleted' : 'No matches'
+                          return { mpn: m, bestRow: blankRow(m), allRows: [], _status: 'nomatch', _reason: reason }
+                        })
+                        const foundEntries: Entry[] = tableEntries.map(e => ({ ...e, _status: 'found' as const }))
+                        const displayRows: Entry[] = [...foundEntries, ...pendingEntries, ...nomatchEntries]
+
                         return (
                           <div>
                             <p className="text-[10px] text-gray-400 mb-1.5">
                               <span className="inline-flex items-center gap-1 text-blue-500">
                                 <svg className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2"><path strokeLinecap="round" strokeLinejoin="round" d="M15 15l-2 5L9 9l11 4-5 2zm0 0l5 5M7.188 2.239l.777 2.897M5.136 7.965l-2.898-.777M13.95 4.05l-2.122 2.122m-5.657 5.656l-2.12 2.122" /></svg>
-                                Click a row
+                                Click a found row
                               </span> to compare suppliers per plant and see potential savings.
+                              {pendingMpns.length > 0 && <span className="ml-2 text-blue-500">· {pendingMpns.length} querying SAP…</span>}
+                              {missingCount > 0 && <span className="ml-2 text-gray-400">· {missingCount} with no priced match</span>}
                             </p>
                             <DataGrid<Entry>
-                              rows={tableEntries}
+                              rows={displayRows}
                               columns={gridCols}
-                              rowKey={(e) => e.mpn}
+                              rowKey={(e) => `${e._status ?? 'found'}-${e.mpn}`}
                               pageSize={50}
                               dense
                               exportFileName={`PPV_MPN_Results_${new Date().toISOString().slice(0, 10)}`}
                               exportSheetName="IQ Results"
-                              onRowClick={(e) => setMpnCompare({ mpn: e.mpn, allRows: e.allRows })}
+                              onRowClick={(e) => { if (e._status === 'found') setMpnCompare({ mpn: e.mpn, allRows: e.allRows }) }}
                               rowClassName={(e, i) => {
+                                if (e._status === 'pending') return 'bg-blue-50/40'
+                                if (e._status === 'nomatch') return 'bg-gray-50/40 opacity-80'
                                 const lpoUsd = resolveLastPoPrice(e.bestRow)
                                 const isLpoGtStd = lpoUsd != null && e.bestRow.standardPriceUsd != null && lpoUsd > e.bestRow.standardPriceUsd
                                 const isSwap = !!(myPlant && e.bestRow.siteName && e.bestRow.siteName !== myPlant)
                                 return isLpoGtStd ? 'bg-red-50 hover:bg-red-100/70' : isSwap ? 'bg-green-50 hover:bg-green-100/70' : i % 2 === 0 ? 'hover:bg-gray-50' : 'bg-gray-50/50 hover:bg-gray-100/50'
                               }}
                             />
-                            {(pendingMpns.length > 0 || missingCount > 0) && (
-                              <p className="text-[10px] text-gray-400 mt-1.5">
-                                {pendingMpns.length > 0 && <span>{pendingMpns.length} still querying SAP… </span>}
-                                {missingCount > 0 && <span>{missingCount} searched MPN{missingCount !== 1 ? 's' : ''} returned no priced match (not shown in grid).</span>}
-                              </p>
-                            )}
                           </div>
                         )
                       }
@@ -5156,7 +5271,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                       if (false) return (
                         <div className="overflow-x-auto rounded-xl border border-gray-200 shadow-sm">
                           <table className="min-w-max w-full text-xs border-collapse">
-                            <thead className="bg-gray-50 text-[10px] uppercase tracking-wide text-gray-500 sticky top-0">
+                            <thead className="bg-gray-50 text-[10px] uppercase tracking-wide text-gray-500 sticky top-0 z-[1]">
                               <tr>
                                 <th className="px-2 py-2.5 w-6 border-b border-gray-200" />
                                 <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">MPN</th>
@@ -5473,45 +5588,48 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                         )}
 
                         {/* ── All Records: per-MPN expander ── */}
-                        {multiMpnSubTab === 'allrecords' && !multiMpnLoading && mpnEntries.length > 0 && (
-                          <div className="rounded-xl border border-gray-200 overflow-hidden shadow-sm">
-                            {mpnEntries.map(({ mpn, allRows }, idx) => {
-                              const isOpen = multiMpnExpandedMpns.has(mpn)
-                              const toggle = () => setMultiMpnExpandedMpns(prev => {
-                                const s = new Set(prev)
-                                isOpen ? s.delete(mpn) : s.add(mpn)
-                                return s
-                              })
-                              return (
-                                <div key={mpn} className={idx > 0 ? 'border-t border-gray-200' : ''}>
-                                  <button
-                                    onClick={toggle}
-                                    className="w-full flex items-center gap-3 px-4 py-3 text-left hover:bg-gray-50 transition-colors"
-                                  >
-                                    <svg
-                                      className={`h-3.5 w-3.5 text-gray-400 flex-shrink-0 transition-transform ${isOpen ? 'rotate-90' : ''}`}
-                                      fill="none" viewBox="0 0 24 24"
-                                    >
-                                      <path stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" d="M9 6l6 6-6 6" />
-                                    </svg>
-                                    <span className="font-mono font-semibold text-sm text-gray-800">{mpn}</span>
-                                    <span className="text-xs text-gray-400 ml-1">{allRows.length} record{allRows.length !== 1 ? 's' : ''}</span>
-                                  </button>
-                                  {isOpen && (
-                                    <div className="overflow-x-auto border-t border-gray-100">
-                                      <table className="min-w-max w-full text-xs border-collapse">
-                                        {iqThead}
-                                        <tbody className="divide-y divide-gray-100">
-                                          {allRows.map((row, i) => iqRow(row, i))}
-                                        </tbody>
-                                      </table>
-                                    </div>
-                                  )}
-                                </div>
-                              )
-                            })}
-                          </div>
-                        )}
+                        {multiMpnSubTab === 'allrecords' && (mpnEntries.length > 0 || multiMpnSearchedList.length > 0) && (() => {
+                          // Flatten every record (cached + loaded so far) into a single
+                          // paginated grid (25 rows/page) so the page stays fast even with
+                          // thousands of records. Includes search, per-column filters & export.
+                          type AllRow = { _mpn: string; row: IQItem }
+                          const flatRows: AllRow[] = mpnEntries.flatMap(e => e.allRows.map(row => ({ _mpn: e.mpn, row })))
+                          const allCols: DataGridColumn<AllRow>[] = [
+                            { key: 'mpn', header: 'MPN', type: 'text', accessor: r => r.row.mpn, render: r => <span className="font-mono text-gray-700">{r.row.mpn}</span> },
+                            { key: 'internalPN', header: 'Internal PN', type: 'text', accessor: r => r.row.internalPN || '', render: r => <span className="font-mono font-semibold text-blue-700">{r.row.internalPN || '—'}</span> },
+                            { key: 'plant', header: 'Plant', type: 'select', align: 'center', accessor: r => r.row.siteName || '' },
+                            { key: 'supplier', header: 'Supplier', type: 'text', accessor: r => r.row.supplierName || r.row.englishName || '', render: r => <span className="text-gray-600 inline-block max-w-[160px] truncate align-bottom" title={r.row.supplierName || r.row.englishName || ''}>{r.row.supplierName || r.row.englishName || '—'}</span> },
+                            { key: 'desc', header: 'Description', type: 'text', accessor: r => r.row.materialDescription || '', render: r => <span className="text-gray-500 inline-block max-w-[200px] truncate align-bottom" title={r.row.materialDescription}>{r.row.materialDescription || '—'}</span> },
+                            { key: 'qty', header: 'Qty', type: 'number', align: 'right', accessor: r => r.row.quantity ?? null, render: r => <span className="font-mono text-gray-700">{r.row.quantity?.toLocaleString() ?? '—'}</span> },
+                            { key: 'cur', header: 'Cur', type: 'select', align: 'center', accessor: r => r.row.localCurrency || '', render: r => <span className="font-mono text-gray-500">{r.row.localCurrency || '—'}</span> },
+                            { key: 'lpoLocal', header: 'Last PO (Local)', type: 'number', align: 'right', accessor: r => resolvePoLocal(r.row), render: r => <span className="font-mono text-gray-700">{resolvePoLocal(r.row) != null ? resolvePoLocal(r.row)!.toLocaleString('en-US', { minimumFractionDigits: 4 }) : '—'}</span> },
+                            { key: 'stdLocal', header: 'Std (Local)', type: 'number', align: 'right', accessor: r => resolveStdLocal(r.row), render: r => <span className="font-mono text-gray-500">{resolveStdLocal(r.row) != null ? resolveStdLocal(r.row)!.toLocaleString('en-US', { minimumFractionDigits: 4 }) : '—'}</span> },
+                            { key: 'lpoUsd', header: 'Last PO (USD)', type: 'number', align: 'right', accessor: r => resolveLastPoPrice(r.row), render: r => <span className="font-mono font-semibold text-blue-700">{fmt6(resolveLastPoPrice(r.row))}</span> },
+                            { key: 'stdUsd', header: 'Std (USD)', type: 'number', align: 'right', accessor: r => r.row.standardPriceUsd ?? null, render: r => <span className="font-mono text-gray-500">{fmt6(r.row.standardPriceUsd)}</span> },
+                            { key: 'date', header: 'Date', type: 'date', accessor: r => r.row.lastPoDate || '', render: r => <span className="text-gray-500">{r.row.lastPoDate || '—'}</span> },
+                          ]
+                          const foundKeys = new Set(mpnEntries.map(e => e.mpn.toUpperCase()))
+                          const pendingMpnsAll = multiMpnSearchedList.filter(m => !foundKeys.has(m.toUpperCase()))
+                          return (
+                            <div>
+                              <DataGrid<AllRow>
+                                rows={flatRows}
+                                columns={allCols}
+                                rowKey={(r, i) => `${r._mpn}-${i}`}
+                                pageSize={25}
+                                dense
+                                exportFileName={`PPV_MPN_All_Records_${new Date().toISOString().slice(0, 10)}`}
+                                exportSheetName="All Records"
+                              />
+                              {pendingMpnsAll.length > 0 && (
+                                <p className="text-[10px] text-gray-400 mt-1.5 flex items-center gap-1.5">
+                                  {multiMpnLoading && <svg className="animate-spin h-3 w-3 text-blue-500" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" /></svg>}
+                                  <span>{pendingMpnsAll.length} MPN{pendingMpnsAll.length !== 1 ? 's' : ''} {multiMpnLoading ? 'still querying SAP…' : 'returned no records'}</span>
+                                </p>
+                              )}
+                            </div>
+                          )
+                        })()}
 
                         {/* ── Deep Analysis tab ── */}
                         {multiMpnSubTab === 'deep' && (
@@ -5559,7 +5677,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                                       </tr>
                                     </thead>
                                     <tbody className="divide-y divide-gray-100">
-                                      {deepAnalysisRows.map(dr => {
+                                      {deepAnalysisRows.slice(deepPage * DEEP_PAGE_SIZE, deepPage * DEEP_PAGE_SIZE + DEEP_PAGE_SIZE).map(dr => {
                                         // Multi-MPN best for this internalPN
                                         const mpnCandidates = mpnEntries.filter(e => e.bestRow.internalPN === dr.internalPN)
                                         const mpnBestEntry = mpnCandidates.reduce<typeof mpnEntries[0] | null>((min, e) => {
@@ -5700,6 +5818,34 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                                     </tbody>
                                   </table>
                                 </div>
+                                {/* Deep Analysis pagination footer (25 rows/page) */}
+                                {deepAnalysisRows.length > DEEP_PAGE_SIZE && (() => {
+                                  const total = deepAnalysisRows.length
+                                  const pageCount = Math.max(1, Math.ceil(total / DEEP_PAGE_SIZE))
+                                  const safePage = Math.min(deepPage, pageCount - 1)
+                                  const fromRow = safePage * DEEP_PAGE_SIZE + 1
+                                  const toRow = Math.min(total, safePage * DEEP_PAGE_SIZE + DEEP_PAGE_SIZE)
+                                  return (
+                                    <div className="flex flex-wrap items-center justify-between gap-2 pt-2">
+                                      <span className="text-[11px] text-gray-500">{fromRow}–{toRow} of {total} internal PNs</span>
+                                      <div className="flex items-center gap-1">
+                                        <button onClick={() => setDeepPage(0)} disabled={safePage === 0} className="p-1 rounded border border-gray-200 text-gray-600 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed" title="First page">
+                                          <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2"><path strokeLinecap="round" strokeLinejoin="round" d="M11 19l-7-7 7-7m8 14l-7-7 7-7" /></svg>
+                                        </button>
+                                        <button onClick={() => setDeepPage(p => Math.max(0, p - 1))} disabled={safePage === 0} className="p-1 rounded border border-gray-200 text-gray-600 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed" title="Previous page">
+                                          <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2"><path strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7" /></svg>
+                                        </button>
+                                        <span className="px-2 text-[11px] text-gray-600 whitespace-nowrap">Page <span className="font-semibold">{safePage + 1}</span> / {pageCount}</span>
+                                        <button onClick={() => setDeepPage(p => Math.min(pageCount - 1, p + 1))} disabled={safePage >= pageCount - 1} className="p-1 rounded border border-gray-200 text-gray-600 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed" title="Next page">
+                                          <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2"><path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" /></svg>
+                                        </button>
+                                        <button onClick={() => setDeepPage(pageCount - 1)} disabled={safePage >= pageCount - 1} className="p-1 rounded border border-gray-200 text-gray-600 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed" title="Last page">
+                                          <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2"><path strokeLinecap="round" strokeLinejoin="round" d="M13 5l7 7-7 7M5 5l7 7-7 7" /></svg>
+                                        </button>
+                                      </div>
+                                    </div>
+                                  )
+                                })()}
                               </div>
                             )}
                           </div>
@@ -5712,57 +5858,57 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                               <p className="text-sm text-gray-400 py-6 text-center">Fetching AMPL data…</p>
                             ) : blockedGroups.length === 0 ? (
                               <p className="text-sm text-gray-500 py-8 text-center">No blocked or deleted MPNs found for the internal part numbers in this search.</p>
-                            ) : (
-                              <div className="space-y-4">
-                                {blockedGroups.map(group => {
-                                  const isDanger = group.code === 'F' || group.code === 'ER'
-                                  const seen = new Set<string>()
-                                  const dedupedItems = group.items.filter(item => {
-                                    const altPn = item.mpnPartNumber && item.mpnPartNumber !== item.mpn ? item.mpnPartNumber : '—'
-                                    const key = `${item.internalPN}|${item.mpn}|${altPn}|${item.mfgName || '—'}`
-                                    if (seen.has(key)) return false
-                                    seen.add(key)
-                                    return true
-                                  })
-                                  return (
-                                    <div key={`${group.kind}:${group.code}`}>
-                                      {/* Group header */}
-                                      <div className={`flex items-center gap-3 px-4 py-2.5 rounded-t-xl border ${isDanger ? 'bg-red-50 border-red-200' : group.kind === 'blocked' ? 'bg-amber-50 border-amber-200' : 'bg-red-50 border-red-200'}`}>
-                                        <span className={`text-[11px] font-bold px-2 py-0.5 rounded-full ${isDanger ? 'bg-red-200 text-red-800' : group.kind === 'blocked' ? 'bg-amber-200 text-amber-800' : 'bg-red-200 text-red-800'}`}>
-                                          {group.kind === 'blocked' ? 'BLOCKED' : 'DELETED'}
-                                        </span>
-                                        <span className="font-mono font-bold text-sm text-gray-800">{group.code}</span>
-                                        <span className="text-gray-600 text-sm flex-1">{group.reason}</span>
-                                        <span className="text-xs text-gray-500 bg-white border border-gray-200 rounded-full px-2 py-0.5">{dedupedItems.length} MPN{dedupedItems.length !== 1 ? 's' : ''}</span>
-                                      </div>
-                                      {/* Items table */}
-                                      <div className="overflow-x-auto border border-t-0 border-gray-200 rounded-b-xl">
-                                        <table className="min-w-max w-full text-xs">
-                                          <thead className="bg-gray-50 text-[10px] uppercase tracking-wide text-gray-500">
-                                            <tr>
-                                              <th className="px-3 py-2 text-left border-b border-gray-200 whitespace-nowrap">Internal PN</th>
-                                              <th className="px-3 py-2 text-left border-b border-gray-200 whitespace-nowrap">MPN</th>
-                                              <th className="px-3 py-2 text-left border-b border-gray-200 whitespace-nowrap">Alt PN</th>
-                                              <th className="px-3 py-2 text-left border-b border-gray-200 whitespace-nowrap">Manufacturer</th>
-                                            </tr>
-                                          </thead>
-                                          <tbody className="divide-y divide-gray-100">
-                                            {dedupedItems.map((item, idx) => (
-                                              <tr key={idx} className="hover:bg-gray-50">
-                                                <td className="px-3 py-1.5 font-mono font-semibold text-blue-700 whitespace-nowrap">{item.internalPN}</td>
-                                                <td className="px-3 py-1.5 font-mono text-gray-700 whitespace-nowrap">{item.mpn}</td>
-                                                <td className="px-3 py-1.5 font-mono text-gray-500 whitespace-nowrap">{item.mpnPartNumber && item.mpnPartNumber !== item.mpn ? item.mpnPartNumber : '—'}</td>
-                                                <td className="px-3 py-1.5 text-gray-600">{item.mfgName || '—'}</td>
-                                              </tr>
-                                            ))}
-                                          </tbody>
-                                        </table>
-                                      </div>
-                                    </div>
-                                  )
-                                })}
-                              </div>
-                            )}
+                            ) : (() => {
+                              // Flatten all blocked/deleted groups into one paginated grid
+                              // (25 rows/page) with filters by Kind / Code / Reason so the
+                              // page stays fast and the user can drill down by reason.
+                              type BlkRow = {
+                                kind: 'blocked' | 'deleted'; code: string; reason: string
+                                internalPN: string; mpn: string; altPn: string; mfgName: string
+                              }
+                              const seenAll = new Set<string>()
+                              const flatBlocked: BlkRow[] = blockedGroups.flatMap(group =>
+                                group.items.map(item => {
+                                  const altPn = item.mpnPartNumber && item.mpnPartNumber !== item.mpn ? item.mpnPartNumber : '—'
+                                  return {
+                                    kind: group.kind, code: group.code, reason: group.reason,
+                                    internalPN: item.internalPN, mpn: item.mpn, altPn, mfgName: item.mfgName || '—',
+                                  }
+                                }),
+                              ).filter(r => {
+                                const key = `${r.kind}|${r.code}|${r.internalPN}|${r.mpn}|${r.altPn}|${r.mfgName}`
+                                if (seenAll.has(key)) return false
+                                seenAll.add(key)
+                                return true
+                              })
+                              const blkCols: DataGridColumn<BlkRow>[] = [
+                                {
+                                  key: 'kind', header: 'Kind', type: 'select', align: 'center',
+                                  accessor: r => r.kind === 'blocked' ? 'BLOCKED' : 'DELETED',
+                                  render: r => {
+                                    const isDanger = r.code === 'F' || r.code === 'ER'
+                                    return <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${isDanger ? 'bg-red-200 text-red-800' : r.kind === 'blocked' ? 'bg-amber-200 text-amber-800' : 'bg-red-200 text-red-800'}`}>{r.kind === 'blocked' ? 'BLOCKED' : 'DELETED'}</span>
+                                  },
+                                },
+                                { key: 'code', header: 'Code', type: 'select', align: 'center', accessor: r => r.code, render: r => <span className="font-mono font-bold text-gray-800">{r.code}</span> },
+                                { key: 'reason', header: 'Reason', type: 'text', accessor: r => r.reason, render: r => <span className="text-gray-600">{r.reason}</span> },
+                                { key: 'internalPN', header: 'Internal PN', type: 'text', accessor: r => r.internalPN, render: r => <span className="font-mono font-semibold text-blue-700">{r.internalPN}</span> },
+                                { key: 'mpn', header: 'MPN', type: 'text', accessor: r => r.mpn, render: r => <span className="font-mono text-gray-700">{r.mpn}</span> },
+                                { key: 'altPn', header: 'Alt PN', type: 'text', accessor: r => r.altPn, render: r => <span className="font-mono text-gray-500">{r.altPn}</span> },
+                                { key: 'mfgName', header: 'Manufacturer', type: 'text', accessor: r => r.mfgName, render: r => <span className="text-gray-600">{r.mfgName}</span> },
+                              ]
+                              return (
+                                <DataGrid<BlkRow>
+                                  rows={flatBlocked}
+                                  columns={blkCols}
+                                  rowKey={(r, i) => `${r.kind}-${r.code}-${i}`}
+                                  pageSize={25}
+                                  dense
+                                  exportFileName={`PPV_MPN_Blocked_Deleted_${new Date().toISOString().slice(0, 10)}`}
+                                  exportSheetName="Blocked Deleted"
+                                />
+                              )
+                            })()}
                           </div>
                         )}
                       </div>
@@ -6137,7 +6283,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                     return (
                       <div className="overflow-x-auto rounded-xl border border-gray-200 shadow-sm">
                         <table className="min-w-max w-full text-xs border-collapse">
-                          <thead className="bg-gray-50 text-[10px] uppercase tracking-wide text-gray-500 sticky top-0">
+                          <thead className="bg-gray-50 text-[10px] uppercase tracking-wide text-gray-500 sticky top-0 z-[1]">
                             <tr>
                               <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">MPN</th>
                               <th className="px-3 py-2.5 text-left whitespace-nowrap border-b border-gray-200">Internal PN</th>
@@ -6435,6 +6581,8 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
             localCurrency: r.localCurrency || '',
             lastPoLocal: resolvePoLocal(r),
           }))}
+          demand={mpnCompareDemand}
+          demandLoading={mpnCompareDemandLoading}
           onClose={() => setMpnCompare(null)}
         />
       )}
