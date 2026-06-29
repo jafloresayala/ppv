@@ -18,6 +18,10 @@ COL_FX    = "Exchange_rate_difference_num"
 # CACHE_TTL_FORECAST  = 7200 (2 h  — forecast models)
 # ── Price Calculator proxy (conexion_internalquery backend) ─────────────────
 PRICECALC_API_URL = "http://localhost:8081"
+# Default Nexar offers/results limit per MPN (caps upstream GraphQL `limit` to
+# save API requests). Override via env var. Frontend may send its own limit.
+import os as _os_pc
+NEXAR_RESULT_LIMIT = int(_os_pc.getenv("NEXAR_RESULT_LIMIT", "10"))
 
 # ── Daily MPN pre-compute job (SQLite best-price cache) ─────────────────────
 import os as _os

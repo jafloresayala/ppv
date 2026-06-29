@@ -314,9 +314,79 @@ def read_mpns_from_file(path: str) -> list[str]:
     return unique
 
 
+def list_source_files() -> list[str]:
+    """Every .xlsx in DBQUERY_DIR (one per plant), excluding temp ~$ lock files."""
+    if not os.path.isdir(DBQUERY_DIR):
+        return []
+    files = [
+        f for f in glob.glob(os.path.join(DBQUERY_DIR, "*.xls*"))
+        if not os.path.basename(f).startswith("~$")
+    ]
+    return sorted(files)
+
+
+def read_mpns_from_all_files() -> tuple[list[str], list[dict]]:
+    """Concatenate every plant .xlsx, drop Total EAU == 0 rows, return UNIQUE MPNs.
+
+    Each file is read independently. A file whose required column
+    (DBQUERY_MPN_COL) is missing — or that fails to read — is SKIPPED and flagged
+    in the per-file report instead of breaking the whole union. This lets one
+    bad/renamed file not stop the others.
+
+    Returns:
+        (unique_mpns, reports) where `reports` is a list of dicts per file:
+          { file, ok, rows, kept, mpns, error }
+    """
+    paths = list_source_files()
+    reports: list[dict] = []
+    seen: set[str] = set()
+    unique: list[str] = []
+
+    for path in paths:
+        name = os.path.basename(path)
+        rep: dict = {"file": name, "ok": False, "rows": 0, "kept": 0, "mpns": 0, "error": None}
+        try:
+            df = pd.read_excel(path, engine="openpyxl")
+            rep["rows"] = int(len(df))
+
+            if DBQUERY_MPN_COL not in df.columns:
+                rep["error"] = (
+                    f'Falta la columna "{DBQUERY_MPN_COL}". '
+                    f"Columnas encontradas: {list(df.columns)[:30]}"
+                )
+                reports.append(rep)
+                continue
+
+            # Drop rows whose Total EAU is 0/empty/non-numeric (when the column exists).
+            if DBQUERY_EAU_COL in df.columns:
+                eau = pd.to_numeric(df[DBQUERY_EAU_COL], errors="coerce").fillna(0)
+                df = df[eau != 0]
+            rep["kept"] = int(len(df))
+
+            file_mpns = (
+                df[DBQUERY_MPN_COL].astype(str).str.strip().str.upper()
+            )
+            file_mpns = file_mpns[(file_mpns != "") & (file_mpns != "NAN")]
+
+            added = 0
+            for m in file_mpns:
+                if m not in seen:
+                    seen.add(m)
+                    unique.append(m)
+                    added += 1
+            rep["mpns"] = added
+            rep["ok"] = True
+        except Exception as exc:  # noqa: BLE001 — a bad file is flagged, not fatal
+            rep["error"] = str(exc)[:500]
+        reports.append(rep)
+
+    return unique, reports
+
+
 # ── Logging helper ────────────────────────────────────────────────────────────
 
-def _write_log(run_id: int, source_file: str | None, summary: dict, errors: list[dict]) -> str:
+def _write_log(run_id: int, source_file: str | None, summary: dict, errors: list[dict],
+               file_reports: list[dict] | None = None) -> str:
     os.makedirs(LOGS_DIR, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = os.path.join(LOGS_DIR, f"dbjob_{stamp}_run{run_id}.log")
@@ -327,6 +397,20 @@ def _write_log(run_id: int, source_file: str | None, summary: dict, errors: list
         f"Source file: {source_file or '(none)'}",
         f"Trigger:     {summary.get('trigger')}",
         "=" * 70,
+    ]
+    # Per-file union report (which plant files were read / skipped).
+    if file_reports:
+        lines.append("SOURCE FILES (union):")
+        for r in file_reports:
+            if r.get("ok"):
+                lines.append(
+                    f"  ✅ {r['file']:<28} rows={r.get('rows', 0):>7} "
+                    f"kept={r.get('kept', 0):>7} +mpns={r.get('mpns', 0):>7}"
+                )
+            else:
+                lines.append(f"  ❌ {r['file']:<28} SKIPPED — {r.get('error')}")
+        lines.append("=" * 70)
+    lines += [
         f"Total MPNs:        {summary.get('total', 0)}",
         f"Succeeded:         {summary.get('success', 0)}",
         f"Errors (total):    {summary.get('errors', 0)}",
@@ -355,17 +439,35 @@ def _run(trigger: str, mpns: list[str] | None, window_days: int, skip_cached: bo
 
     source_file = None
     from_file = mpns is None
+    file_reports: list[dict] = []
     if mpns is None:
-        source_file = find_latest_source_file()
-        if not source_file:
-            _set_state(running=False, status="failed",
-                       message=f"No .xlsx file found in {DBQUERY_DIR}")
-            return
+        # Concatenate ALL plant files (KEMX, KEJ, KECN, KEPL, KETL, KERO, …).
+        # Each file is validated independently; a file with a column mismatch is
+        # skipped and flagged rather than failing the whole union.
         try:
-            mpns = read_mpns_from_file(source_file)
+            mpns, file_reports = read_mpns_from_all_files()
         except Exception as e:
             _set_state(running=False, status="failed", message=str(e))
             return
+
+        ok_files = [r for r in file_reports if r.get("ok")]
+        bad_files = [r for r in file_reports if not r.get("ok")]
+
+        if not file_reports:
+            _set_state(running=False, status="failed",
+                       message=f"No .xlsx file found in {DBQUERY_DIR}")
+            return
+        if not mpns:
+            bad_summary = "; ".join(f"{r['file']}: {r['error']}" for r in bad_files) or "sin MPNs válidos"
+            _set_state(running=False, status="failed",
+                       message=f"No se obtuvieron MPNs de ningún archivo. {bad_summary}")
+            return
+
+        # Human-readable source label + a heads-up when some files were skipped.
+        source_file = ", ".join(r["file"] for r in ok_files) or "(varios)"
+        if bad_files:
+            skipped = "; ".join(f"{r['file']} ({r['error']})" for r in bad_files)
+            _set_state(message=f"⚠ Archivos omitidos por discrepancia de columnas: {skipped}")
 
     # ── Force full re-run: build into a NEW versioned DB so the active cache is
     #    never wiped. Users keep hitting the old DB while this runs in the
@@ -398,7 +500,7 @@ def _run(trigger: str, mpns: list[str] | None, window_days: int, skip_cached: bo
                    total=file_total, processed=0, success=0, errors=0, conn_errors=0,
                    started_at=datetime.now().isoformat(),
                    finished_at=datetime.now().isoformat(),
-                   source_file=os.path.basename(source_file) if source_file else None,
+                   source_file=source_file,
                    message=f"All {file_total} MPNs already cached — nothing to do.")
         return
 
@@ -410,12 +512,12 @@ def _run(trigger: str, mpns: list[str] | None, window_days: int, skip_cached: bo
         store.set_build_target(build_path)
         _set_state(message=f"Building new database {build_file} (active DB stays live)…")
 
-    run_id = store.create_run(trigger, total, os.path.basename(source_file) if source_file else None)
+    run_id = store.create_run(trigger, total, source_file)
 
     _set_state(running=True, run_id=run_id, trigger=trigger, total=total,
                processed=0, success=0, errors=0, conn_errors=0,
                started_at=datetime.now().isoformat(), finished_at=None,
-               status="running", source_file=os.path.basename(source_file) if source_file else None,
+               status="running", source_file=source_file,
                message=(f"Resuming — {skipped} already cached, {total} pending." if skipped else ""))
 
     processed = success = errors = conn_errors = 0
@@ -482,7 +584,7 @@ def _run(trigger: str, mpns: list[str] | None, window_days: int, skip_cached: bo
         "trigger": trigger, "total": total, "success": success,
         "errors": errors, "conn_errors": conn_errors, "status": status,
     }
-    log_path = _write_log(run_id, source_file, summary, error_records)
+    log_path = _write_log(run_id, source_file, summary, error_records, file_reports)
 
     store.update_run_progress(run_id, processed, success, errors, conn_errors)
     store.finish_run(run_id, status, log_path)

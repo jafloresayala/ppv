@@ -215,41 +215,27 @@ export default function SupplierComparePanel({ mpn, records, demand = [], demand
     return () => { cancelled = true }
   }, [view, mpn, fullDemand])
 
-  // Map "PLANT|SOURCE_VENDOR_NAME" → demand row. The dbquery 'Source Vendor
-  // Name' column identifies the supplier, and the demand is plant-specific, so
-  // we key by BOTH plant and vendor to avoid attaching another plant's demand.
-  const demandByPlantVendor = useMemo(() => {
-    const m = new Map<string, DemandRow>()
-    for (const d of demand) {
-      const plantKey = (d.plantName || '').trim().toUpperCase()
-      const vendorKey = (d.sourceVendorName || '').trim().toUpperCase()
-      if (!plantKey || !vendorKey) continue
-      m.set(`${plantKey}|${vendorKey}`, d)
-    }
-    return m
-  }, [demand])
-
-  /** Resolve the demand row for a supplier record by matching BOTH the plant
-   * and the supplier (Source Vendor Name == Supplier). No cross-plant fallback:
-   * even if the same MPN/vendor exists in another plant, that demand belongs to
-   * a different plant and must NOT be shown here. Returns undefined on no match. */
-  const demandForRecord = (r: CompareRecord): DemandRow | undefined => {
-    const plantKey = (r.plant || '').trim().toUpperCase()
-    const supplierKey = (r.supplier || '').trim().toUpperCase()
-    if (!plantKey || !supplierKey) return undefined
-    return demandByPlantVendor.get(`${plantKey}|${supplierKey}`)
-  }
-
-  // Overall MPN demand totals (summed across all plants in the demand file).
+  // MPN demand totals: a grand total (sum of EVERY demand row) plus a per-plant
+  // breakdown. Rows are NOT de-duplicated, so a plant with several rows for the
+  // same MPN is fully summed — matching what you get summing the Excel column.
   const demandTotals = useMemo(() => {
     let eau = 0, onhand = 0, gross = 0
     let any = false
+    const byPlant = new Map<string, { eau: number; onhand: number; gross: number; rows: number }>()
     for (const d of demand) {
-      if (d.totalEau != null) { eau += d.totalEau; any = true }
-      if (d.onhandQty != null) { onhand += d.onhandQty; any = true }
-      if (d.grossDemand != null) { gross += d.grossDemand; any = true }
+      const plantKey = (d.plantName || d.plantCode || '—').toUpperCase()
+      const acc = byPlant.get(plantKey) ?? { eau: 0, onhand: 0, gross: 0, rows: 0 }
+      acc.rows += 1
+      if (d.totalEau != null)    { eau    += d.totalEau;    acc.eau    += d.totalEau;    any = true }
+      if (d.onhandQty != null)   { onhand += d.onhandQty;   acc.onhand += d.onhandQty;   any = true }
+      if (d.grossDemand != null) { gross  += d.grossDemand; acc.gross  += d.grossDemand; any = true }
+      byPlant.set(plantKey, acc)
     }
-    return any ? { eau, onhand, gross } : null
+    if (!any) return null
+    const plants = [...byPlant.entries()]
+      .map(([plant, v]) => ({ plant, ...v }))
+      .sort((a, b) => a.plant.localeCompare(b.plant))
+    return { eau, onhand, gross, plants, totalRows: demand.length }
   }, [demand])
 
   // Default base plant = the one with the most records (likely the main buyer).
@@ -464,12 +450,31 @@ export default function SupplierComparePanel({ mpn, records, demand = [], demand
                 <span className="text-[11px] text-gray-600">Onhand Qty <span className="font-bold text-indigo-700 font-mono">{demandTotals.onhand.toLocaleString()}</span></span>
                 <span className="text-gray-300">·</span>
                 <span className="text-[11px] text-gray-600">Gross Demand <span className="font-bold text-indigo-700 font-mono">{demandTotals.gross.toLocaleString()}</span></span>
-                <span className="ml-1 text-[10px] text-gray-400">(sum across {demand.length} plant{demand.length !== 1 ? 's' : ''})</span>
+                <span className="ml-1 text-[10px] text-gray-400">(grand total · {demandTotals.totalRows} demand row{demandTotals.totalRows !== 1 ? 's' : ''})</span>
               </>
             ) : (
               <span className="text-[11px] text-gray-400 italic">No demand data for this MPN in the active demand database.</span>
             )}
           </div>
+
+          {/* Per-plant breakdown of the same totals */}
+          {!demandLoading && demandTotals && demandTotals.plants.length > 0 && (
+            <div className="mt-2 flex flex-wrap gap-2">
+              {demandTotals.plants.map(p => (
+                <div key={p.plant} className="rounded-lg border border-indigo-100 bg-white px-2.5 py-1.5">
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-[10px] font-bold font-mono text-indigo-700">{p.plant}</span>
+                    <span className="text-[9px] text-gray-400">{p.rows} row{p.rows !== 1 ? 's' : ''}</span>
+                  </div>
+                  <div className="flex items-center gap-2 mt-0.5">
+                    <span className="text-[10px] text-gray-500">EAU <span className="font-mono font-semibold text-gray-700">{p.eau.toLocaleString()}</span></span>
+                    <span className="text-[10px] text-gray-500">Onhand <span className="font-mono font-semibold text-gray-700">{p.onhand.toLocaleString()}</span></span>
+                    <span className="text-[10px] text-gray-500">Gross <span className="font-mono font-semibold text-gray-700">{p.gross.toLocaleString()}</span></span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
 
         {/* Comparison table */}
@@ -486,9 +491,6 @@ export default function SupplierComparePanel({ mpn, records, demand = [], demand
                   <th className="px-2.5 py-2 text-right whitespace-nowrap border-b border-gray-200">Δ / unit</th>
                   <th className="px-2.5 py-2 text-right whitespace-nowrap border-b border-gray-200">PO Qty</th>
                   <th className="px-2.5 py-2 text-right whitespace-nowrap border-b border-gray-200">Potential Saving</th>
-                  <th className="px-2.5 py-2 text-right whitespace-nowrap border-b border-indigo-200 bg-indigo-50/60 text-indigo-600">Total EAU</th>
-                  <th className="px-2.5 py-2 text-right whitespace-nowrap border-b border-indigo-200 bg-indigo-50/60 text-indigo-600">Onhand Qty</th>
-                  <th className="px-2.5 py-2 text-right whitespace-nowrap border-b border-indigo-200 bg-indigo-50/60 text-indigo-600">Gross Demand</th>
                   <th className="px-2.5 py-2 text-left whitespace-nowrap border-b border-gray-200">Date</th>
                 </tr>
               </thead>
@@ -510,19 +512,6 @@ export default function SupplierComparePanel({ mpn, records, demand = [], demand
                       <td className={`px-2.5 py-2 text-right font-mono font-semibold whitespace-nowrap ${l.saveTotal && l.saveTotal > 0 ? 'text-emerald-700' : 'text-gray-300'}`}>
                         {l.saveTotal && l.saveTotal > 0 ? fmtUsd2(l.saveTotal) : (l.saveTotal == null ? 'n/a (no qty)' : '—')}
                       </td>
-                      {(() => {
-                        const d = demandForRecord(l.r)
-                        const matchedBy = d
-                          ? `Matched by plant + Source Vendor Name: ${d.plantName} · ${d.sourceVendorName}`
-                          : `No demand for this supplier in plant ${l.r.plant || '—'} (Source Vendor Name must match the Supplier)`
-                        return (
-                          <>
-                            <td className="px-2.5 py-2 text-right font-mono text-indigo-700 whitespace-nowrap bg-indigo-50/30" title={matchedBy}>{d?.totalEau != null ? d.totalEau.toLocaleString() : '—'}</td>
-                            <td className="px-2.5 py-2 text-right font-mono text-indigo-700 whitespace-nowrap bg-indigo-50/30" title={matchedBy}>{d?.onhandQty != null ? d.onhandQty.toLocaleString() : '—'}</td>
-                            <td className="px-2.5 py-2 text-right font-mono text-indigo-700 whitespace-nowrap bg-indigo-50/30" title={matchedBy}>{d?.grossDemand != null ? d.grossDemand.toLocaleString() : '—'}</td>
-                          </>
-                        )
-                      })()}
                       <td className="px-2.5 py-2 text-gray-500 whitespace-nowrap">
                         {l.r.lastPoDate || '—'}
                         {!l.within && l.price != null && l.price > 0 && (

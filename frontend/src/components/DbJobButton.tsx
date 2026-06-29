@@ -29,6 +29,10 @@ export default function DbJobButton() {
   const [open, setOpen]       = useState(false)
   const [busy, setBusy]       = useState(false)
   const [adminOpen, setAdminOpen] = useState(false)
+  // True while a bulk re-query is running inside the admin modal. We keep the
+  // modal MOUNTED (just hidden) when it's closed mid-run so the re-query keeps
+  // going even after the user leaves the admin panel.
+  const [adminBulkRunning, setAdminBulkRunning] = useState(false)
   const panelRef = useRef<HTMLDivElement | null>(null)
 
   const refresh = useCallback(async () => {
@@ -198,14 +202,27 @@ export default function DbJobButton() {
         </div>
       )}
 
-      {adminOpen && <AdminDashboardModal onClose={() => setAdminOpen(false)} />}
+      {/* Keep the modal mounted while a bulk re-query is running, even if the
+          user closes it — otherwise unmounting would abort the search. When
+          closed we hide it (visible=false) but let the loop finish. */}
+      {(adminOpen || adminBulkRunning) && (
+        <AdminDashboardModal
+          visible={adminOpen}
+          onClose={() => setAdminOpen(false)}
+          onBulkRunningChange={setAdminBulkRunning}
+        />
+      )}
     </div>
   )
 }
 
 // ── Admin dashboard modal ─────────────────────────────────────────────────────
 
-function AdminDashboardModal({ onClose }: { onClose: () => void }) {
+function AdminDashboardModal({ visible, onClose, onBulkRunningChange }: {
+  visible: boolean
+  onClose: () => void
+  onBulkRunningChange: (running: boolean) => void
+}) {
   const [token, setToken]   = useState<string | null>(null)
   const [user, setUser]     = useState('')
   const [pass, setPass]     = useState('')
@@ -221,7 +238,24 @@ function AdminDashboardModal({ onClose }: { onClose: () => void }) {
   const [counts, setCounts]         = useState<Record<string, number>>({})
   const [requerying, setRequerying] = useState<Set<string>>(new Set())
   const [bulkBusy, setBulkBusy]     = useState(false)
+  // Which bulk re-query is currently running, so only that button shows the
+  // spinner (the others are merely disabled, not shown as loading).
+  const [bulkMode, setBulkMode]     = useState<'' | 'failed' | 'internalPN' | 'searched'>('')
+  // Cooperative cancellation flag for the chunked bulk re-query loop. The loop
+  // checks this between batches and stops cleanly when the user pauses/cancels.
+  const cancelBulkRef = useRef(false)
+  // Mirror of the cancel flag as state, so the Pause button updates visually.
+  const [bulkCancelRequested, setBulkCancelRequested] = useState(false)
   const [notice, setNotice]         = useState('')
+  // When true, only show rows that DID resolve an Internal PN. These are worth
+  // re-querying because an Internal PN was found but no price — a re-query
+  // usually recovers the price. Rows with no Internal PN are typically invalid
+  // MPNs or have no purchase history, so re-querying them rarely helps.
+  const [onlyWithInternalPN, setOnlyWithInternalPN] = useState(false)
+
+  // Tell the parent whether a bulk re-query is running, so it keeps this modal
+  // mounted (hidden) after the user closes the panel until the loop finishes.
+  useEffect(() => { onBulkRunningChange(bulkBusy) }, [bulkBusy, onBulkRunningChange])
 
   // ── Local DB version control ──
   const [dbVersions, setDbVersions] = useState<DbVersion[]>([])
@@ -428,7 +462,7 @@ function AdminDashboardModal({ onClose }: { onClose: () => void }) {
 
   const requeryAllFailed = async () => {
     if (!token) return
-    setBulkBusy(true); setNotice('')
+    setBulkBusy(true); setBulkMode('failed'); setNotice('')
     try {
       const res = await adminRequeryFailed(token, ['no_price', 'error'])
       setNotice(res.started
@@ -436,7 +470,7 @@ function AdminDashboardModal({ onClose }: { onClose: () => void }) {
         : (res.reason ?? 'Nothing to re-query.'))
     } catch {
       setNotice('Failed to start bulk re-query.')
-    } finally { setBulkBusy(false) }
+    } finally { setBulkBusy(false); setBulkMode('') }
   }
 
   // Re-query every MPN currently shown in the search results (synchronous,
@@ -445,32 +479,102 @@ function AdminDashboardModal({ onClose }: { onClose: () => void }) {
     if (!token || !results || results.length === 0) return
     const mpns = [...new Set(results.map(r => r.mpn).filter(Boolean))]
     if (mpns.length === 0) return
-    setBulkBusy(true); setNotice('')
-    setRequerying(new Set(mpns))
+    cancelBulkRef.current = false; setBulkCancelRequested(false)
+    setBulkBusy(true); setBulkMode('searched'); setNotice('')
     try {
-      const CHUNK = 50
+      // Small chunks (matches the backend's 6 parallel workers) so results show
+      // up progressively and a pause stops quickly after the current batch.
+      const CHUNK = 6
       let okTotal = 0
+      let processed = 0
       const merged = new Map(results.map(r => [r.mpn, r]))
       for (let i = 0; i < mpns.length; i += CHUNK) {
+        if (cancelBulkRef.current) {
+          setNotice(`Re-query paused — ${processed}/${mpns.length} done (${okTotal} resolved). The rest were left untouched.`)
+          break
+        }
         const batch = mpns.slice(i, i + CHUNK)
+        setRequerying(new Set(batch))   // spinner only on the rows in flight
         const res = await adminRequeryMpns(token, batch)
         for (const u of res.results) if (u?.mpn) merged.set(u.mpn, u)
         okTotal += res.summary?.ok ?? 0
+        processed = Math.min(i + CHUNK, mpns.length)
         setResults(Array.from(merged.values()))
         setCounts(res.status_counts ?? {})
-        setNotice(`Re-querying… ${Math.min(i + CHUNK, mpns.length)}/${mpns.length} done`)
+        setNotice(`Re-querying… ${processed}/${mpns.length} done`)
       }
-      setNotice(`Re-queried ${mpns.length} MPN(s) — ${okTotal} resolved with a price.`)
+      if (!cancelBulkRef.current) setNotice(`Re-queried ${mpns.length} MPN(s) — ${okTotal} resolved with a price.`)
     } catch {
       setNotice('Bulk re-query of searched MPNs failed.')
     } finally {
       setRequerying(new Set())
       setBulkBusy(false)
+      setBulkMode('')
+      cancelBulkRef.current = false; setBulkCancelRequested(false)
     }
   }
 
+  // Re-query only the rows that have a resolved Internal PN (synchronous, chunked).
+  // These are the entries most likely to recover a price on a second attempt.
+  const requeryWithInternalPN = async () => {
+    if (!token || !results || results.length === 0) return
+    const mpns = [...new Set(
+      results.filter(r => (r.internalPN ?? '').trim() !== '').map(r => r.mpn).filter(Boolean),
+    )]
+    if (mpns.length === 0) { setNotice('No rows with an Internal PN to re-query.'); return }
+    cancelBulkRef.current = false; setBulkCancelRequested(false)
+    setBulkBusy(true); setBulkMode('internalPN'); setNotice('')
+    try {
+      // Small chunks (matches the backend's 6 parallel workers) so results show
+      // up progressively and a pause stops quickly after the current batch.
+      const CHUNK = 6
+      let okTotal = 0
+      let processed = 0
+      const merged = new Map(results.map(r => [r.mpn, r]))
+      for (let i = 0; i < mpns.length; i += CHUNK) {
+        if (cancelBulkRef.current) {
+          setNotice(`Re-query paused — ${processed}/${mpns.length} done (${okTotal} resolved). The rest were left untouched.`)
+          break
+        }
+        const batch = mpns.slice(i, i + CHUNK)
+        setRequerying(new Set(batch))   // spinner only on the rows in flight
+        const res = await adminRequeryMpns(token, batch)
+        for (const u of res.results) if (u?.mpn) merged.set(u.mpn, u)
+        okTotal += res.summary?.ok ?? 0
+        processed = Math.min(i + CHUNK, mpns.length)
+        setResults(Array.from(merged.values()))
+        setCounts(res.status_counts ?? {})
+        setNotice(`Re-querying (with Internal PN)… ${processed}/${mpns.length} done`)
+      }
+      if (!cancelBulkRef.current) setNotice(`Re-queried ${mpns.length} MPN(s) with an Internal PN — ${okTotal} resolved with a price.`)
+    } catch {
+      setNotice('Bulk re-query of Internal-PN MPNs failed.')
+    } finally {
+      setRequerying(new Set())
+      setBulkBusy(false)
+      setBulkMode('')
+      cancelBulkRef.current = false; setBulkCancelRequested(false)
+    }
+  }
+
+  // Request the running chunked bulk re-query to stop after the current batch.
+  const pauseBulk = () => {
+    if (bulkBusy) { cancelBulkRef.current = true; setBulkCancelRequested(true); setNotice('Pausing after the current batch…') }
+  }
+
+  // Rows shown in the table: optionally narrowed to those that resolved an Internal PN.
+  const displayedResults = results
+    ? (onlyWithInternalPN ? results.filter(r => (r.internalPN ?? '').trim() !== '') : results)
+    : null
+  const withInternalPnCount = results
+    ? results.filter(r => (r.internalPN ?? '').trim() !== '').length
+    : 0
+
   return (
-    <div className="fixed inset-0 z-[60] bg-black/40 flex items-center justify-center p-4" onMouseDown={onClose}>
+    <div
+      className={`fixed inset-0 z-[60] bg-black/40 flex items-center justify-center p-4 ${visible ? '' : 'hidden'}`}
+      onMouseDown={onClose}
+    >
       <div
         className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[85vh] overflow-hidden flex flex-col"
         onMouseDown={e => e.stopPropagation()}
@@ -631,12 +735,12 @@ function AdminDashboardModal({ onClose }: { onClose: () => void }) {
                     title="Re-query all no_price + error entries (background job)"
                     className="flex items-center justify-center gap-1 px-3 py-1.5 rounded-lg text-xs font-semibold bg-amber-500 text-white hover:bg-amber-600 disabled:opacity-50"
                   >
-                    {bulkBusy ? <Loader2 size={12} className="animate-spin" /> : <RotateCw size={12} />} Re-query all failed
+                    {bulkMode === 'failed' ? <Loader2 size={12} className="animate-spin" /> : <RotateCw size={12} />} Re-query all failed
                   </button>
                 </div>
               </div>
 
-              <div className="flex items-center justify-between mb-2 gap-2">
+              <div className="flex items-center justify-between mb-2 gap-2 flex-wrap">
                 <p className="text-[10px] text-gray-400">
                   {(() => {
                     const n = query.split(/[\s,;]+/).map(s => s.trim()).filter(Boolean).length
@@ -644,19 +748,51 @@ function AdminDashboardModal({ onClose }: { onClose: () => void }) {
                   })()}
                 </p>
                 {results !== null && results.length > 0 && (
-                  <button
-                    onClick={requeryAllResults} disabled={bulkBusy}
-                    title="Re-query every MPN in the results below (synchronous, updates in place)"
-                    className="flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-semibold bg-blue-50 text-blue-700 border border-blue-200 hover:bg-blue-100 disabled:opacity-50 whitespace-nowrap"
-                  >
-                    {bulkBusy ? <Loader2 size={12} className="animate-spin" /> : <RotateCw size={12} />} Re-query searched ({results.length})
-                  </button>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    {/* Pause/cancel the running chunked bulk re-query */}
+                    {(bulkMode === 'internalPN' || bulkMode === 'searched') && (
+                      <button
+                        onClick={pauseBulk} disabled={bulkCancelRequested}
+                        title="Stop the re-query after the current batch finishes"
+                        className="flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-semibold bg-red-600 text-white hover:bg-red-700 disabled:opacity-50 whitespace-nowrap"
+                      >
+                        <Square size={12} /> {bulkCancelRequested ? 'Pausing…' : 'Pause / Cancel'}
+                      </button>
+                    )}
+                    {/* Filter: only rows that resolved an Internal PN */}
+                    <label
+                      className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold bg-indigo-50 text-indigo-700 border border-indigo-200 cursor-pointer select-none"
+                      title="Show only rows that resolved an Internal PN — these usually recover a price on re-query"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={onlyWithInternalPN}
+                        onChange={e => setOnlyWithInternalPN(e.target.checked)}
+                        className="w-3.5 h-3.5 accent-indigo-600 cursor-pointer"
+                      />
+                      With Internal PN ({withInternalPnCount})
+                    </label>
+                    <button
+                      onClick={requeryWithInternalPN} disabled={bulkBusy || withInternalPnCount === 0}
+                      title="Re-query only the rows that have an Internal PN (synchronous, updates in place)"
+                      className="flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-semibold bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50 whitespace-nowrap"
+                    >
+                      {bulkMode === 'internalPN' ? <Loader2 size={12} className="animate-spin" /> : <RotateCw size={12} />} Re-query w/ Internal PN ({withInternalPnCount})
+                    </button>
+                    <button
+                      onClick={requeryAllResults} disabled={bulkBusy}
+                      title="Re-query every MPN in the results below (synchronous, updates in place)"
+                      className="flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-semibold bg-blue-50 text-blue-700 border border-blue-200 hover:bg-blue-100 disabled:opacity-50 whitespace-nowrap"
+                    >
+                      {bulkMode === 'searched' ? <Loader2 size={12} className="animate-spin" /> : <RotateCw size={12} />} Re-query searched ({results.length})
+                    </button>
+                  </div>
                 )}
               </div>
 
               {notice && <p className="text-[11px] text-blue-600 mb-2">{notice}</p>}
 
-              {results !== null && (
+              {displayedResults !== null && (
                 <div className="overflow-x-auto rounded-lg border border-gray-200 max-h-72 overflow-y-auto">
                   <table className="min-w-full text-xs border-separate border-spacing-0">
                     <thead className="text-gray-500 sticky top-0 z-[1]">
@@ -670,7 +806,7 @@ function AdminDashboardModal({ onClose }: { onClose: () => void }) {
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-gray-100">
-                      {results.map((r, i) => {
+                      {displayedResults.map((r, i) => {
                         const st = r.status ?? (r.bestPriceUsd != null ? 'ok' : 'no_price')
                         const badge = st === 'ok'
                           ? 'bg-emerald-100 text-emerald-700'
@@ -700,8 +836,12 @@ function AdminDashboardModal({ onClose }: { onClose: () => void }) {
                           </tr>
                         )
                       })}
-                      {results.length === 0 && (
-                        <tr><td colSpan={6} className="px-3 py-4 text-center text-gray-400">No matching entries</td></tr>
+                      {displayedResults.length === 0 && (
+                        <tr><td colSpan={6} className="px-3 py-4 text-center text-gray-400">
+                          {onlyWithInternalPN && results && results.length > 0
+                            ? 'No rows with an Internal PN in the current results'
+                            : 'No matching entries'}
+                        </td></tr>
                       )}
                     </tbody>
                   </table>

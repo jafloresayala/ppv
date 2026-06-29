@@ -25,6 +25,12 @@ interface IQItem {
 interface AmplActiveItem { MfgPartNumber: string; MfgName: string; MpnPartNumber: string; count: number; Blocked?: string; Deleted?: string }
 type MpnInfo = { mpnPartNumber: string; status: 'active' | 'blocked' | 'deleted'; blockCode?: string }
 
+// ── Feature flag: Nexar Market integration ───────────────────────────────────
+// Temporarily disabled to save Nexar API requests. While false the "Include
+// Nexar Market" toggles are hidden, no Nexar queries are issued, and the Nexar
+// columns in Deep Analysis are not rendered. Flip back to `true` to restore.
+const NEXAR_ENABLED = false
+
 const BLOCK_REASONS: Record<string, string> = {
   '0004': 'Receive conditionally',
   'CD':   'Customer deleted from AVL',
@@ -1984,6 +1990,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
   const [myPlant, setMyPlant]             = useState<string>('')
   const [windowDays, setWindowDays]       = useState(45)
   const [searchMode, setSearchMode]       = useState<'internal' | 'mpn'>('internal')
+  // Forced off while NEXAR_ENABLED is false (temporary: saving Nexar API calls).
   const [searchNexar, setSearchNexar]     = useState(false)
   const [componentQtys, setComponentQtys] = useState<Record<string, number>>({})
   const [componentQtyDefaults, setComponentQtyDefaults] = useState<Record<string, 'empty' | '0'>>({})
@@ -2006,6 +2013,9 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
   const [mpnComponentQtyDefaults, setMpnComponentQtyDefaults]         = useState<Record<string, 'empty' | '0'>>({})
   const [stopMpnHover, setStopMpnHover]                               = useState(false)
   const abortMpnRef = useRef<AbortController | null>(null)
+  // Cooperative stop for the MPN Numbers search: instead of aborting the request
+  // in flight, we let the current chunk finish and then stop the loop cleanly.
+  const stopMpnRef = useRef(false)
   const [multiMpnSubTab, setMultiMpnSubTab]                           = useState<'results' | 'allrecords' | 'blocked' | 'deep'>('results')
   const [multiMpnAmplMap, setMultiMpnAmplMap]                         = useState<Record<string, AmplResponse>>({})
   const [multiMpnExpandedMpns, setMultiMpnExpandedMpns]               = useState<Set<string>>(new Set())
@@ -2031,15 +2041,12 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
     lookupDemand(mpnKeys)
       .then(res => {
         if (cancelled) return
-        // Merge all matched MPN keys' rows, de-duplicated by plant.
-        const byPlant = new Map<string, DemandRow>()
-        for (const rows of Object.values(res.results)) {
-          for (const d of rows) {
-            const key = d.plantCode || d.plantName
-            if (!byPlant.has(key)) byPlant.set(key, d)
-          }
-        }
-        setMpnCompareDemand([...byPlant.values()])
+        // Keep EVERY demand row (do NOT de-duplicate by plant): a plant can have
+        // several rows for the same MPN, and dropping them undercounts the
+        // Total EAU / Onhand / Gross Demand totals. The panel sums all rows.
+        const all: DemandRow[] = []
+        for (const rows of Object.values(res.results)) all.push(...rows)
+        setMpnCompareDemand(all)
       })
       .catch(() => { if (!cancelled) setMpnCompareDemand([]) })
       .finally(() => { if (!cancelled) setMpnCompareDemandLoading(false) })
@@ -2117,6 +2124,10 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
   const handleSearch = useCallback(async () => {
     if (!bmatn.trim()) return
     reset()
+    // Single search: cap the number of Nexar results requested to 10. The limit
+    // is enforced in the BACKEND (forwarded as the upstream GraphQL `limit`) so
+    // we consume fewer Nexar API requests — not just trim the response here.
+    const SINGLE_NEXAR_LIMIT = 10
     try {
       if (searchMode === 'mpn') {
         // ── MPN mode: skip AMPL, query IQ + market directly ──────────────────
@@ -2128,7 +2139,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
         setIqRows(rows)
         setPlants(buildPlantSummaries(rows, windowDays * 86400000))
         setStatus('loading-market')
-        const mkt = await apiPost<MarketResponse>('/api/pricecalc/market-prices', { mpns: queryMpns, quantity: qty })
+        const mkt = await apiPost<MarketResponse>('/api/pricecalc/market-prices', { mpns: queryMpns, quantity: qty, limit: SINGLE_NEXAR_LIMIT })
         setMarket(mkt)
       } else {
         // ── Internal PN mode: original flow ──────────────────────────────────
@@ -2180,7 +2191,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
         }
 
         setStatus('loading-market')
-        const mkt = await apiPost<MarketResponse>('/api/pricecalc/market-prices', { mpns: queryMpns, quantity: qty })
+        const mkt = await apiPost<MarketResponse>('/api/pricecalc/market-prices', { mpns: queryMpns, quantity: qty, limit: SINGLE_NEXAR_LIMIT })
         setMarket(mkt)
       }
 
@@ -2233,7 +2244,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
           ? ((bestPrice - stdPrice) / stdPrice) * 100 : null
         let nexarBestUsd: number | null = null
         let nexarSeller = ''
-        if (searchNexar && queryMpns.length) {
+        if (NEXAR_ENABLED && searchNexar && queryMpns.length) {
           try {
             const effectiveQty = componentQtys[bmatn] ?? qty
             const mkt = await apiPostWithRetry<MarketResponse>('/api/pricecalc/market-prices', { mpns: queryMpns, quantity: effectiveQty }, signal)
@@ -2893,7 +2904,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
       }
 
       // 3 — Nexar: all searched MPNs plus SAP-returned variants
-      if (searchNexar && !signal.aborted) {
+      if (NEXAR_ENABLED && searchNexar && !signal.aborted) {
         const nexarMpns = [...new Set([...uniqueMpns, ...collectedRows.map((r: IQItem) => r.mpn).filter(Boolean)])]
         const nexarUpdates: typeof amplDemandNexarMap = {}
         await Promise.allSettled(nexarMpns.map(async (mpn: string) => {
@@ -3026,6 +3037,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
     if (!mpns.length) return
     const ctrl = new AbortController()
     abortMpnRef.current = ctrl
+    stopMpnRef.current = false
     const { signal } = ctrl
     setMultiMpnLoading(true)
     setStopMpnHover(false)
@@ -3072,7 +3084,9 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
       //     stored in the DB so the next search is instant.
       const CHUNK = 6
       for (let i = 0; i < missing.length; i += CHUNK) {
-        if (signal.aborted) break
+        // Cooperative stop: the Stop button sets stopMpnRef so the loop finishes
+        // the current chunk and then stops (signal.aborted = hard abort).
+        if (signal.aborted || stopMpnRef.current) break
         const chunk = missing.slice(i, i + CHUNK)
         try {
           const { results } = await resolveMpnBest(chunk, windowDays)
@@ -3099,7 +3113,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
       }
 
       // 3 — Nexar market fetch (optional, separate) for all searched MPNs.
-      if (searchNexar && mpns.length > 0 && !signal.aborted) {
+      if (NEXAR_ENABLED && searchNexar && mpns.length > 0 && !signal.aborted) {
         const uniqueMpns = [...new Set([...mpns, ...collectedRows.map(r => r.mpn).filter(Boolean)])]
         const nexarUpdates: Record<string, { nexarBestUsd: number | null; nexarSeller: string; nexarManufacturer: string; nexarStock: number | null; nexarMoq: number | null; nexarMpn: string }> = {}
         await Promise.allSettled(uniqueMpns.map(async mpn => {
@@ -3127,6 +3141,16 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
         })
       }
     }
+    // If the user stopped early, clear the leftover "pending" spinners so rows
+    // that were never reached don't appear to be querying forever.
+    if (stopMpnRef.current) {
+      setMpnStatusMap(prev => {
+        const next = { ...prev }
+        for (const k of Object.keys(next)) if (next[k] === 'pending') next[k] = 'error'
+        return next
+      })
+    }
+    stopMpnRef.current = false
     setMultiMpnLoading(false)
     setStopMpnHover(false)
   }, [multiMpnInput, searchNexar, qty, mpnComponentQtys, windowDays])
@@ -4209,15 +4233,17 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                           </span>
                         </span>
                       </button>
-                      <label className="flex items-center gap-2 cursor-pointer select-none">
-                        <input
-                          type="checkbox"
-                          checked={searchNexar}
-                          onChange={e => setSearchNexar(e.target.checked)}
-                          className="w-4 h-4 accent-purple-600 cursor-pointer"
-                        />
-                        <span className="text-sm text-gray-600">Include <span className="font-semibold text-purple-600">Nexar Market</span></span>
-                      </label>
+                      {NEXAR_ENABLED && (
+                        <label className="flex items-center gap-2 cursor-pointer select-none">
+                          <input
+                            type="checkbox"
+                            checked={searchNexar}
+                            onChange={e => setSearchNexar(e.target.checked)}
+                            className="w-4 h-4 accent-purple-600 cursor-pointer"
+                          />
+                          <span className="text-sm text-gray-600">Include <span className="font-semibold text-purple-600">Nexar Market</span></span>
+                        </label>
+                      )}
                     </div>
                   </div>
 
@@ -4867,20 +4893,23 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                         />
                       </div>
                       <div className="flex-1" />
-                      <label className="flex items-center gap-2 cursor-pointer select-none pb-0.5">
-                        <input
-                          type="checkbox"
-                          checked={searchNexar}
-                          onChange={e => setSearchNexar(e.target.checked)}
-                          className="w-4 h-4 accent-purple-600 cursor-pointer"
-                        />
-                        <span className="text-sm text-gray-600">Include <span className="font-semibold text-purple-600">Nexar Market</span></span>
-                      </label>
+                      {NEXAR_ENABLED && (
+                        <label className="flex items-center gap-2 cursor-pointer select-none pb-0.5">
+                          <input
+                            type="checkbox"
+                            checked={searchNexar}
+                            onChange={e => setSearchNexar(e.target.checked)}
+                            className="w-4 h-4 accent-purple-600 cursor-pointer"
+                          />
+                          <span className="text-sm text-gray-600">Include <span className="font-semibold text-purple-600">Nexar Market</span></span>
+                        </label>
+                      )}
                       <button
-                        onClick={multiMpnLoading ? () => abortMpnRef.current?.abort() : handleMultiMpnSearch}
+                        onClick={multiMpnLoading ? () => { stopMpnRef.current = true; setStopMpnHover(false) } : handleMultiMpnSearch}
                         disabled={!multiMpnLoading && !multiMpnInput.trim()}
                         onMouseEnter={() => { if (multiMpnLoading) setStopMpnHover(true) }}
                         onMouseLeave={() => setStopMpnHover(false)}
+                        title={multiMpnLoading ? 'Finish the current batch, then stop' : undefined}
                         className={`flex items-center gap-2 px-6 py-2 rounded-lg text-sm font-semibold transition-colors shadow-sm ${
                           multiMpnLoading && stopMpnHover
                             ? 'bg-red-600 text-white hover:bg-red-700 cursor-pointer'
@@ -5058,7 +5087,18 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                                 </span>
                               )
                               if (e._status === 'nomatch') return <span className="text-gray-300">—</span>
-                              return <span className="font-mono font-semibold text-emerald-700">{e.bestRow.mpn}</span>
+                              // Only the MPN value opens the Supplier Savings modal — this keeps
+                              // the rest of the row freely selectable for copy/paste.
+                              return (
+                                <button
+                                  type="button"
+                                  onClick={() => setMpnCompare({ mpn: e.mpn, allRows: e.allRows })}
+                                  className="font-mono font-semibold text-emerald-700 hover:text-emerald-800 hover:underline underline-offset-2 cursor-pointer"
+                                  title="Open Supplier Savings Analysis"
+                                >
+                                  {e.bestRow.mpn}
+                                </button>
+                              )
                             },
                           },
                           {
@@ -5236,7 +5276,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                             <p className="text-[10px] text-gray-400 mb-1.5">
                               <span className="inline-flex items-center gap-1 text-blue-500">
                                 <svg className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2"><path strokeLinecap="round" strokeLinejoin="round" d="M15 15l-2 5L9 9l11 4-5 2zm0 0l5 5M7.188 2.239l.777 2.897M5.136 7.965l-2.898-.777M13.95 4.05l-2.122 2.122m-5.657 5.656l-2.12 2.122" /></svg>
-                                Click a found row
+                                Click the MPN value
                               </span> to compare suppliers per plant and see potential savings.
                               {pendingMpns.length > 0 && <span className="ml-2 text-blue-500">· {pendingMpns.length} querying SAP…</span>}
                               {missingCount > 0 && <span className="ml-2 text-gray-400">· {missingCount} with no priced match</span>}
@@ -5249,7 +5289,6 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                               dense
                               exportFileName={`PPV_MPN_Results_${new Date().toISOString().slice(0, 10)}`}
                               exportSheetName="IQ Results"
-                              onRowClick={(e) => { if (e._status === 'found') setMpnCompare({ mpn: e.mpn, allRows: e.allRows }) }}
                               rowClassName={(e, i) => {
                                 if (e._status === 'pending') return 'bg-blue-50/40'
                                 if (e._status === 'nomatch') return 'bg-gray-50/40 opacity-80'
@@ -5610,6 +5649,22 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                           ]
                           const foundKeys = new Set(mpnEntries.map(e => e.mpn.toUpperCase()))
                           const pendingMpnsAll = multiMpnSearchedList.filter(m => !foundKeys.has(m.toUpperCase()))
+                          // Excel-like banding by MPN: every distinct MPN gets a band
+                          // index, and consecutive MPN groups alternate between two
+                          // shades so you can see where one MPN's rows end and the next
+                          // begins. The color depends on the MPN value (not the table
+                          // row index), so banding stays consistent through sorting.
+                          const mpnBandIndex = new Map<string, number>()
+                          for (const r of flatRows) {
+                            const k = r._mpn.toUpperCase()
+                            if (!mpnBandIndex.has(k)) mpnBandIndex.set(k, mpnBandIndex.size)
+                          }
+                          const bandClass = (r: AllRow): string => {
+                            const idx = mpnBandIndex.get(r._mpn.toUpperCase()) ?? 0
+                            return idx % 2 === 0
+                              ? 'bg-white hover:bg-blue-50/60'
+                              : 'bg-slate-100/70 hover:bg-blue-50/60'
+                          }
                           return (
                             <div>
                               <DataGrid<AllRow>
@@ -5618,6 +5673,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                                 rowKey={(r, i) => `${r._mpn}-${i}`}
                                 pageSize={25}
                                 dense
+                                rowClassName={bandClass}
                                 exportFileName={`PPV_MPN_All_Records_${new Date().toISOString().slice(0, 10)}`}
                                 exportSheetName="All Records"
                               />
@@ -5646,7 +5702,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                                         <th className="px-3 py-2.5 text-left border-b border-gray-200 whitespace-nowrap" rowSpan={2}>Internal PN</th>
                                         <th className="px-3 py-2.5 text-center border-b border-gray-200 border-l border-l-blue-200 whitespace-nowrap bg-blue-50/50" colSpan={6}>Multi-MPN</th>
                                         <th className="px-3 py-2.5 text-center border-b border-gray-200 border-l border-l-purple-200 whitespace-nowrap bg-purple-50/50" colSpan={7}>Multi-Component</th>
-                                        <th className="px-3 py-2.5 text-center border-b border-gray-200 border-l border-l-orange-200 whitespace-nowrap bg-orange-50/50" colSpan={6}>Nexar Market</th>
+                                        {NEXAR_ENABLED && <th className="px-3 py-2.5 text-center border-b border-gray-200 border-l border-l-orange-200 whitespace-nowrap bg-orange-50/50" colSpan={6}>Nexar Market</th>}
                                         {Object.keys(lyticaMap).length > 0 && <th className="px-3 py-2.5 text-center border-b border-gray-200 border-l border-l-teal-200 whitespace-nowrap bg-teal-50/50" colSpan={4}>Lytica</th>}
                                         <th className="px-3 py-2.5 text-center border-b border-gray-200 border-l border-l-gray-300 whitespace-nowrap" rowSpan={2}>Winner</th>
                                       </tr>
@@ -5664,12 +5720,14 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                                         <th className="px-3 py-2 text-right border-b border-gray-200 whitespace-nowrap bg-purple-50/30">Last PO (USD)</th>
                                         <th className="px-3 py-2 text-right border-b border-gray-200 whitespace-nowrap bg-purple-50/30">Std (USD)</th>
                                         <th className="px-3 py-2 text-left border-b border-gray-200 whitespace-nowrap bg-purple-50/30">Date</th>
+                                        {NEXAR_ENABLED && <>
                                         <th className="px-3 py-2 text-left border-b border-gray-200 border-l border-l-orange-200 whitespace-nowrap bg-orange-50/30">MPN</th>
                                         <th className="px-3 py-2 text-left border-b border-gray-200 whitespace-nowrap bg-orange-50/30">Manufacturer</th>
                                         <th className="px-3 py-2 text-left border-b border-gray-200 whitespace-nowrap bg-orange-50/30">Supplier</th>
                                         <th className="px-3 py-2 text-right border-b border-gray-200 whitespace-nowrap bg-orange-50/30">Unit Price (USD)</th>
                                         <th className="px-3 py-2 text-right border-b border-gray-200 whitespace-nowrap bg-orange-50/30">Stock</th>
                                         <th className="px-3 py-2 text-right border-b border-gray-200 whitespace-nowrap bg-orange-50/30">MOQ</th>
+                                        </>}
                                         {Object.keys(lyticaMap).length > 0 && <th className="px-3 py-2 text-left border-b border-gray-200 border-l border-l-teal-200 whitespace-nowrap bg-teal-50/30">MPN Searched</th>}
                                         {Object.keys(lyticaMap).length > 0 && <th className="px-3 py-2 text-left border-b border-gray-200 whitespace-nowrap bg-teal-50/30">MPN Matched</th>}
                                         {Object.keys(lyticaMap).length > 0 && <th className="px-3 py-2 text-left border-b border-gray-200 whitespace-nowrap bg-teal-50/30">Manufacturer</th>}
@@ -5764,7 +5822,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                                               </>
                                             )}
                                             {/* Nexar Market side */}
-                                            {(() => {
+                                            {NEXAR_ENABLED && (() => {
                                               const candidates = mpnEntries.filter(e => e.bestRow.internalPN === dr.internalPN)
                                               let nexarBest: (typeof mpnNexarMap)[string] | null = null
                                               for (const c of candidates) {
@@ -6077,17 +6135,19 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                         )}
                       </div>
                       {/* Nexar toggle */}
-                      <div className="ml-auto flex items-center gap-2">
-                        <label className={`flex items-center gap-2 cursor-pointer select-none px-3 py-1.5 rounded-lg border text-xs font-semibold transition-colors ${searchNexar ? 'bg-orange-50 border-orange-300 text-orange-700' : 'bg-white border-gray-200 text-gray-500 hover:border-orange-300'}`}>
-                          <input
-                            type="checkbox"
-                            checked={searchNexar}
-                            onChange={e => setSearchNexar(e.target.checked)}
-                            className="w-3.5 h-3.5 accent-orange-500 cursor-pointer"
-                          />
-                          Include <span className="font-bold text-orange-500">Nexar</span> market data
-                        </label>
-                      </div>
+                      {NEXAR_ENABLED && (
+                        <div className="ml-auto flex items-center gap-2">
+                          <label className={`flex items-center gap-2 cursor-pointer select-none px-3 py-1.5 rounded-lg border text-xs font-semibold transition-colors ${searchNexar ? 'bg-orange-50 border-orange-300 text-orange-700' : 'bg-white border-gray-200 text-gray-500 hover:border-orange-300'}`}>
+                            <input
+                              type="checkbox"
+                              checked={searchNexar}
+                              onChange={e => setSearchNexar(e.target.checked)}
+                              className="w-3.5 h-3.5 accent-orange-500 cursor-pointer"
+                            />
+                            Include <span className="font-bold text-orange-500">Nexar</span> market data
+                          </label>
+                        </div>
+                      )}
                     </div>
 
                     {/* Row 2 – Actions (only when file loaded) */}
@@ -6407,7 +6467,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                                 <th className="px-3 py-2.5 text-left border-b border-gray-200 whitespace-nowrap" rowSpan={2}>Internal PN</th>
                                 <th className="px-3 py-2.5 text-center border-b border-gray-200 border-l border-l-blue-200 whitespace-nowrap bg-blue-50/50" colSpan={6}>AMPL MPN</th>
                                 <th className="px-3 py-2.5 text-center border-b border-gray-200 border-l border-l-purple-200 whitespace-nowrap bg-purple-50/50" colSpan={7}>Multi-Component</th>
-                                <th className="px-3 py-2.5 text-center border-b border-gray-200 border-l border-l-orange-200 whitespace-nowrap bg-orange-50/50" colSpan={6}>Nexar Market</th>
+                                {NEXAR_ENABLED && <th className="px-3 py-2.5 text-center border-b border-gray-200 border-l border-l-orange-200 whitespace-nowrap bg-orange-50/50" colSpan={6}>Nexar Market</th>}
                                 {Object.keys(lyticaMap).length > 0 && <th className="px-3 py-2.5 text-center border-b border-gray-200 border-l border-l-teal-200 whitespace-nowrap bg-teal-50/50" colSpan={4}>Lytica</th>}
                                 <th className="px-3 py-2.5 text-center border-b border-gray-200 border-l border-l-gray-300 whitespace-nowrap" rowSpan={2}>Winner</th>
                               </tr>
@@ -6425,12 +6485,14 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                                 <th className="px-3 py-2 text-right border-b border-gray-200 whitespace-nowrap bg-purple-50/30">Last PO (USD)</th>
                                 <th className="px-3 py-2 text-right border-b border-gray-200 whitespace-nowrap bg-purple-50/30">Std (USD)</th>
                                 <th className="px-3 py-2 text-left border-b border-gray-200 whitespace-nowrap bg-purple-50/30">Date</th>
+                                {NEXAR_ENABLED && <>
                                 <th className="px-3 py-2 text-left border-b border-gray-200 border-l border-l-orange-200 whitespace-nowrap bg-orange-50/30">MPN</th>
                                 <th className="px-3 py-2 text-left border-b border-gray-200 whitespace-nowrap bg-orange-50/30">Manufacturer</th>
                                 <th className="px-3 py-2 text-left border-b border-gray-200 whitespace-nowrap bg-orange-50/30">Supplier</th>
                                 <th className="px-3 py-2 text-right border-b border-gray-200 whitespace-nowrap bg-orange-50/30">Unit Price (USD)</th>
                                 <th className="px-3 py-2 text-right border-b border-gray-200 whitespace-nowrap bg-orange-50/30">Stock</th>
                                 <th className="px-3 py-2 text-right border-b border-gray-200 whitespace-nowrap bg-orange-50/30">MOQ</th>
+                                </>}
                                 {Object.keys(lyticaMap).length > 0 && <th className="px-3 py-2 text-left border-b border-gray-200 border-l border-l-teal-200 whitespace-nowrap bg-teal-50/30">MPN Searched</th>}
                                 {Object.keys(lyticaMap).length > 0 && <th className="px-3 py-2 text-left border-b border-gray-200 whitespace-nowrap bg-teal-50/30">MPN Matched</th>}
                                 {Object.keys(lyticaMap).length > 0 && <th className="px-3 py-2 text-left border-b border-gray-200 whitespace-nowrap bg-teal-50/30">Manufacturer</th>}
@@ -6511,7 +6573,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                                     </>
                                   )}
                                   {/* Nexar Market side */}
-                                  {nexarBest == null ? (
+                                  {NEXAR_ENABLED && (nexarBest == null ? (
                                     <td colSpan={6} className="px-3 py-2.5 text-center text-gray-300 text-[10px] border-l border-l-orange-100 bg-orange-50/10">
                                       {Object.keys(amplDemandNexarMap).length === 0 ? 'Enable Nexar search' : '—'}
                                     </td>
@@ -6524,7 +6586,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                                       <td className="px-3 py-2.5 text-right font-mono text-gray-500 whitespace-nowrap bg-orange-50/10">{nexarBest.nexarStock != null ? nexarBest.nexarStock.toLocaleString() : '—'}</td>
                                       <td className="px-3 py-2.5 text-right font-mono text-gray-500 whitespace-nowrap bg-orange-50/10">{nexarBest.nexarMoq != null ? nexarBest.nexarMoq.toLocaleString() : '—'}</td>
                                     </>
-                                  )}
+                                  ))}
                                   {/* Lytica side */}
                                   {hasLytica && (
                                     lyticaBest == null ? (

@@ -22,7 +22,7 @@ from pydantic import BaseModel
 
 import pandas as pd
 
-from config import SAP_API_URL, COL_PPV, COL_PRICE, COL_FX, ALLOWED_ORIGINS, AZ_INF_ENDPOINT, AZ_INF_API_KEY, AZ_INF_API_VER, AZ_INF_MODEL, PRICECALC_API_URL
+from config import SAP_API_URL, COL_PPV, COL_PRICE, COL_FX, ALLOWED_ORIGINS, AZ_INF_ENDPOINT, AZ_INF_API_KEY, AZ_INF_API_VER, AZ_INF_MODEL, PRICECALC_API_URL, NEXAR_RESULT_LIMIT
 from config import ADMIN_USERNAME, ADMIN_PASSWORD, DBJOB_SCHEDULE_HOUR, DBJOB_WINDOW_DAYS
 from data_service import parse_df, extract_records, get_filter_options, apply_filters, enrich_with_currency
 from analytics import compute_all_analytics, compute_forecast, search_material, compute_mg_plant_components
@@ -343,6 +343,9 @@ class PriceCalcIQRequest(BaseModel):
 class PriceCalcMarketRequest(BaseModel):
     mpns:     list[str]
     quantity: int
+    # Max offers/results to request from Nexar per MPN. Caps the upstream
+    # GraphQL `limit` to save API requests. None → use the server default.
+    limit:    int | None = None
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -1248,24 +1251,33 @@ def pricecalc_internal_query(req: PriceCalcIQRequest):
 
 @app.post("/api/pricecalc/market-prices")
 def pricecalc_market_prices(req: PriceCalcMarketRequest):
-    # ── Nexar 24-hour cache (per MPN, quantity-agnostic) ──────────────────────
+    # Cap the number of results requested from Nexar (upstream GraphQL `limit`)
+    # to save API requests. Use the frontend-provided value if any, else the
+    # configured default. The limit is forwarded to the conexion_internalquery
+    # service in the request body.
+    limit = req.limit if (req.limit is not None and req.limit > 0) else NEXAR_RESULT_LIMIT
+    body  = {"mpns": req.mpns, "quantity": req.quantity, "limit": limit}
+
+    # ── Nexar 24-hour cache (per MPN + limit, quantity-agnostic) ──────────────
     # Frontend always sends a single MPN per call, so we cache per that MPN.
     # Quantity is intentionally excluded from the cache key: offer prices are
     # per-unit and don't change with quantity; this maximises cache reuse.
+    # The limit IS part of the key so a smaller cached result isn't reused for a
+    # larger request (and vice-versa).
     if len(req.mpns) == 1:
         mpn_upper = req.mpns[0].strip().upper()
-        mkt_key   = cache.make_key("nexar", "mkt", mpn_upper)
+        mkt_key   = cache.make_key("nexar", "mkt", f"{mpn_upper}:{limit}")
         cached    = cache.get_json(mkt_key)
         if cached is not None:
             return cached
-        result = _pricecalc_post("/market-prices", {"mpns": req.mpns, "quantity": req.quantity})
+        result = _pricecalc_post("/market-prices", body)
         cache.set_json(mkt_key, result, cache.TTL_NEXAR)
         # Record the moment the first entry was written (SET NX — won't overwrite)
         init_key = cache.make_key("nexar", "init")
         cache.set_if_not_exists(init_key, {"ts": datetime.utcnow().isoformat()}, cache.TTL_NEXAR)
         return result
     # Multi-MPN fallback (not called by the frontend currently) — no caching
-    return _pricecalc_post("/market-prices", {"mpns": req.mpns, "quantity": req.quantity})
+    return _pricecalc_post("/market-prices", body)
 
 
 @app.get("/api/pricecalc/nexar-cache-stats")

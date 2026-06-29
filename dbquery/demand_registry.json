@@ -1,11 +1,11 @@
 {
-  "active": "QUOTE_DATA JUNE26.db",
+  "active": "QUOTE_DATA_ALL.db",
   "databases": [
     {
-      "file": "QUOTE_DATA JUNE26.db",
-      "label": "QUOTE_DATA JUNE26.xlsx",
-      "rows": 78691,
-      "created_at": "2026-06-26T12:31:31.820140"
+      "file": "QUOTE_DATA_ALL.db",
+      "label": "ALL plants (6 files) [2026-06-29 14:51]",
+      "rows": 85472,
+      "created_at": "2026-06-29T14:51:55.314924"
     }
   ]
 }

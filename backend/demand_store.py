@@ -9,6 +9,13 @@ columns plus three derived helper columns for fast joins:
   • plant_code — the Excel 'Plant' value normalised to a 4-digit code (e.g. 20→'0020')
   • plant_name — mapped plant short name (KEMX, KETL, …) or '' when unknown
 
+In addition to one .db per plant file, convert_all() also builds a single
+combined database (COMBINED_DB_NAME) that concatenates every plant file,
+drops rows whose 'Total EAU' is 0/empty, and deduplicates nothing — all rows
+from every plant are present so per-plant lookups work correctly. Files that
+cannot be read or are missing the required MPN column are skipped and flagged
+but do not abort the combined build.
+
 A small JSON registry (dbquery/demand_registry.json) tracks every demand .db and
 which one is "active". An admin chooses the active demand database; the Supplier
 Savings Analysis modal then joins demand by MPN + plant.
@@ -48,6 +55,9 @@ GROSS_DEMAND_COL = "Gross Demand"
 LAST_PO_PRICE_COL = "Last PO Item Price"
 PO_QTY_COL        = "Purchase Order Quantity"
 SOURCE_VENDOR_NAME_COL = "Source Vendor Name"
+
+# Name of the combined (all-plants) demand database.
+COMBINED_DB_NAME = "QUOTE_DATA_ALL.db"
 
 _LOCK = threading.RLock()
 REGISTRY_PATH = os.path.join(DBQUERY_DIR, "demand_registry.json")
@@ -191,8 +201,129 @@ def convert_one(xlsx_path: str, *, force: bool = False) -> dict:
             "source": os.path.basename(xlsx_path)}
 
 
+def convert_combined(*, force: bool = False) -> dict:
+    """Build QUOTE_DATA_ALL.db — a single SQLite database that concatenates ALL
+    plant .xlsx files in DBQUERY_DIR.
+
+    Rows where 'Total EAU' is 0 or empty are dropped. Every plant file is read
+    independently; a file that is missing the required MPN column or that cannot
+    be opened is skipped and flagged in the result but does not abort the build.
+    The combined .db is registered in the registry and set as the active database.
+
+    Returns a summary dict with:
+      total_rows, kept_rows, file_reports, file, error (if failed entirely).
+    """
+    db_path = os.path.join(DBQUERY_DIR, COMBINED_DB_NAME)
+
+    # If the combined DB is newer than the newest source file, skip (unless forced).
+    if not force and os.path.exists(db_path):
+        sources = list_xlsx_files()
+        if sources:
+            newest_src = max(os.path.getmtime(s) for s in sources)
+            if os.path.getmtime(db_path) >= newest_src:
+                return {"file": COMBINED_DB_NAME, "skipped": True,
+                        "reason": "up-to-date", "total_rows": None, "kept_rows": None,
+                        "file_reports": []}
+
+    xlsx_files = list_xlsx_files()
+    if not xlsx_files:
+        return {"file": COMBINED_DB_NAME, "skipped": False,
+                "error": f"No .xlsx files found in {DBQUERY_DIR}",
+                "total_rows": 0, "kept_rows": 0, "file_reports": []}
+
+    frames: list[pd.DataFrame] = []
+    file_reports: list[dict] = []
+
+    for xlsx_path in xlsx_files:
+        name = os.path.basename(xlsx_path)
+        rep: dict = {"file": name, "ok": False, "rows": 0, "kept": 0, "error": None}
+        try:
+            df = pd.read_excel(xlsx_path, sheet_name=0)
+            rep["rows"] = int(len(df))
+
+            # Validate required column
+            if MPN_COL not in df.columns:
+                rep["error"] = (
+                    f'Falta la columna "{MPN_COL}". '
+                    f"Columnas disponibles: {list(df.columns)[:20]}"
+                )
+                file_reports.append(rep)
+                continue
+
+            # Drop rows where Total EAU is 0 / empty / non-numeric
+            if TOTAL_EAU_COL in df.columns:
+                eau = pd.to_numeric(df[TOTAL_EAU_COL], errors="coerce").fillna(0)
+                df = df[eau != 0].copy()
+
+            # Add helper columns
+            df["mpn_key"] = df[MPN_COL].astype(str).str.strip().str.upper()
+            df["plant_code"] = (df[PLANT_COL].map(_normalise_plant_code)
+                                if PLANT_COL in df.columns else "")
+            df["plant_name"] = df["plant_code"].map(lambda c: PLANT_CODE_TO_NAME.get(c, ""))
+
+            rep["kept"] = int(len(df))
+            rep["ok"] = True
+            frames.append(df)
+        except Exception as exc:  # noqa: BLE001
+            rep["error"] = str(exc)[:500]
+        file_reports.append(rep)
+
+    if not frames:
+        bad = "; ".join(f"{r['file']}: {r['error']}" for r in file_reports if r.get("error"))
+        return {"file": COMBINED_DB_NAME, "skipped": False,
+                "error": f"No se pudo leer ningún archivo. {bad}",
+                "total_rows": 0, "kept_rows": 0, "file_reports": file_reports}
+
+    combined = pd.concat(frames, ignore_index=True)
+    total_rows = int(combined.shape[0])
+
+    # Atomic write (temp file → rename)
+    tmp_path = db_path + ".building"
+    for p in (tmp_path, tmp_path + "-wal", tmp_path + "-shm"):
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except OSError:
+            pass
+    conn = sqlite3.connect(tmp_path)
+    try:
+        combined.to_sql("demand", conn, if_exists="replace", index=False)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_demand_mpn ON demand(mpn_key)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_demand_mpn_plant ON demand(mpn_key, plant_code)")
+        conn.commit()
+    finally:
+        conn.close()
+    for p in (db_path, db_path + "-wal", db_path + "-shm"):
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except OSError:
+            pass
+    os.replace(tmp_path, db_path)
+
+    ok_files = [r["file"] for r in file_reports if r.get("ok")]
+    label = f"ALL plants ({len(ok_files)} files) [{datetime.now():%Y-%m-%d %H:%M}]"
+    register_database(COMBINED_DB_NAME, label=label, rows=total_rows)
+
+    # Make the combined DB the active one automatically
+    with _LOCK:
+        reg = _read()
+        reg["active"] = COMBINED_DB_NAME
+        _write(reg)
+
+    return {
+        "file": COMBINED_DB_NAME, "skipped": False,
+        "rows": total_rows, "kept_rows": total_rows,
+        "file_reports": file_reports,
+        "ok_files": ok_files,
+        "skipped_files": [r["file"] for r in file_reports if not r.get("ok")],
+    }
+
+
 def convert_all(*, force: bool = False) -> list[dict]:
-    """Convert every .xlsx in DBQUERY_DIR to a .db. Returns per-file summaries."""
+    """Convert every .xlsx in DBQUERY_DIR to a per-plant .db AND build the
+    combined QUOTE_DATA_ALL.db that unions all plant files. Returns per-file summaries.
+    """
     results = []
     for xlsx in list_xlsx_files():
         try:
@@ -201,7 +332,17 @@ def convert_all(*, force: bool = False) -> list[dict]:
             results.append({"file": os.path.basename(_db_path_for(xlsx)),
                             "source": os.path.basename(xlsx),
                             "error": str(exc)[:500], "skipped": False})
-    # Default the active DB to the first one if none set yet.
+
+    # Build / refresh the combined all-plants database.
+    try:
+        combined_result = convert_combined(force=force)
+        results.append(combined_result)
+    except Exception as exc:  # noqa: BLE001
+        results.append({"file": COMBINED_DB_NAME, "error": str(exc)[:500], "skipped": False})
+
+    # Default the active DB to the combined one (already done inside
+    # convert_combined); only fall back to the first individual DB if the
+    # combined build failed entirely and nothing is active yet.
     reg = _read()
     if not reg.get("active") and reg.get("databases"):
         reg["active"] = reg["databases"][0]["file"]

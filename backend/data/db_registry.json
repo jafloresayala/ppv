@@ -1,15 +1,15 @@
 {
-  "active": "mpn_cache.db",
+  "active": "mpn_cache_20260626_170237.db",
   "databases": [
-    {
-      "file": "mpn_cache.db",
-      "label": "default",
-      "created_at": "2026-06-26T11:05:13.204471"
-    },
     {
       "file": "mpn_cache_20260626_113224.db",
       "label": "rebuild 2026-06-26 11:32",
       "created_at": "2026-06-26T11:32:24.247843"
+    },
+    {
+      "file": "mpn_cache_20260626_170237.db",
+      "label": "rebuild 2026-06-26 17:02",
+      "created_at": "2026-06-26T17:02:37.979150"
     }
   ]
 }
