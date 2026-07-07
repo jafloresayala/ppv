@@ -2,6 +2,7 @@
 
 import pandas as pd
 import requests as _http
+from datetime import datetime as _dt, timedelta as _td
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests_ntlm import HttpNtlmAuth as _NtlmAuth
 
@@ -147,11 +148,17 @@ def _fetch_one_rate(from_currency: str, date_str: str) -> float:
 
 def _get_rate(from_currency: str, date_str: str) -> float:
     """Return the M-rate (from_currency → USD) with multi-tier caching:
-    in-process dict → Redis → SAP API. Falls back to 1.0 on any error.
+    in-process dict → Redis → SAP API. Falls back to 1.0 only if every retry fails.
+
+    Notes:
+    - Never persists fallback 1.0 for non-USD currencies.
+    - If the exact date has no rate (weekend/holiday), retries previous days.
     """
     key = (from_currency.strip().upper(), date_str[:10])
     if key in _rate_cache:
-        return _rate_cache[key]
+        cached = _rate_cache[key]
+        if key[0] == "USD" or cached != 1.0:
+            return cached
 
     # Redis lookup (survives process restarts; rates are immutable)
     if _CACHE_OK:
@@ -159,22 +166,47 @@ def _get_rate(from_currency: str, date_str: str) -> float:
         cached = _cache.get_json(rk)
         if cached is not None:
             try:
-                _rate_cache[key] = float(cached)
-                return _rate_cache[key]
+                cv = float(cached)
+                # Ignore stale fallback values for non-USD and refetch.
+                if key[0] == "USD" or cv != 1.0:
+                    _rate_cache[key] = cv
+                    return _rate_cache[key]
             except (TypeError, ValueError):
                 pass
 
-    # Network fetch
-    try:
-        rate = _fetch_one_rate(key[0], key[1])
-    except Exception:
-        rate = 1.0  # fallback: no conversion
+    if key[0] == "USD":
+        _rate_cache[key] = 1.0
+        return 1.0
 
-    _rate_cache[key] = rate
-    if _CACHE_OK:
-        # 30-day TTL — historical M-rates don't change
-        _cache.set_json(_cache.make_key("fxrate", key[0], key[1]), rate, 30 * 86400)
-    return rate
+    # Network fetch with backfill to previous dates (common on weekends/holidays).
+    try:
+        base = _dt.strptime(key[1], "%Y-%m-%d")
+    except Exception:
+        base = _dt.utcnow()
+
+    for back_days in range(0, 8):
+        probe = (base - _td(days=back_days)).strftime("%Y-%m-%d")
+        try:
+            rate = _fetch_one_rate(key[0], probe)
+            if rate > 0 and rate != 1.0:
+                # Cache under requested key and probe key to speed future lookups.
+                _rate_cache[key] = rate
+                _rate_cache[(key[0], probe)] = rate
+                if _CACHE_OK:
+                    ttl = 30 * 86400
+                    _cache.set_json(_cache.make_key("fxrate", key[0], key[1]), rate, ttl)
+                    _cache.set_json(_cache.make_key("fxrate", key[0], probe), rate, ttl)
+                return rate
+        except Exception:
+            continue
+
+    # Last-resort fallback: do not cache this for non-USD to avoid stale wrong rates.
+    return 1.0
+
+
+def get_currency_rate(from_currency: str, date_str: str) -> float:
+    """Public wrapper for the cached currency-rate lookup used by API endpoints."""
+    return _get_rate(from_currency, date_str)
 
 
 def enrich_with_currency(df: pd.DataFrame) -> pd.DataFrame:

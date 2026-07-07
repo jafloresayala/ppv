@@ -10,6 +10,7 @@ import os
 import time
 import uuid
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from requests_ntlm import HttpNtlmAuth
 from typing import Any
@@ -23,8 +24,8 @@ from pydantic import BaseModel
 import pandas as pd
 
 from config import SAP_API_URL, COL_PPV, COL_PRICE, COL_FX, ALLOWED_ORIGINS, AZ_INF_ENDPOINT, AZ_INF_API_KEY, AZ_INF_API_VER, AZ_INF_MODEL, PRICECALC_API_URL, NEXAR_RESULT_LIMIT
-from config import ADMIN_USERNAME, ADMIN_PASSWORD, DBJOB_SCHEDULE_HOUR, DBJOB_WINDOW_DAYS
-from data_service import parse_df, extract_records, get_filter_options, apply_filters, enrich_with_currency
+from config import ADMIN_USERNAME, ADMIN_PASSWORD, DBJOB_SCHEDULE_HOUR, DBJOB_WINDOW_DAYS, MPN_RESOLVE_MAX_WORKERS
+from data_service import parse_df, extract_records, get_filter_options, apply_filters, enrich_with_currency, get_currency_rate
 from analytics import compute_all_analytics, compute_forecast, search_material, compute_mg_plant_components
 import cache
 import mpn_store
@@ -1319,12 +1320,16 @@ def _entry_public(e: dict | None) -> dict | None:
     if not e:
         return None
     payload = {}
+    # Accept both payload_json (string from DB) and payload (dict from realtime)
     raw = e.get("payload_json")
     if raw:
         try:
             payload = _json.loads(raw) or {}
         except (ValueError, TypeError):
             payload = {}
+    elif "payload" in e:
+        payload = e["payload"] or {}
+    
     return {
         "mpn":           e.get("mpn"),
         "internalPN":    e.get("internal_pn"),
@@ -1343,7 +1348,7 @@ def _entry_public(e: dict | None) -> dict | None:
         "rawRows":       payload.get("raw_rows") or [],
         "ampl":          payload.get("ampl"),
         "mcRows":        payload.get("mc_rows") or [],
-        "hasPayload":    bool(raw),
+        "hasPayload":    bool(raw or payload),
     }
 
 
@@ -1370,28 +1375,42 @@ def mpn_best_resolve(req: MpnResolveRequest):
     result: dict[str, dict | None] = {k: _entry_public(found[k]) for k in keys if k in found}
 
     misses = [k for k in keys if k not in found]
-    for mpn in misses:
-        try:
-            entry = batch_job.process_mpn(mpn, req.window_days)
-            entry["origin"] = "realtime"
-            mpn_store.upsert_best(entry)
-            # Cache the separate Multi-MPN / Multi-Component bests for Deep Analysis.
-            _deep = entry.get("deep")
-            if _deep:
-                _deep["origin"] = "realtime"
+    if misses:
+        # Realtime profile: bounded parallelism + shorter upstream timeout/retries
+        # to avoid long "querying" tails and upstream saturation.
+        max_workers = max(1, int(os.getenv("MPN_RESOLVE_MAX_WORKERS", str(MPN_RESOLVE_MAX_WORKERS))))
+        workers = min(max_workers, len(misses))
+        log = logging.getLogger(__name__)
+        log.info("mpn-best resolve realtime: misses=%d workers=%d", len(misses), workers)
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(batch_job.process_mpn, mpn, req.window_days, 30, 2): mpn
+                for mpn in misses
+            }
+            for fut in as_completed(futures):
+                mpn = futures[fut]
                 try:
-                    mpn_store.upsert_deep(_deep)
-                except Exception:
-                    pass
-            result[mpn] = _entry_public({**entry, "internal_pn": entry.get("internal_pn")})
-        except Exception as exc:  # surface as null; caller can fall back
-            result[mpn] = None
-            # Document the failure so it shows up in the admin search & re-query.
-            try:
-                mpn_store.mark_error(mpn, str(exc))
-            except Exception:
-                pass
-            logging.getLogger(__name__).info("resolve miss for %s: %s", mpn, exc)
+                    entry = fut.result()
+                    entry["origin"] = "realtime"
+                    mpn_store.upsert_best(entry)
+                    # Cache the separate Multi-MPN / Multi-Component bests for Deep Analysis.
+                    _deep = entry.get("deep")
+                    if _deep:
+                        _deep["origin"] = "realtime"
+                        try:
+                            mpn_store.upsert_deep(_deep)
+                        except Exception:
+                            pass
+                    result[mpn] = _entry_public({**entry, "internal_pn": entry.get("internal_pn")})
+                except Exception as exc:  # surface as null; caller can fall back
+                    result[mpn] = None
+                    # Document the failure so it shows up in the admin search & re-query.
+                    try:
+                        mpn_store.mark_error(mpn, str(exc))
+                    except Exception:
+                        pass
+                    log.info("resolve miss for %s: %s", mpn, exc)
 
     return {"results": result, "from_db": [k for k in keys if k in found], "computed": misses}
 
@@ -1870,6 +1889,11 @@ class DemandCreateBestTableRequest(BaseModel):
     table_name: str | None = None
 
 
+class CurrencyRateRequest(BaseModel):
+    from_currency: str
+    date: str
+
+
 @app.post("/api/demand/lookup")
 def demand_lookup(req: DemandLookupRequest):
     """Per-MPN demand (Total EAU / Onhand Qty / Gross Demand) per plant from the
@@ -1894,6 +1918,20 @@ def demand_full(req: DemandLookupRequest):
         "total_eau_col": demand_store.TOTAL_EAU_COL,
         "plant_name_col": "plant_name",
     }
+
+
+@app.post("/api/financials/currency-rate")
+def financials_currency_rate(req: CurrencyRateRequest):
+    """Proxy currency conversion rate lookup to the SAP FetchCurrencyRates API."""
+    from_currency = (req.from_currency or "").strip().upper()
+    if not from_currency or from_currency == "USD":
+        return {"rate": 1.0, "from_currency": from_currency or "USD", "date": (req.date or "")[:10]}
+
+    date_str = (req.date or "")[:10]
+    if not date_str:
+        raise HTTPException(status_code=400, detail="date is required")
+
+    return {"rate": get_currency_rate(from_currency, date_str), "from_currency": from_currency, "date": date_str}
 
 
 @app.get("/api/admin/demand/databases")

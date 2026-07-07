@@ -46,16 +46,19 @@ DBJOB_WINDOW_DAYS = int(_os.getenv("DBJOB_WINDOW_DAYS", "45"))
 DBJOB_SCHEDULE_HOUR = int(_os.getenv("DBJOB_SCHEDULE_HOUR", "6"))
 # Parallel workers for the batch job
 DBJOB_MAX_WORKERS = int(_os.getenv("DBJOB_MAX_WORKERS", "8"))
+# Parallel workers for realtime /api/mpn-best/resolve misses.
+# Keep this conservative to avoid saturating upstream InternalQuery.
+MPN_RESOLVE_MAX_WORKERS = int(_os.getenv("MPN_RESOLVE_MAX_WORKERS", "3"))
 
 # Admin dashboard credentials (override via env in production)
 ADMIN_USERNAME = _os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = _os.getenv("ADMIN_PASSWORD", "admin123")
 
 # ── Azure AI Inference ────────────────────────────────────────────────────────
-AZ_INF_ENDPOINT = "https://k90016277-aippv-resource.services.ai.azure.com/models"
-AZ_INF_API_KEY  = "1quEgPspq8NjEo4zm8STsskX1RwSOc6Yzaiwh0LO8Rl8pnkAjS79JQQJ99CDACHYHv6XJ3w3AAAAACOGCMKx"
-AZ_INF_API_VER  = "2024-05-01-preview"
-AZ_INF_MODEL    = "Kimi-K2.6"
+AZ_INF_ENDPOINT = "AZ_INF_ENDPOINT"
+AZ_INF_API_KEY  = "AZ_INF_API_KEY"
+AZ_INF_API_VER  = "AZ_INF_API_VER"
+AZ_INF_MODEL    = "AZ_INF_MODEL"
 
 # ── CORS origins (add prod domain if ever deployed) ──────────────────────────
 ALLOWED_ORIGINS = ["http://localhost:5173", "http://localhost:4173", "http://localhost:3000", "http://localhost:8080"]

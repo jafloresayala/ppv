@@ -33,6 +33,8 @@ export interface DataGridColumn<T> {
   className?: string
   /** Value used for Excel export (defaults to accessor). */
   exportValue?: (row: T) => string | number | null | undefined
+  /** Optional Tailwind width class (e.g. 'w-20', 'w-32', 'flex-1'). */
+  width?: string
 }
 
 interface DataGridProps<T> {
@@ -58,6 +60,8 @@ interface DataGridProps<T> {
   defaultShowFilters?: boolean
   /** Optional click handler per row (e.g. open a detail/comparison panel). */
   onRowClick?: (row: T, index: number) => void
+  /** Freeze the first data column so it stays visible on horizontal scroll. */
+  freezeFirstColumn?: boolean
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -105,6 +109,7 @@ export default function DataGrid<T>({
   rows, columns, rowKey, pageSize = 50, rowClassName,
   exportFileName = 'export', exportSheetName = 'Data',
   prepend, append, dense = false, defaultShowFilters = true, onRowClick,
+  freezeFirstColumn = false,
 }: DataGridProps<T>) {
   const [page, setPage]         = useState(0)
   const [perPage, setPerPage]   = useState(pageSize)
@@ -293,17 +298,19 @@ export default function DataGrid<T>({
       </div>
 
       {/* ── Table ── */}
-      <div className="overflow-x-auto rounded-xl border border-gray-200 shadow-sm">
+      <div className="overflow-auto rounded-xl border border-gray-200 shadow-sm" style={{ maxHeight: '60vh' }}>
         <table className="min-w-max w-full text-xs border-collapse">
-          <thead className="bg-gray-50 text-[10px] uppercase tracking-wide text-gray-500 sticky top-0 z-[1]">
+          <thead className="bg-gray-50 text-[10px] uppercase tracking-wide text-gray-500 sticky top-0 z-[10]">
             <tr>
-              {columns.map(col => {
+              {columns.map((col, i) => {
                 const isSorted = sortKey === col.key
                 const alignCls = col.align === 'right' ? 'text-right' : col.align === 'center' ? 'text-center' : 'text-left'
+                const stickyCls = freezeFirstColumn && i === 0 ? 'sticky left-0 top-0 z-[11] bg-gray-50' : 'sticky top-0 z-[10]'
+                const widthCls = col.width ?? ''
                 return (
                   <th
                     key={col.key}
-                    className={`${padH} ${alignCls} whitespace-nowrap border-b border-gray-200 ${col.noSort ? '' : 'cursor-pointer select-none hover:text-gray-700'} ${col.className ?? ''}`}
+                    className={`${padH} ${alignCls} whitespace-nowrap border-b border-gray-200 ${col.noSort ? '' : 'cursor-pointer select-none hover:text-gray-700'} ${stickyCls} ${widthCls} ${col.className ?? ''}`}
                     onClick={col.noSort ? undefined : () => toggleSort(col.key)}
                   >
                     <span className={`inline-flex items-center gap-1 ${col.align === 'right' ? 'flex-row-reverse' : ''}`}>
@@ -321,13 +328,15 @@ export default function DataGrid<T>({
 
             {/* Per-column filter row */}
             {showFilters && (
-              <tr className="bg-white">
-                {columns.map(col => {
+              <tr className="bg-white sticky top-0 z-[1]">
+                {columns.map((col, i) => {
                   const f = filters[col.key] ?? EMPTY_FILTER
                   const type = col.type ?? 'text'
-                  if (col.noFilter) return <th key={col.key} className="px-2 py-1.5 border-b border-gray-200" />
+                  const stickyCls = freezeFirstColumn && i === 0 ? 'sticky left-0 top-0 z-[11] bg-white' : 'sticky top-0 z-[10]'
+                  const widthCls = col.width ?? ''
+                  if (col.noFilter) return <th key={col.key} className={`px-2 py-1.5 border-b border-gray-200 ${stickyCls} ${widthCls}`} />
                   return (
-                    <th key={col.key} className="px-2 py-1.5 border-b border-gray-200 font-normal">
+                    <th key={col.key} className={`px-2 py-1.5 border-b border-gray-200 font-normal ${stickyCls} ${widthCls}`}>
                       {type === 'number' || type === 'date' ? (
                         <div className="flex items-center gap-1">
                           <input
@@ -377,13 +386,22 @@ export default function DataGrid<T>({
               return (
                 <tr
                   key={rowKey(row, globalIdx)}
-                  className={`${extra} ${onRowClick ? 'cursor-pointer' : ''}`}
+                  className={`group ${extra} ${onRowClick ? 'cursor-pointer' : ''}`}
                   onClick={onRowClick ? () => onRowClick(row, globalIdx) : undefined}
                 >
-                  {columns.map(col => {
+                  {columns.map((col, colIdx) => {
                     const alignCls = col.align === 'right' ? 'text-right' : col.align === 'center' ? 'text-center' : 'text-left'
+                    const widthCls = col.width ?? ''
+                    let stickyCls = ''
+                    if (freezeFirstColumn && colIdx === 0) {
+                      if (i % 2 === 0) {
+                        stickyCls = 'sticky left-0 z-[2] bg-white group-hover:bg-gray-50 group-[.bg-indigo-100]:bg-indigo-100'
+                      } else {
+                        stickyCls = 'sticky left-0 z-[2] bg-gray-50/50 group-hover:bg-gray-100 group-[.bg-indigo-100]:bg-indigo-100'
+                      }
+                    }
                     return (
-                      <td key={col.key} className={`${pad} ${alignCls} whitespace-nowrap ${col.className ?? ''}`}>
+                      <td key={col.key} className={`${pad} ${alignCls} whitespace-nowrap ${stickyCls} ${widthCls} ${col.className ?? ''}`}>
                         {col.render ? col.render(row, globalIdx) : (col.accessor(row) ?? '—')}
                       </td>
                     )

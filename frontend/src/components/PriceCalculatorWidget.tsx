@@ -5,7 +5,8 @@ import { Calculator, X, Pin, ChevronDown, ChevronUp, ExternalLink, Download } fr
 import DbJobButton from './DbJobButton'
 import DataGrid, { type DataGridColumn } from './DataGrid'
 import SupplierComparePanel, { type CompareRecord, type DemandRow } from './SupplierComparePanel'
-import { lookupMpnBest, resolveMpnBest, resolveDeep, lookupDemand, type MpnBestEntry } from '../api/client'
+import FullQuoteDataTab from './FullQuoteDataTab'
+import { lookupMpnBest, resolveMpnBest, resolveDeep, lookupDemand, lookupDemandFull, type MpnBestEntry, type DemandFullResponse } from '../api/client'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -1982,7 +1983,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
   const [pinnedPlant, setPinnedPlant]     = useState<PlantSummary | null>(null)
   const [selectedPlant, setSelectedPlant] = useState<PlantSummary | null>(null)
   const [selectedOffer, setSelectedOffer] = useState<MarketOffer | null>(null)
-  const [activeTab, setActiveTab]         = useState<'single' | 'multi' | 'mpn' | 'ampl'>('single')
+  const [activeTab, setActiveTab]         = useState<'single' | 'multi' | 'mpn' | 'ampl' | 'fullquote'>('single')
   const [multiBmatn, setMultiBmatn]       = useState('')
   const [multiResults, setMultiResults]   = useState<MultiResult[]>([])
   const [multiLoading, setMultiLoading]   = useState(false)
@@ -2052,6 +2053,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
       .finally(() => { if (!cancelled) setMpnCompareDemandLoading(false) })
     return () => { cancelled = true }
   }, [mpnCompare])
+
   // Deep Analysis pagination (keeps the rich grouped table fast for large sets)
   const [deepPage, setDeepPage]                                       = useState(0)
   const DEEP_PAGE_SIZE = 25
@@ -2098,6 +2100,59 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
   const abortAmplDemandRef    = useRef<AbortController | null>(null)
   const abortAmplDemandDeepRef = useRef<AbortController | null>(null)
   // ── AMPL Demand: multi-sheet picker + missing-cols alert + Lytica export ──
+
+  // ── Full Quote Data tab state (all demand database rows with procedural pagination) ──
+  const [fullQuoteData, setFullQuoteData]                               = useState<DemandFullResponse | null>(null)
+  const [fullQuoteLoading, setFullQuoteLoading]                         = useState(false)
+  const [fullQuoteDataCache, setFullQuoteDataCache]                     = useState<DemandFullResponse | null>(null)
+  const abortFullQuoteRef                                               = useRef<AbortController | null>(null)
+
+  // Fetch full demand database when the Full Quote Data tab is opened.
+  // Data is cached in session memory and reused on tab re-entry to avoid reloading.
+  useEffect(() => {
+    if (activeTab !== 'fullquote') {
+      return
+    }
+    // Use cached data if available
+    if (fullQuoteDataCache !== null) {
+      setFullQuoteData(fullQuoteDataCache)
+      return
+    }
+    // Skip if already loading
+    if (fullQuoteLoading) return
+    
+    let cancelled = false
+    setFullQuoteLoading(true)
+    console.log('[FullQuoteData] Fetching with lookupDemandFull([])')
+    lookupDemandFull([]) // Empty array to get ALL rows
+      .then(res => {
+        if (cancelled) return
+        console.log('[FullQuoteData] Full raw response:', res)
+        console.log('[FullQuoteData] Response analysis:', {
+          hasColumns: !!res?.columns,
+          columnCount: Array.isArray(res?.columns) ? res.columns.length : 'not array',
+          hasResults: !!res?.results,
+          resultsIsArray: Array.isArray(res?.results),
+          resultsKeys: !Array.isArray(res?.results) ? Object.keys(res?.results ?? {}) : 'is array',
+          activeDb: res?.active_db,
+          lastPoPriceCol: res?.last_po_price_col,
+          poQtyCol: res?.po_qty_col,
+          totalEauCol: res?.total_eau_col,
+          plantNameCol: res?.plant_name_col,
+        })
+        setFullQuoteData(res)
+        setFullQuoteDataCache(res) // Cache for re-entry
+      })
+      .catch(err => {
+        if (!cancelled) {
+          console.error('[FullQuoteData] Fetch failed:', err)
+          setFullQuoteData(null)
+        }
+      })
+      .finally(() => { if (!cancelled) setFullQuoteLoading(false) })
+    return () => { cancelled = true }
+  }, [activeTab, fullQuoteDataCache, fullQuoteLoading])
+
   const [amplSheetPickerOpen, setAmplSheetPickerOpen]               = useState(false)
   const [amplSheetNames, setAmplSheetNames]                         = useState<string[]>([])
   const [amplSheetPickerSelected, setAmplSheetPickerSelected]       = useState('')
@@ -2874,9 +2929,9 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
         return next
       })
 
-      // 2 — Only uncached MPNs hit SAP in real time, in small chunks; each result
-      //     is stored in the DB so the next search (any tab) is instant.
-      const CHUNK = 6
+      // 2 — Only uncached MPNs hit SAP in real time, in moderate chunks to avoid
+      //     saturating the upstream server while still showing progressive results.
+      const CHUNK = 9
       for (let i = 0; i < missing.length; i += CHUNK) {
         if (signal.aborted) break
         const chunk = missing.slice(i, i + CHUNK)
@@ -3079,10 +3134,9 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
         return next
       })
 
-      // 2 — Only the uncached MPNs hit SAP in real time, in small chunks so they
-      //     flip from "computing" to a price progressively. Each result is also
-      //     stored in the DB so the next search is instant.
-      const CHUNK = 6
+      // 2 — Only the uncached MPNs hit SAP in real time, in moderate chunks to avoid
+      //     saturating the upstream server while still showing progressive results.
+      const CHUNK = 9
       for (let i = 0; i < missing.length; i += CHUNK) {
         // Cooperative stop: the Stop button sets stopMpnRef so the loop finishes
         // the current chunk and then stops (signal.aborted = hard abort).
@@ -3717,30 +3771,49 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
 
             {/* Tabs */}
             <div className="px-6 pt-3 pb-0 flex-shrink-0 border-b border-gray-100">
-              <div className="flex gap-1 bg-gray-100 rounded-xl p-1 w-fit">
+              <div className="flex gap-1 bg-gray-100 rounded-xl p-1 w-fit overflow-x-auto">
                 <button
+                  type="button"
                   onClick={() => setActiveTab('single')}
-                  className={`px-4 py-1.5 text-sm font-medium rounded-lg transition-colors ${activeTab === 'single' ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+                  className={`px-4 py-1.5 text-sm font-medium rounded-lg transition-colors whitespace-nowrap ${activeTab === 'single' ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
                 >
                   Single
                 </button>
                 <button
+                  type="button"
+                  disabled
                   onClick={() => setActiveTab('multi')}
-                  className={`px-4 py-1.5 text-sm font-medium rounded-lg transition-colors ${activeTab === 'multi' ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+                  className={`px-4 py-1.5 text-sm font-medium rounded-lg transition-colors cursor-not-allowed opacity-70 whitespace-nowrap ${activeTab === 'multi' ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500'}`}
                 >
-                  Multi-Component
+                  <span className="flex items-center gap-2">
+                    <span>Multi-Component</span>
+                    <span className="text-[10px] font-semibold uppercase tracking-wide text-amber-600">in dev</span>
+                  </span>
                 </button>
                 <button
+                  type="button"
                   onClick={() => setActiveTab('mpn')}
-                  className={`px-4 py-1.5 text-sm font-medium rounded-lg transition-colors ${activeTab === 'mpn' ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+                  className={`px-4 py-1.5 text-sm font-medium rounded-lg transition-colors whitespace-nowrap ${activeTab === 'mpn' ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
                 >
                   Multi-MPN
                 </button>
                 <button
+                  type="button"
+                  disabled
                   onClick={() => setActiveTab('ampl')}
-                  className={`px-4 py-1.5 text-sm font-medium rounded-lg transition-colors ${activeTab === 'ampl' ? 'bg-white text-indigo-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+                  className={`px-4 py-1.5 text-sm font-medium rounded-lg transition-colors cursor-not-allowed opacity-70 whitespace-nowrap ${activeTab === 'ampl' ? 'bg-white text-indigo-600 shadow-sm' : 'text-gray-500'}`}
                 >
-                  AMPL Demand
+                  <span className="flex items-center gap-2">
+                    <span>AMPL Demand</span>
+                    <span className="text-[10px] font-semibold uppercase tracking-wide text-amber-600">in dev</span>
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setActiveTab('fullquote')}
+                  className={`px-4 py-1.5 text-sm font-medium rounded-lg transition-colors whitespace-nowrap ${activeTab === 'fullquote' ? 'bg-white text-indigo-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+                >
+                  Full Quote Data
                 </button>
               </div>
             </div>
@@ -6625,6 +6698,68 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
               )}
             </div>
           </div>
+        </div>
+      )}
+
+      {/* •••••••••••••• FULL QUOTE DATA TAB •••••••••••••• */}
+      {activeTab === 'fullquote' && (
+        <div className="flex flex-col h-full overflow-hidden">
+          {(() => {
+            // Extract rows from active database or flatten all results
+            let rows: Array<Record<string, string | number | null>> = []
+            let hasValidData = false
+            
+            if (fullQuoteData && fullQuoteData.results) {
+              if (fullQuoteData.active_db && Array.isArray(fullQuoteData.results[fullQuoteData.active_db])) {
+                // Single active database
+                rows = fullQuoteData.results[fullQuoteData.active_db]
+                hasValidData = rows.length > 0
+              } else if (!Array.isArray(fullQuoteData.results)) {
+                // Object with multiple databases — flatten all
+                try {
+                  const allRows = Object.values(fullQuoteData.results)
+                    .filter((v): v is Array<Record<string, string | number | null>> => Array.isArray(v))
+                    .flat()
+                  if (allRows.length > 0) {
+                    rows = allRows
+                    hasValidData = true
+                  }
+                } catch {
+                  // If flattening fails, keep hasValidData = false
+                }
+              }
+            }
+
+            // Calculate best price from all rows
+            let calculatedBestPrice: number | null = null
+            if (hasValidData && rows.length > 0) {
+              const lastPoPriceCol = fullQuoteData?.last_po_price_col
+              if (lastPoPriceCol) {
+                const prices: number[] = []
+                for (const row of rows) {
+                  const price = Number(row[lastPoPriceCol] ?? 0)
+                  if (!Number.isNaN(price) && price > 0) {
+                    prices.push(price)
+                  }
+                }
+                if (prices.length > 0) {
+                  calculatedBestPrice = Math.min(...prices)
+                }
+              }
+            }
+
+            return (
+              <FullQuoteDataTab
+                data={hasValidData && fullQuoteData ? { columns: fullQuoteData.columns, rows } : null}
+                loading={fullQuoteLoading}
+                lastPoPriceCol={fullQuoteData?.last_po_price_col ?? ''}
+                poQtyCol={fullQuoteData?.po_qty_col ?? ''}
+                currencyCol=""
+                dateCol=""
+                bestPrice={calculatedBestPrice}
+              />
+            )
+          })()}
         </div>
       )}
 

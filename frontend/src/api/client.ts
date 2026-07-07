@@ -482,6 +482,17 @@ export async function lookupDemandFull(mpns: string[]): Promise<DemandFullRespon
   return data
 }
 
+export interface CurrencyRateResponse {
+  rate: number
+  from_currency: string
+  date: string
+}
+
+export async function getCurrencyRate(fromCurrency: string, date: string): Promise<CurrencyRateResponse> {
+  const { data } = await http.post<CurrencyRateResponse>('/financials/currency-rate', { from_currency: fromCurrency, date }, { timeout: 30_000 })
+  return data
+}
+
 export interface DemandDbVersion {
   file:       string
   label:      string
