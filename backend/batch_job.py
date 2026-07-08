@@ -150,7 +150,12 @@ def _post(path: str, body: dict, timeout: int = 60, max_attempts: int = 3) -> di
 
 # ── Core per-MPN computation (reused by realtime fallback) ────────────────────
 
-def process_mpn(mpn: str, window_days: int = DBJOB_WINDOW_DAYS) -> dict:
+def process_mpn(
+    mpn: str,
+    window_days: int = DBJOB_WINDOW_DAYS,
+    request_timeout: int = 60,
+    request_attempts: int = 3,
+) -> dict:
     """
     Compute the best SAP price for a single MPN.
     Returns an entry dict ready for store.upsert_best(). Raises _ConnectionFail /
@@ -160,7 +165,7 @@ def process_mpn(mpn: str, window_days: int = DBJOB_WINDOW_DAYS) -> dict:
     window_ms = window_days * 86_400_000
 
     # 1 — Direct MPN search (Multi-MPN style)
-    iq = _post("/internal-query", {"mpns": [mpn]})
+    iq = _post("/internal-query", {"mpns": [mpn]}, timeout=request_timeout, max_attempts=request_attempts)
     rows = iq.get("data") or []
     best_mpn_row = compute_best_row(rows, window_ms)
 
@@ -176,7 +181,7 @@ def process_mpn(mpn: str, window_days: int = DBJOB_WINDOW_DAYS) -> dict:
     mc_rows: list = []
     best_internal_row = None
     if internal_pn:
-        ampl = _post("/ampl-by-material", {"internal_part_number": internal_pn})
+        ampl = _post("/ampl-by-material", {"internal_part_number": internal_pn}, timeout=request_timeout, max_attempts=request_attempts)
         ampl_data = ampl
         query_mpns = ampl.get("mpns_list") or []
         if not query_mpns:
@@ -186,7 +191,7 @@ def process_mpn(mpn: str, window_days: int = DBJOB_WINDOW_DAYS) -> dict:
                 if i.get("MfgPartNumber")
             })
         if query_mpns:
-            iq2 = _post("/internal-query", {"mpns": query_mpns})
+            iq2 = _post("/internal-query", {"mpns": query_mpns}, timeout=request_timeout, max_attempts=request_attempts)
             mc_rows = iq2.get("data") or []
             best_internal_row = compute_best_row(mc_rows, window_ms)
 

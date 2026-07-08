@@ -519,6 +519,8 @@ def lookup_full_rows(mpns: Iterable[str]) -> dict:
       "columns": [<every column name in the demand table, in order>],
       "results": { MPN_UPPER: [ {col: value, …}, … ] }
     }
+    If mpns is empty, returns ALL rows from the demand table (useful for the
+    "Full demand data" view when no specific MPN filter is needed).
     Used by the modal's "Full demand data" view, which renders the entire row
     plus computed best-price / savings columns on the frontend.
     """
@@ -526,8 +528,6 @@ def lookup_full_rows(mpns: Iterable[str]) -> dict:
     if not path or not os.path.exists(path):
         return {"columns": [], "results": {}}
     keys = list({(m or "").strip().upper() for m in mpns if m})
-    if not keys:
-        return {"columns": [], "results": {}}
 
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
@@ -538,16 +538,27 @@ def lookup_full_rows(mpns: Iterable[str]) -> dict:
 
     out: dict[str, list[dict]] = {}
     try:
-        for i in range(0, len(keys), 400):
-            chunk = keys[i : i + 400]
-            placeholders = ",".join("?" * len(chunk))
-            sql = f"SELECT * FROM demand WHERE mpn_key IN ({placeholders})"
-            for row in conn.execute(sql, tuple(chunk)).fetchall():
+        if not keys:
+            # Empty MPN list → fetch ALL rows from demand table
+            sql = "SELECT * FROM demand"
+            for row in conn.execute(sql).fetchall():
                 d = dict(row)
                 key = d.get("mpn_key") or ""
                 # Strip the join helper from the row payload.
                 d.pop("mpn_key", None)
                 out.setdefault(key, []).append(d)
+        else:
+            # Specific MPNs → fetch only those rows (in chunks to avoid SQL parameter limits)
+            for i in range(0, len(keys), 400):
+                chunk = keys[i : i + 400]
+                placeholders = ",".join("?" * len(chunk))
+                sql = f"SELECT * FROM demand WHERE mpn_key IN ({placeholders})"
+                for row in conn.execute(sql, tuple(chunk)).fetchall():
+                    d = dict(row)
+                    key = d.get("mpn_key") or ""
+                    # Strip the join helper from the row payload.
+                    d.pop("mpn_key", None)
+                    out.setdefault(key, []).append(d)
     finally:
         conn.close()
     return {"columns": display_cols, "results": out}

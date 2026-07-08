@@ -46,6 +46,9 @@ DBJOB_WINDOW_DAYS = int(_os.getenv("DBJOB_WINDOW_DAYS", "45"))
 DBJOB_SCHEDULE_HOUR = int(_os.getenv("DBJOB_SCHEDULE_HOUR", "6"))
 # Parallel workers for the batch job
 DBJOB_MAX_WORKERS = int(_os.getenv("DBJOB_MAX_WORKERS", "8"))
+# Parallel workers for realtime /api/mpn-best/resolve misses.
+# Keep this conservative to avoid saturating upstream InternalQuery.
+MPN_RESOLVE_MAX_WORKERS = int(_os.getenv("MPN_RESOLVE_MAX_WORKERS", "3"))
 
 # Admin dashboard credentials (override via env in production)
 ADMIN_USERNAME = _os.getenv("ADMIN_USERNAME", "admin")

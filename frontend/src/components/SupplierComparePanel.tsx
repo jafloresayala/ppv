@@ -5,12 +5,16 @@
 // "target" plant, and quantifies how much money could be saved if every supplier
 // in the comparison aligned to the cheapest Last PO (USD) price found.
 import { useMemo, useState, useEffect } from 'react'
-import { lookupDemandFull } from '../api/client'
+import { getCurrencyRate, lookupDemandFull } from '../api/client'
 import DataGrid, { DataGridColumn } from './DataGrid'
-import { adminCreateDemandBestTable } from '../api/client'
 import { X, TrendingDown, ArrowRight, Building2, Trophy, CalendarClock } from 'lucide-react'
 
 // ── Types ──────────────────────────────────────────────────────────────────
+
+// v2: bumped from 'fx_rates_cache' because the previous key could persist
+// SAP's 1.0 last-resort fallback as if it were a genuine rate. Shared with
+// FullQuoteDataTab.tsx so both benefit from the same clean, corrected cache.
+const FX_CACHE_KEY = 'fx_rates_cache_v2'
 
 /** Minimal shape this panel needs from each raw purchase record. */
 export interface CompareRecord {
@@ -25,93 +29,390 @@ export interface CompareRecord {
   lastPoLocal: number | null
 }
 
-function FullDemandView({ mpn, data, loading, bestPrice, windowDays }: { mpn: string; data: FullDemandData | null; loading: boolean; bestPrice: number | null; windowDays: number }) {
-  const [creating, setCreating] = useState(false)
-  if (loading) return (
-    <div className="p-6 flex items-center justify-center">
-      <div className="text-sm text-gray-500">Loading full demand data…</div>
-    </div>
-  )
-  if (!data || !data.columns.length) return (
-    <div className="p-6 text-sm text-gray-500">No demand rows available in the active demand database.</div>
-  )
+function normalizeFullDemandData(data: FullDemandData | null | undefined): FullDemandData | null {
+  if (!data) return null
+  const columns = Array.isArray(data.columns) ? data.columns.filter((c): c is string => typeof c === 'string' && c.trim() !== '') : []
+  const rows = Array.isArray(data.rows) ? data.rows : []
+  return {
+    ...data,
+    columns,
+    rows,
+    lastPoPriceCol: typeof data.lastPoPriceCol === 'string' ? data.lastPoPriceCol : '',
+    poQtyCol: typeof data.poQtyCol === 'string' ? data.poQtyCol : '',
+    totalEauCol: typeof data.totalEauCol === 'string' ? data.totalEauCol : '',
+    plantNameCol: typeof data.plantNameCol === 'string' ? data.plantNameCol : '',
+  }
+}
 
-  // Use DataGrid for filtering/export. Filter out rows where Total EAU == 0.
-  const rawRows = data.rows || []
-  const totalCol = data.totalEauCol
-  const filteredRows = rawRows.filter(r => {
+function FullDemandView({ mpn, data, loading, bestPrice, windowDays, bestSupplier, bestPlant, availablePlants, records }: { mpn: string; data: FullDemandData | null; loading: boolean; bestPrice: number | null; windowDays: number; bestSupplier?: string; bestPlant?: string; availablePlants?: string[]; records?: CompareRecord[] }) {
+  // Track which row the user clicked so it stays highlighted.
+  const [selectedRowIdx, setSelectedRowIdx] = useState<number | null>(null)
+  const [currencyRates, setCurrencyRates] = useState<Record<string, number>>({})
+  const [fxDiag, setFxDiag] = useState<{ requested: number; nonUnity: number; fallback: number; currencyCol: string; dateCol: string }>({ requested: 0, nonUnity: 0, fallback: 0, currencyCol: '—', dateCol: '—' })
+  const [selectedPlant, setSelectedPlant] = useState<string>(bestPlant ?? '')
+  const [appliedFilters, setAppliedFilters] = useState<Record<string, string[]>>({}) // Global filters
+  const safeData = useMemo(() => normalizeFullDemandData(data), [data])
+
+  // Load cached FX rates from localStorage on mount
+  useEffect(() => {
+    try {
+      const cached = localStorage.getItem(FX_CACHE_KEY)
+      if (cached) {
+        const parsed = JSON.parse(cached)
+        setCurrencyRates(prev => ({ ...prev, ...parsed }))
+      }
+    } catch {
+      // Silently ignore localStorage errors
+    }
+  }, [])
+
+  // Keep the dropdown in sync if the caller changes the plant.
+  useEffect(() => { setSelectedPlant(bestPlant ?? '') }, [bestPlant])
+
+  // Recalculate the best price / supplier from the selected plant's records.
+  const plantAnalysis = useMemo(() => {
+    if (!records?.length) return null
+    const plantRecords = selectedPlant
+      ? records.filter(r => (r.plant || '(no plant)') === selectedPlant)
+      : records
+    return analyzeScope(plantRecords, windowDays)
+  }, [records, selectedPlant, windowDays])
+  const plantBestPrice = plantAnalysis?.refPrice ?? bestPrice
+  const plantBestSupplier = plantAnalysis?.refRow?.supplier ?? bestSupplier
+
+  const normalizeColumnName = (name: string) => String(name ?? '').replace(/[^a-z0-9]+/gi, '').trim().toLowerCase()
+  const resolveColumnName = (columns: string[], candidates: string[]) => {
+    const map = new Map(columns.map(c => [normalizeColumnName(c), c]))
+    for (const candidate of candidates) {
+      const hit = map.get(normalizeColumnName(candidate))
+      if (hit) return hit
+    }
+    // Fallback: loose contains match for unexpected source names.
+    const normalizedColumns = columns.map(c => ({ raw: c, norm: normalizeColumnName(c) }))
+    for (const candidate of candidates) {
+      const cand = normalizeColumnName(candidate)
+      const loose = normalizedColumns.find(c => c.norm.includes(cand) || cand.includes(c.norm))
+      if (loose) return loose.raw
+    }
+    return null
+  }
+
+  const discoverableColumns = useMemo(() => {
+    if (!safeData) return []
+    const fromRows = safeData.rows.length ? Object.keys(safeData.rows[0] ?? {}) : []
+    return Array.from(new Set([...safeData.columns, ...fromRows]))
+  }, [safeData])
+
+  const priceCol = discoverableColumns.length ? resolveColumnName(discoverableColumns, ['LAST PO ITEM PRICE', 'Last PO Item Price']) : null
+  const qtyCol = discoverableColumns.length ? resolveColumnName(discoverableColumns, ['PURCHASE ORDER QUANTITY', 'Purchase Order Quantity']) : null
+  const currencyCol = discoverableColumns.length ? resolveColumnName(discoverableColumns, ['CURRENCY.2', 'CURRENCY 2', 'Currency', 'Currency 2']) : null
+  const dateCol = discoverableColumns.length ? resolveColumnName(discoverableColumns, ['LAST ORDERER ON', 'Last Orderer On', 'Last Ordered On', 'Last PO Date', 'PO Date']) : null
+  const mpnCol = discoverableColumns.length ? resolveColumnName(discoverableColumns, ['MANUFACTURER PART NO', 'MANUFACTURER PART NO.', 'MPN', 'Manufacturer Part No']) : null
+
+  // Prepare all derived data BEFORE any early returns to maintain stable Hook order
+  const rawRows = safeData?.rows || []
+  const totalCol = safeData?.totalEauCol || ''
+  
+  // Filter: apply non-zero total EAU filter
+  const filteredRows = useMemo(() => rawRows.filter(r => {
     const v = r[totalCol]
     if (v == null || v === '') return true
     const n = Number(v)
     if (isNaN(n)) return true
     return n !== 0
-  })
+  }), [rawRows, totalCol])
 
-  const bp = bestPrice
-  const poCol = data.poQtyCol
-  const lastCol = data.lastPoPriceCol
+  // Calculate BEST PRICE FOR MPN (global, across entire dataset)
+  const mpnBestPriceMap = useMemo(() => {
+    const map = new Map<string, number>()
+    if (!safeData?.rows?.length || !mpnCol) return map
 
-  // Build DataGrid columns from the DB columns and append Best Price + Potential Saving
-  const cols: DataGridColumn<Record<string, any>>[] = data.columns.map(c => ({
-    key: c,
-    header: c,
-    accessor: (r) => r[c] ?? '',
-    render: (r) => String(r[c] ?? ''),
-    type: 'text',
-    align: 'left',
-    noSort: false,
-  }))
-  cols.push({
-    key: 'best_price_for_mpn', header: 'Best Price for this MPN', accessor: () => (bp == null ? '' : String(bp)), render: () => (bp == null ? '—' : String(bp)), type: 'number', align: 'right',
+    const resolvedPriceCol = resolveColumnName(safeData.columns, ['LAST PO ITEM PRICE', 'Last PO Item Price'])
+    if (!resolvedPriceCol) return map
+
+    for (const row of safeData.rows) {
+      const mpnKey = String(row[mpnCol] ?? '').trim()
+      if (!mpnKey) continue
+      const priceValue = Number(row[resolvedPriceCol] ?? 0)
+      if (!Number.isFinite(priceValue) || priceValue <= 0) continue
+      const currentBest = map.get(mpnKey) ?? Infinity
+      map.set(mpnKey, Math.min(currentBest, priceValue))
+    }
+    return map
+  }, [safeData, mpnCol])
+
+  const bp = plantBestPrice
+  const poCol = safeData?.poQtyCol || ''
+  const lastCol = safeData?.lastPoPriceCol || ''
+
+  const excludedColumnNames = new Set(['PLANT_CODE', 'PLANT_NAME', 'PRICE UNIT2', 'CURRENCY3', 'PRICE UNIT4', 'CURRENCY5'])
+  const normalizedColumnName = (name: string) => String(name ?? '').replace(/\s+/g, ' ').trim().toUpperCase()
+
+  // Apply global filters to all rows (not just displayed ones)
+  const globallyFilteredRows = useMemo(() => {
+    if (Object.keys(appliedFilters).length === 0) return filteredRows
+    
+    return filteredRows.filter(row => {
+      for (const [colName, filterValues] of Object.entries(appliedFilters)) {
+        if (filterValues.length === 0) continue
+        const rowValue = String(row[colName] ?? '')
+        if (!filterValues.includes(rowValue)) return false
+      }
+      return true
+    })
+  }, [filteredRows, appliedFilters])
+
+  const displayRows = useMemo(() => {
+    if (!safeData?.rows?.length) return []
+    const resolvedCurrencyCol = resolveColumnName(safeData.columns, ['CURRENCY.2', 'CURRENCY 2', 'Currency', 'Currency 2'])
+    const resolvedDateCol = resolveColumnName(safeData.columns, ['LAST ORDERER ON', 'Last Orderer On', 'LAST ORDERED ON', 'Last Ordered On', 'Last PO Date', 'PO Date'])
+    const resolvedPriceCol = resolveColumnName(safeData.columns, ['LAST PO ITEM PRICE', 'Last PO Item Price'])
+    const resolvedQtyCol = resolveColumnName(safeData.columns, ['PURCHASE ORDER QUANTITY', 'Purchase Order Quantity'])
+    const resolvedStdPriceCol = resolveColumnName(safeData.columns, ['STANDARD PRICE', 'Standard Price', 'STD PRICE', 'Std Price'])
+
+    return globallyFilteredRows.map(row => {
+      const priceValue = Number(row[resolvedPriceCol ?? lastCol] ?? 0)
+      const qtyValue = Number(row[resolvedQtyCol ?? poCol] ?? 0)
+      const stdPriceValue = Number(row[resolvedStdPriceCol ?? ''] ?? 0)
+      const currencyRaw = row[resolvedCurrencyCol ?? '']
+      const currencyValue = String(currencyRaw ?? '').trim().toUpperCase()
+      const dateValue = String(row[resolvedDateCol ?? ''] ?? '').trim()
+      const dateKey = dateValue ? dateValue.slice(0, 10) : ''
+      const rate = currencyValue && currencyValue !== 'USD' && dateKey ? (currencyRates[`${currencyValue}|${dateKey}`] ?? 1) : 1
+      // Requested formula: CURRENCY TO USD = LAST PO ITEM PRICE / CurrencyRate
+      const currencyToUsd = !Number.isNaN(priceValue) && priceValue > 0 && currencyValue && currencyValue !== 'USD' && rate > 0
+        ? priceValue / rate
+        : priceValue
+      const total = currencyToUsd * (Number.isFinite(qtyValue) ? qtyValue : 0)
+      const qtyXBestPrice = bp != null && Number.isFinite(qtyValue) ? bp * qtyValue : 0
+      const poSavings = total - qtyXBestPrice
+      const stdSavings = (stdPriceValue * qtyValue) - qtyXBestPrice
+      
+      // Best Price for this specific MPN (grouped globally)
+      const mpnKey = mpnCol ? String(row[mpnCol] ?? '').trim() : ''
+      const bestPriceForMpn = mpnKey && mpnBestPriceMap.has(mpnKey) ? mpnBestPriceMap.get(mpnKey) : null
+
+      return {
+        ...row,
+        'TO USD': Number.isFinite(currencyToUsd) ? Number(currencyToUsd.toFixed(6)) : '',
+        'LAST PO QTY x TO USD': Number.isFinite(total) ? Number(total.toFixed(2)) : '',
+        'LAST PO QTY x BEST PRICE': Number.isFinite(qtyXBestPrice) ? Number(qtyXBestPrice.toFixed(2)) : '',
+        'PO SAVINGS': Number.isFinite(poSavings) ? Number(poSavings.toFixed(2)) : '',
+        'STD SAVINGS': Number.isFinite(stdSavings) ? Number(stdSavings.toFixed(2)) : '',
+        'BEST PRICE FOR MPN': bestPriceForMpn != null ? Number(bestPriceForMpn.toFixed(6)) : '',
+        '_currencyEmpty': !currencyValue || currencyValue.trim() === '',
+      }
+    })
+  }, [safeData, globallyFilteredRows, lastCol, poCol, bp, currencyRates, mpnCol, mpnBestPriceMap])
+
+  useEffect(() => {
+    // FX lookup only depends on currency + date columns.
+    // Do not block this when price/qty aliases are missing.
+    if (!safeData || !safeData.rows.length || !currencyCol || !dateCol) {
+      setFxDiag({ requested: 0, nonUnity: 0, fallback: 0, currencyCol: currencyCol ?? '—', dateCol: dateCol ?? '—' })
+      return
+    }
+    const pending = new Map<string, { currency: string; date: string }>()
+    const seen = new Set<string>()
+    for (const row of safeData.rows) {
+      const rawCurrency = String(row[currencyCol] ?? '').trim()
+      const rawDate = String(row[dateCol] ?? '').trim()
+      const currency = rawCurrency.toUpperCase()
+      if (!currency || currency === 'USD') continue
+      const normalizedDate = rawDate ? rawDate.slice(0, 10) : ''
+      if (!normalizedDate) continue
+      const key = `${currency}|${normalizedDate}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      pending.set(key, { currency, date: normalizedDate })
+    }
+    if (!pending.size) return
+
+    let cancelled = false
+    const run = async () => {
+      const nextRates: Record<string, number> = {}
+      const persistable: Record<string, number> = {}
+      let requested = 0
+      let nonUnity = 0
+      let fallback = 0
+      for (const [key, req] of pending.entries()) {
+        requested += 1
+        try {
+          const res = await getCurrencyRate(req.currency, req.date)
+          nextRates[key] = res.rate
+          if (res.is_fallback) {
+            // SAP had no genuine rate for this currency/date — do not persist
+            // this 1.0 placeholder as if it were a real conversion.
+            fallback += 1
+          } else {
+            persistable[key] = res.rate
+            if (res.rate !== 1) nonUnity += 1
+          }
+        } catch {
+          nextRates[key] = 1
+          fallback += 1
+        }
+      }
+      if (!cancelled) {
+        const updatedRates = { ...currencyRates, ...nextRates }
+        setCurrencyRates(updatedRates)
+        // Cache only genuine (non-fallback) rates in localStorage for persistence
+        if (Object.keys(persistable).length) {
+          try {
+            const toPersist = { ...currencyRates, ...persistable }
+            localStorage.setItem(FX_CACHE_KEY, JSON.stringify(toPersist))
+          } catch {
+            // Silently ignore localStorage errors
+          }
+        }
+        setFxDiag({ requested, nonUnity, fallback, currencyCol, dateCol })
+      }
+    }
+    void run()
+    return () => { cancelled = true }
+  }, [safeData, currencyCol, dateCol])
+
+  // Early returns AFTER all Hooks have been called
+  if (loading) return (
+    <div className="p-6 flex items-center justify-center">
+      <div className="text-sm text-gray-500">Loading full demand data…</div>
+    </div>
+  )
+  if (!safeData || !safeData.columns.length) return (
+    <div className="p-6 text-sm text-gray-500">No demand rows available in the active demand database.</div>
+  )
+
+  // Build DataGrid columns from the DB columns, hide the noise columns, and append
+  // the best-price reference columns that matter for this analysis.
+  const visibleColumns = safeData.columns.filter(c => !excludedColumnNames.has(normalizedColumnName(c)))
+  const cols: DataGridColumn<Record<string, any>>[] = visibleColumns.map((c, i) => {
+    // Determine width based on column characteristics
+    const normalized = normalizedColumnName(c)
+    let width = ''
+    if (i === 0) {
+      width = 'sticky left-0 z-[2] bg-white'
+    } else if (normalized.includes('PRICE') || normalized.includes('QUANTITY') || normalized.includes('QTY') || normalized.includes('DATE') || normalized.includes('CURRENCY')) {
+      width = 'w-24'
+    } else if (normalized.includes('PLANT') || normalized.includes('SUPPLIER')) {
+      width = 'flex-1 min-w-32'
+    }
+    
+    return {
+      key: c,
+      header: c,
+      accessor: (r) => r[c] ?? '',
+      render: (r) => {
+        const raw = r[c]
+        const norm = normalizedColumnName(c)
+        if (norm === 'GROSS DEMAND') {
+          const n = raw == null || raw === '' ? null : Number(raw)
+          if (n == null || Number.isNaN(n)) return String(raw ?? '—')
+          const cls = n < 0 ? 'bg-emerald-100 text-emerald-700' : n > 0 ? 'bg-red-100 text-red-700' : 'text-gray-700'
+          return <span className={`inline-block w-full ${cls}`}>{String(raw)}</span>
+        }
+        return String(raw ?? '')
+      },
+      type: 'text',
+      align: 'left',
+      noSort: false,
+      width: width,
+    }
   })
   cols.push({
-    key: 'potential_saving', header: 'Potential Saving', accessor: (r) => {
-      const last = Number(r[lastCol] ?? 0) || 0
-      const qty = Number(r[poCol] ?? 0) || 0
-      const saving = bp != null && last > bp ? (last - bp) * qty : 0
-      return Number(saving.toFixed(2))
-    }, render: (r) => {
-      const val = Number(((bp != null && Number(r[lastCol] ?? 0) > bp) ? ((Number(r[lastCol] ?? 0) - bp) * (Number(r[poCol] ?? 0) || 0)) : 0))
-      return val > 0 ? val.toFixed(2) : '—'
-    }, type: 'number', align: 'right',
+    key: 'best_supplier', header: 'BEST SUPPLIER', accessor: () => (plantBestSupplier ?? ''), render: () => (plantBestSupplier ?? '—'), type: 'text', align: 'left', width: 'flex-1 min-w-32',
+  })
+  cols.push({
+    key: 'best_plant_price', header: 'PLANT SELECTED', accessor: () => (selectedPlant ?? bestPlant ?? ''), render: () => (selectedPlant ?? bestPlant ?? '—'), type: 'text', align: 'left', width: 'w-24',
+  })
+  cols.push({
+    key: 'best_price_for_mpn', header: 'BEST PRICE', accessor: () => (bp == null ? '' : String(bp)), render: () => (bp == null ? '—' : String(bp)), type: 'number', align: 'right', width: 'w-20',
+  })
+  cols.push({
+    key: 'best_price_for_this_mpn', header: 'BEST PRICE FOR MPN', accessor: (r) => r['BEST PRICE FOR MPN'] ?? '', render: (r) => {
+      const v = r['BEST PRICE FOR MPN']
+      if (v == null || v === '') return '—'
+      return <span className="bg-indigo-100 text-indigo-700 inline-block w-full">{String(v)}</span>
+    }, type: 'number', align: 'right', width: 'w-24',
+  })
+  cols.push({
+    key: 'QTY x BEST PRICE', header: 'LAST PO QTY x BEST PRICE', accessor: (r) => r['LAST PO QTY x BEST PRICE'] ?? '', render: (r) => (r['LAST PO QTY x BEST PRICE'] == null || r['LAST PO QTY x BEST PRICE'] === '' ? '—' : String(r['LAST PO QTY x BEST PRICE'])), type: 'number', align: 'right', width: 'w-24',
+  })
+  cols.push({
+    key: 'TO USD', header: 'LAST PO ITEM PRICE TO USD', accessor: (r) => r['TO USD'] ?? '', render: (r) => {
+      const v = r['TO USD']
+      const isEmpty = r['_currencyEmpty']
+      if (v == null || v === '') return '—'
+      const cls = isEmpty ? 'bg-yellow-100 text-yellow-700' : 'text-gray-700'
+      return <span className={`inline-block w-full ${cls}`}>{String(v)}</span>
+    }, type: 'number', align: 'right', width: 'w-24',
+  })
+  cols.push({
+    key: 'PO QTY x TO CURRENCY', header: 'LAST PO QTY x TO USD', accessor: (r) => r['LAST PO QTY x TO USD'] ?? '', render: (r) => {
+      const v = r['LAST PO QTY x TO USD']
+      const isEmpty = r['_currencyEmpty']
+      if (v == null || v === '') return '—'
+      const cls = isEmpty ? 'bg-yellow-100 text-yellow-700' : 'text-gray-700'
+      return <span className={`inline-block w-full ${cls}`}>{String(v)}</span>
+    }, type: 'number', align: 'right', width: 'w-28',
+  })
+  cols.push({
+    key: 'PO SAVINGS', header: 'PO SAVINGS', accessor: (r) => r['PO SAVINGS'] ?? '', render: (r) => {
+      const v = r['PO SAVINGS']
+      if (v == null || v === '') return '—'
+      const n = typeof v === 'number' ? v : Number(v)
+      const cls = n > 0 ? 'bg-emerald-100 text-emerald-700' : n < 0 ? 'bg-red-100 text-red-700' : 'text-gray-700'
+      return <span className={`inline-block w-full ${cls}`}>{String(v)}</span>
+    }, type: 'number', align: 'right', width: 'w-24',
+  })
+  cols.push({
+    key: 'STD SAVINGS', header: 'STD SAVINGS', accessor: (r) => r['STD SAVINGS'] ?? '', render: (r) => {
+      const v = r['STD SAVINGS']
+      if (v == null || v === '') return '—'
+      const n = typeof v === 'number' ? v : Number(v)
+      const cls = n > 0 ? 'bg-emerald-100 text-emerald-700' : n < 0 ? 'bg-red-100 text-red-700' : 'text-gray-700'
+      return <span className={`inline-block w-full ${cls}`}>{String(v)}</span>
+    }, type: 'number', align: 'right', width: 'w-24',
   })
 
   return (
-    <div className="p-4">
-      <div className="mb-3 flex items-center justify-between">
-        <div className="text-[11px] text-gray-600">Full demand rows from <span className="font-mono">{mpn}</span> · Best price (window {windowDays}d): <span className="font-mono font-bold">{bp != null ? String(bp) : '—'}</span></div>
-        <div>
-          <button
-            disabled={creating}
-            onClick={async () => {
-              const token = window.prompt('Admin token required to create table in demand DB (Paste token)')
-              if (!token) return
-              try {
-                setCreating(true)
-                const res = await adminCreateDemandBestTable(token, [mpn], windowDays, null)
-                window.alert(`Created table ${res.table} with ${res.rows} rows. Total potential saving: ${res.total_potential_saving.toFixed(2)}`)
-              } catch (e: any) {
-                window.alert('Failed to create table: ' + (e?.response?.data?.detail || e?.message || String(e)))
-              } finally {
-                setCreating(false)
-              }
-            }}
-            className="px-2.5 py-1 rounded bg-emerald-600 text-white text-[12px] font-semibold hover:bg-emerald-700 disabled:opacity-60"
-          >
-            {creating ? 'Saving…' : 'Save to .db'}
-          </button>
-        </div>
+    <div className="flex flex-col h-full overflow-hidden p-4 gap-2">
+      <div className="text-[11px] text-gray-600 shrink-0 flex flex-wrap items-center gap-3">
+        <span>Full demand rows from <span className="font-mono">{mpn}</span> · Best price (window {windowDays}d): <span className="font-mono font-bold">{bp != null ? String(bp) : '—'}</span></span>
+        {availablePlants && availablePlants.length > 0 && (
+          <label className="flex items-center gap-1.5">
+            <span className="text-gray-500">Plant:</span>
+            <select
+              value={selectedPlant}
+              onChange={e => setSelectedPlant(e.target.value)}
+              className="px-2 py-0.5 text-[11px] border border-gray-200 rounded focus:outline-none focus:ring-2 focus:ring-brand/30 focus:border-brand bg-white"
+            >
+              {availablePlants.map(p => <option key={p} value={p}>{p}</option>)}
+            </select>
+          </label>
+        )}
+        <span className="ml-auto text-gray-400">· Click a row to highlight it</span>
+        <span className="text-gray-500">· FX calls: <span className="font-mono">{fxDiag.requested}</span> | rate≠1: <span className="font-mono">{fxDiag.nonUnity}</span> | fallback: <span className="font-mono">{fxDiag.fallback}</span></span>
+        <span className="text-gray-500">· FX cols: <span className="font-mono">{fxDiag.currencyCol}</span> / <span className="font-mono">{fxDiag.dateCol}</span></span>
       </div>
 
-      <DataGrid
-        rows={filteredRows}
-        columns={cols}
-        rowKey={(r, i) => `${mpn}-${i}`}
-        pageSize={50}
-        exportFileName={`demand_${mpn}_${new Date().toISOString().slice(0,10)}`}
-        exportSheetName={`Demand_${mpn}`}
-        defaultShowFilters={true}
-      />
+      <div className="flex-1 min-h-0 overflow-auto">
+        <DataGrid
+          rows={displayRows}
+          columns={cols}
+          rowKey={(r, i) => `${mpn}-${i}`}
+          pageSize={50}
+          exportFileName={`demand_${mpn}_${new Date().toISOString().slice(0,10)}`}
+          exportSheetName={`Demand_${mpn}`}
+          defaultShowFilters={true}
+          freezeFirstColumn={true}
+          onRowClick={(_r, i) => setSelectedRowIdx(prev => prev === i ? null : i)}
+          rowClassName={(_r, i) =>
+            selectedRowIdx === i
+              ? 'bg-indigo-100 ring-1 ring-inset ring-indigo-400 cursor-pointer'
+              : 'hover:bg-indigo-50/60 cursor-pointer'
+          }
+        />
+      </div>
     </div>
   )
 }
@@ -187,6 +488,104 @@ function groupByPlant(records: CompareRecord[]): PlantGroup[] {
     .sort((a, b) => a.plant.localeCompare(b.plant))
 }
 
+interface AnalysisLine {
+  r: CompareRecord
+  price: number | null
+  isRef: boolean
+  within: boolean
+  deltaUnit: number | null
+  qty: number | null
+  saveTotal: number | null
+}
+
+interface AnalysisResult {
+  refRow: CompareRecord | null
+  refPrice: number | null
+  lines: AnalysisLine[]
+  totalQtySaving: number
+  distinctSuppliers: number
+  unitSpread: number | null
+  maxPrice: number
+  windowStart: number | null
+  maxT: number | null
+}
+
+/** Compute the cheapest reference price and savings lines for a set of records.
+ *  If `referenceMaxT` is provided, the window is anchored to that timestamp
+ *  instead of the most recent date inside `records`. This lets an "all plants"
+ *  analysis share the same time window as the user's selected scope. */
+function analyzeScope(records: CompareRecord[], windowDays: number, referenceMaxT?: number | null): AnalysisResult {
+  const priced = records.filter(r => r.lastPoUsd != null && r.lastPoUsd > 0)
+
+  const ts = (s: string) => { const t = new Date(s).getTime(); return isNaN(t) ? null : t }
+  const dated = priced.map(r => ts(r.lastPoDate)).filter((t): t is number => t != null)
+  const maxT = referenceMaxT ?? (dated.length ? Math.max(...dated) : null)
+  const windowStart = maxT != null ? maxT - windowDays * 86_400_000 : null
+
+  const inWindow = (r: CompareRecord) => {
+    if (windowStart == null) return true
+    const t = ts(r.lastPoDate)
+    return t == null ? false : t >= windowStart
+  }
+  const eligible = priced.filter(inWindow)
+  const pool = eligible.length ? eligible : priced
+
+  const refRow = pool.reduce<CompareRecord | null>((min, r) => {
+    if (min == null) return r
+    return (r.lastPoUsd ?? Infinity) < (min.lastPoUsd ?? Infinity) ? r : min
+  }, null)
+  const refPrice = refRow?.lastPoUsd ?? null
+
+  const lines = records.map(r => {
+    const price = r.lastPoUsd
+    const isRef = refRow != null && r === refRow
+    const within = inWindow(r)
+    const deltaUnit = price != null && refPrice != null ? price - refPrice : null
+    const qty = r.quantity ?? null
+    const saveTotal = deltaUnit != null && deltaUnit > 0 && qty != null ? deltaUnit * qty : (deltaUnit != null && deltaUnit > 0 ? null : 0)
+    return { r, price, isRef, within, deltaUnit, qty, saveTotal }
+  })
+
+  const totalQtySaving = lines.reduce((sum, l) => sum + (l.saveTotal ?? 0), 0)
+  const distinctSuppliers = new Set(records.map(r => r.supplier).filter(Boolean)).size
+  const maxPrice = pool.reduce((mx, r) => Math.max(mx, r.lastPoUsd ?? 0), 0)
+  const unitSpread = refPrice != null && maxPrice > 0 ? maxPrice - refPrice : null
+
+  return { refRow, refPrice, lines, totalQtySaving, distinctSuppliers, unitSpread, maxPrice, windowStart, maxT }
+}
+
+/** Find the cheapest price across every plant, where each plant is evaluated
+ *  against its own look-back window anchored to its own most recent Last PO date. */
+function analyzeAllPlants(records: CompareRecord[], windowDays: number): AnalysisResult {
+  const groups = groupByPlant(records)
+  let bestRefRow: CompareRecord | null = null
+  let bestRefPrice: number | null = null
+  let bestWindowStart: number | null = null
+  let bestMaxT: number | null = null
+
+  for (const group of groups) {
+    const plantAnalysis = analyzeScope(group.rows, windowDays)
+    if (plantAnalysis.refPrice != null && (bestRefPrice == null || plantAnalysis.refPrice < bestRefPrice)) {
+      bestRefRow = plantAnalysis.refRow
+      bestRefPrice = plantAnalysis.refPrice
+      bestWindowStart = plantAnalysis.windowStart
+      bestMaxT = plantAnalysis.maxT
+    }
+  }
+
+  return {
+    refRow: bestRefRow,
+    refPrice: bestRefPrice,
+    lines: [],
+    totalQtySaving: 0,
+    distinctSuppliers: 0,
+    unitSpread: null,
+    maxPrice: bestRefPrice ?? 0,
+    windowStart: bestWindowStart,
+    maxT: bestMaxT,
+  }
+}
+
 // ── Component ──────────────────────────────────────────────────────────────
 
 export default function SupplierComparePanel({ mpn, records, demand = [], demandLoading = false, fullDemand = null, fullDemandLoading = false, onClose }: SupplierComparePanelProps) {
@@ -209,7 +608,19 @@ export default function SupplierComparePanel({ mpn, records, demand = [], demand
     setFullLocal(null)
     setFullLocalLoading(true)
     lookupDemandFull([mpn])
-      .then(res => { if (cancelled) return; setFullLocal({ columns: res.columns, rows: Object.values(res.results).flat(), lastPoPriceCol: res.last_po_price_col, poQtyCol: res.po_qty_col, totalEauCol: res.total_eau_col, plantNameCol: res.plant_name_col }) })
+      .then(res => {
+        if (cancelled) return
+        const columns = Array.isArray(res?.columns) ? res.columns.filter((c): c is string => typeof c === 'string' && c.trim() !== '') : []
+        const rows = Array.isArray(res?.results) ? res.results : Object.values(res?.results ?? {}).flat()
+        setFullLocal({
+          columns,
+          rows,
+          lastPoPriceCol: typeof res?.last_po_price_col === 'string' ? res.last_po_price_col : '',
+          poQtyCol: typeof res?.po_qty_col === 'string' ? res.po_qty_col : '',
+          totalEauCol: typeof res?.total_eau_col === 'string' ? res.total_eau_col : '',
+          plantNameCol: typeof res?.plant_name_col === 'string' ? res.plant_name_col : '',
+        })
+      })
       .catch(() => { if (!cancelled) setFullLocal(null) })
       .finally(() => { if (!cancelled) setFullLocalLoading(false) })
     return () => { cancelled = true }
@@ -260,48 +671,12 @@ export default function SupplierComparePanel({ mpn, records, demand = [], demand
     const scopeRows: CompareRecord[] = []
     if (baseGroup) scopeRows.push(...baseGroup.rows)
     if (targetGroup) scopeRows.push(...targetGroup.rows)
-    const priced = scopeRows.filter(r => r.lastPoUsd != null && r.lastPoUsd > 0)
-
-    // Latest PO date across priced records → start of the window.
-    const ts = (s: string) => { const t = new Date(s).getTime(); return isNaN(t) ? null : t }
-    const dated = priced.map(r => ts(r.lastPoDate)).filter((t): t is number => t != null)
-    const maxT = dated.length ? Math.max(...dated) : null
-    const windowStart = maxT != null ? maxT - windowDays * 86_400_000 : null
-
-    // A record is eligible to set the reference price only if it falls inside
-    // the window (or we have no dates at all, in which case all priced count).
-    const inWindow = (r: CompareRecord) => {
-      if (windowStart == null) return true
-      const t = ts(r.lastPoDate)
-      return t == null ? false : t >= windowStart
-    }
-    const eligible = priced.filter(inWindow)
-    const pool = eligible.length ? eligible : priced   // fall back if window empties
-
-    const refRow = pool.reduce<CompareRecord | null>((min, r) => {
-      if (min == null) return r
-      return (r.lastPoUsd ?? Infinity) < (min.lastPoUsd ?? Infinity) ? r : min
-    }, null)
-    const refPrice = refRow?.lastPoUsd ?? null
-
-    const lines = scopeRows.map(r => {
-      const price = r.lastPoUsd
-      const isRef = refRow != null && r === refRow
-      const within = inWindow(r)
-      const deltaUnit = price != null && refPrice != null ? price - refPrice : null
-      const qty = r.quantity ?? null
-      // Annualized-style saving estimate based on the recorded PO quantity.
-      const saveTotal = deltaUnit != null && deltaUnit > 0 && qty != null ? deltaUnit * qty : (deltaUnit != null && deltaUnit > 0 ? null : 0)
-      return { r, price, isRef, within, deltaUnit, qty, saveTotal }
-    })
-
-    const totalQtySaving = lines.reduce((sum, l) => sum + (l.saveTotal ?? 0), 0)
-    const distinctSuppliers = new Set(scopeRows.map(r => r.supplier).filter(Boolean)).size
-    const maxPrice = pool.reduce((mx, r) => Math.max(mx, r.lastPoUsd ?? 0), 0)
-    const unitSpread = refPrice != null && maxPrice > 0 ? maxPrice - refPrice : null
-
-    return { refRow, refPrice, lines, totalQtySaving, distinctSuppliers, unitSpread, maxPrice, windowStart, maxT }
+    return analyzeScope(scopeRows, windowDays)
   }, [baseGroup, targetGroup, windowDays])
+
+  // Cheapest price across every plant, where each plant is evaluated within its
+  // own look-back window anchored to its own most recent Last PO date.
+  const allPlantsAnalysis = useMemo(() => analyzeAllPlants(records, windowDays), [records, windowDays])
 
   const scopeLabel = targetPlant ? `${basePlant} vs ${targetPlant}` : basePlant
 
@@ -409,12 +784,19 @@ export default function SupplierComparePanel({ mpn, records, demand = [], demand
         </div>
 
         {/* Summary cards */}
-        <div className="px-5 py-3 grid grid-cols-2 sm:grid-cols-4 gap-3 border-b border-gray-100 bg-gray-50/50">
+        <div className="px-5 py-3 grid grid-cols-2 sm:grid-cols-5 gap-3 border-b border-gray-100 bg-gray-50/50">
           <div className="bg-white rounded-xl border border-gray-200 p-3">
             <p className="text-[10px] uppercase tracking-wide text-gray-400">Cheapest price <span className="text-emerald-500">· {windowDays}d window</span></p>
             <p className="text-sm font-bold text-emerald-700 font-mono mt-0.5">{fmtUsd6(analysis.refPrice)}</p>
             <p className="text-[10px] text-gray-400 truncate mt-0.5" title={analysis.refRow?.supplier}>
               {analysis.refRow ? `${analysis.refRow.supplier} · ${analysis.refRow.plant}` : '—'}
+            </p>
+          </div>
+          <div className="bg-white rounded-xl border border-gray-200 p-3">
+            <p className="text-[10px] uppercase tracking-wide text-gray-400">Cheapest price all plants <span className="text-emerald-500">· {windowDays}d window</span></p>
+            <p className="text-sm font-bold text-emerald-700 font-mono mt-0.5">{fmtUsd6(allPlantsAnalysis.refPrice)}</p>
+            <p className="text-[10px] text-gray-400 truncate mt-0.5" title={allPlantsAnalysis.refRow?.supplier}>
+              {allPlantsAnalysis.refRow ? `${allPlantsAnalysis.refRow.supplier} · ${allPlantsAnalysis.refRow.plant}` : '—'}
             </p>
           </div>
           <div className="bg-white rounded-xl border border-gray-200 p-3">
@@ -488,6 +870,7 @@ export default function SupplierComparePanel({ mpn, records, demand = [], demand
                   <th className="px-2.5 py-2 text-left whitespace-nowrap border-b border-gray-200">Plant</th>
                   <th className="px-2.5 py-2 text-left whitespace-nowrap border-b border-gray-200">Supplier</th>
                   <th className="px-2.5 py-2 text-right whitespace-nowrap border-b border-gray-200">Last PO (USD)</th>
+                  <th className="px-2.5 py-2 text-right whitespace-nowrap border-b border-gray-200">STD (USD)</th>
                   <th className="px-2.5 py-2 text-right whitespace-nowrap border-b border-gray-200">Δ / unit</th>
                   <th className="px-2.5 py-2 text-right whitespace-nowrap border-b border-gray-200">PO Qty</th>
                   <th className="px-2.5 py-2 text-right whitespace-nowrap border-b border-gray-200">Potential Saving</th>
@@ -504,7 +887,8 @@ export default function SupplierComparePanel({ mpn, records, demand = [], demand
                         {l.isRef && <Trophy className="inline h-3 w-3 text-emerald-600 mr-1 -mt-0.5" />}
                         {l.r.supplier || '—'}
                       </td>
-                      <td className={`px-2.5 py-2 text-right font-mono font-semibold whitespace-nowrap ${l.isRef ? 'text-emerald-700' : 'text-gray-700'}`}>{fmtUsd6(l.price)}</td>
+                      <td className={`px-2.5 py-2 text-right font-mono font-semibold whitespace-nowrap ${l.isRef ? 'text-emerald-700' : l.price === 0 ? 'bg-yellow-100 text-yellow-700' : l.price != null && l.r.stdUsd != null && l.price > l.r.stdUsd ? 'bg-red-100 text-red-700' : 'text-gray-700'}`}>{fmtUsd6(l.price)}</td>
+                      <td className="px-2.5 py-2 text-right font-mono text-gray-600 whitespace-nowrap">{fmtUsd6(l.r.stdUsd)}</td>
                       <td className={`px-2.5 py-2 text-right font-mono whitespace-nowrap ${l.deltaUnit != null && l.deltaUnit > 0 ? 'text-red-600' : 'text-gray-400'}`}>
                         {l.deltaUnit != null && l.deltaUnit > 0 ? `+${fmtUsd6(l.deltaUnit)}` : (l.isRef ? '—' : fmtUsd6(l.deltaUnit))}
                       </td>
@@ -533,13 +917,19 @@ export default function SupplierComparePanel({ mpn, records, demand = [], demand
         </>}
 
         {view === 'full' && (
-          <FullDemandView
-            mpn={mpn}
-            data={fullDemand ?? fullLocal}
-            loading={fullDemandLoading || fullLocalLoading}
-            bestPrice={analysis.refPrice}
-            windowDays={windowDays}
-          />
+          <div className="flex-1 overflow-hidden flex flex-col">
+            <FullDemandView
+              mpn={mpn}
+              data={fullDemand ?? fullLocal}
+              loading={fullDemandLoading || fullLocalLoading}
+              bestPrice={analysis.refPrice}
+              windowDays={windowDays}
+              bestSupplier={analysis.refRow?.supplier ?? ''}
+              bestPlant={analysis.refRow?.plant ?? ''}
+              availablePlants={plantGroups.map(g => g.plant)}
+              records={records}
+            />
+          </div>
         )}
       </div>
     </div>

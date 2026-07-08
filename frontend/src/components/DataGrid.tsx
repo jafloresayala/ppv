@@ -7,6 +7,7 @@ import {
   Search, X, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight,
   Download, Filter, ArrowUp, ArrowDown, ArrowUpDown,
 } from 'lucide-react'
+import type { ExportColumnMeta, ExportRowData, ExportRequest, ExportResponse } from '../workers/exportWorker'
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -33,6 +34,14 @@ export interface DataGridColumn<T> {
   className?: string
   /** Value used for Excel export (defaults to accessor). */
   exportValue?: (row: T) => string | number | null | undefined
+  /** Optional per-row Excel cell background fill (ARGB hex, e.g. 'FFD1FAE5') — mirrors the on-screen highlight color for that cell. */
+  exportFill?: (row: T) => string | null | undefined
+  /** Optional per-row Excel cell font color (ARGB hex, e.g. 'FF047857'). */
+  exportFontColor?: (row: T) => string | null | undefined
+  /** Optional Excel number format code applied to every cell in this column (e.g. '"$"#,##0.00'). */
+  numberFormat?: string
+  /** Optional Tailwind width class (e.g. 'w-20', 'w-32', 'flex-1'). */
+  width?: string
 }
 
 interface DataGridProps<T> {
@@ -58,6 +67,8 @@ interface DataGridProps<T> {
   defaultShowFilters?: boolean
   /** Optional click handler per row (e.g. open a detail/comparison panel). */
   onRowClick?: (row: T, index: number) => void
+  /** Freeze the first data column so it stays visible on horizontal scroll. */
+  freezeFirstColumn?: boolean
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -105,6 +116,7 @@ export default function DataGrid<T>({
   rows, columns, rowKey, pageSize = 50, rowClassName,
   exportFileName = 'export', exportSheetName = 'Data',
   prepend, append, dense = false, defaultShowFilters = true, onRowClick,
+  freezeFirstColumn = false,
 }: DataGridProps<T>) {
   const [page, setPage]         = useState(0)
   const [perPage, setPerPage]   = useState(pageSize)
@@ -192,32 +204,61 @@ export default function DataGrid<T>({
   }, [])
 
   // Excel export — exports the *filtered/sorted* result set (all pages).
+  // Two-step pipeline so large exports never freeze the page (and never
+  // trigger the browser's "page unresponsive" prompt):
+  //  1) Build plain, serializable row data on the main thread, yielding to
+  //     the event loop every CHUNK rows.
+  //  2) Hand that data to a Web Worker, which does the actual heavy lifting
+  //     (ExcelJS workbook assembly + zip compression) off the main thread.
   const handleExport = useCallback(async () => {
     setExporting(true)
     try {
-      const ExcelJS = (await import('exceljs')).default
-      const wb = new ExcelJS.Workbook()
-      const ws = wb.addWorksheet(exportSheetName.slice(0, 31) || 'Data')
-      ws.columns = columns.map(c => ({
-        header: c.header, key: c.key,
+      const exportColumns: ExportColumnMeta[] = columns.map(c => ({
+        key: c.key,
+        header: c.header,
         width: Math.min(40, Math.max(12, c.header.length + 4)),
+        numberFormat: c.numberFormat,
       }))
-      for (const r of sorted) {
-        const obj: Record<string, string | number | null> = {}
+
+      const EXPORT_CHUNK = 1000
+      const exportRows: ExportRowData[] = new Array(sorted.length)
+      for (let i = 0; i < sorted.length; i++) {
+        const r = sorted[i]
+        const values: Record<string, string | number | null> = {}
+        let fills: Record<string, string | null> | undefined
+        let fontColors: Record<string, string | null> | undefined
         for (const c of columns) {
           const v = (c.exportValue ?? c.accessor)(r)
-          obj[c.key] = (v ?? '') as string | number | null
+          values[c.key] = (v ?? '') as string | number | null
+          const fill = c.exportFill?.(r)
+          if (fill) (fills ??= {})[c.key] = fill
+          const fontColor = c.exportFontColor?.(r)
+          if (fontColor) (fontColors ??= {})[c.key] = fontColor
         }
-        ws.addRow(obj)
+        exportRows[i] = { values, fills, fontColors }
+        if (i % EXPORT_CHUNK === EXPORT_CHUNK - 1) {
+          await new Promise(resolve => setTimeout(resolve, 0))
+        }
       }
-      // Header style
-      ws.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } }
-      ws.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF2563EB' } }
-      ws.getRow(1).alignment = { vertical: 'middle' }
-      ws.views = [{ state: 'frozen', ySplit: 1 }]
-      ws.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: columns.length } }
-      const buf = await wb.xlsx.writeBuffer()
-      const blob = new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })
+
+      const worker = new Worker(new URL('../workers/exportWorker.ts', import.meta.url), { type: 'module' })
+      const buffer = await new Promise<ArrayBuffer>((resolve, reject) => {
+        worker.onmessage = (e: MessageEvent<ExportResponse>) => {
+          if (e.data.type === 'done') resolve(e.data.buffer)
+          else reject(new Error(e.data.message))
+        }
+        worker.onerror = (e) => reject(e.error ?? new Error(e.message))
+        const request: ExportRequest = {
+          sheetName: exportSheetName,
+          fileName: exportFileName,
+          columns: exportColumns,
+          rows: exportRows,
+        }
+        worker.postMessage(request)
+      })
+      worker.terminate()
+
+      const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
       a.href = url
@@ -293,17 +334,19 @@ export default function DataGrid<T>({
       </div>
 
       {/* ── Table ── */}
-      <div className="overflow-x-auto rounded-xl border border-gray-200 shadow-sm">
+      <div className="overflow-auto rounded-xl border border-gray-200 shadow-sm" style={{ maxHeight: '60vh' }}>
         <table className="min-w-max w-full text-xs border-collapse">
-          <thead className="bg-gray-50 text-[10px] uppercase tracking-wide text-gray-500 sticky top-0 z-[1]">
+          <thead className="bg-gray-50 text-[10px] uppercase tracking-wide text-gray-500 sticky top-0 z-[10]">
             <tr>
-              {columns.map(col => {
+              {columns.map((col, i) => {
                 const isSorted = sortKey === col.key
                 const alignCls = col.align === 'right' ? 'text-right' : col.align === 'center' ? 'text-center' : 'text-left'
+                const stickyCls = freezeFirstColumn && i === 0 ? 'sticky left-0 top-0 z-[11] bg-gray-50' : 'sticky top-0 z-[10]'
+                const widthCls = col.width ?? ''
                 return (
                   <th
                     key={col.key}
-                    className={`${padH} ${alignCls} whitespace-nowrap border-b border-gray-200 ${col.noSort ? '' : 'cursor-pointer select-none hover:text-gray-700'} ${col.className ?? ''}`}
+                    className={`${padH} ${alignCls} whitespace-nowrap border-b border-gray-200 ${col.noSort ? '' : 'cursor-pointer select-none hover:text-gray-700'} ${stickyCls} ${widthCls} ${col.className ?? ''}`}
                     onClick={col.noSort ? undefined : () => toggleSort(col.key)}
                   >
                     <span className={`inline-flex items-center gap-1 ${col.align === 'right' ? 'flex-row-reverse' : ''}`}>
@@ -321,13 +364,15 @@ export default function DataGrid<T>({
 
             {/* Per-column filter row */}
             {showFilters && (
-              <tr className="bg-white">
-                {columns.map(col => {
+              <tr className="bg-white sticky top-0 z-[1]">
+                {columns.map((col, i) => {
                   const f = filters[col.key] ?? EMPTY_FILTER
                   const type = col.type ?? 'text'
-                  if (col.noFilter) return <th key={col.key} className="px-2 py-1.5 border-b border-gray-200" />
+                  const stickyCls = freezeFirstColumn && i === 0 ? 'sticky left-0 top-0 z-[11] bg-white' : 'sticky top-0 z-[10]'
+                  const widthCls = col.width ?? ''
+                  if (col.noFilter) return <th key={col.key} className={`px-2 py-1.5 border-b border-gray-200 ${stickyCls} ${widthCls}`} />
                   return (
-                    <th key={col.key} className="px-2 py-1.5 border-b border-gray-200 font-normal">
+                    <th key={col.key} className={`px-2 py-1.5 border-b border-gray-200 font-normal ${stickyCls} ${widthCls}`}>
                       {type === 'number' || type === 'date' ? (
                         <div className="flex items-center gap-1">
                           <input
@@ -377,13 +422,22 @@ export default function DataGrid<T>({
               return (
                 <tr
                   key={rowKey(row, globalIdx)}
-                  className={`${extra} ${onRowClick ? 'cursor-pointer' : ''}`}
+                  className={`group ${extra} ${onRowClick ? 'cursor-pointer' : ''}`}
                   onClick={onRowClick ? () => onRowClick(row, globalIdx) : undefined}
                 >
-                  {columns.map(col => {
+                  {columns.map((col, colIdx) => {
                     const alignCls = col.align === 'right' ? 'text-right' : col.align === 'center' ? 'text-center' : 'text-left'
+                    const widthCls = col.width ?? ''
+                    let stickyCls = ''
+                    if (freezeFirstColumn && colIdx === 0) {
+                      if (i % 2 === 0) {
+                        stickyCls = 'sticky left-0 z-[2] bg-white group-hover:bg-gray-50 group-[.bg-indigo-100]:bg-indigo-100'
+                      } else {
+                        stickyCls = 'sticky left-0 z-[2] bg-gray-50/50 group-hover:bg-gray-100 group-[.bg-indigo-100]:bg-indigo-100'
+                      }
+                    }
                     return (
-                      <td key={col.key} className={`${pad} ${alignCls} whitespace-nowrap ${col.className ?? ''}`}>
+                      <td key={col.key} className={`${pad} ${alignCls} whitespace-nowrap ${stickyCls} ${widthCls} ${col.className ?? ''}`}>
                         {col.render ? col.render(row, globalIdx) : (col.accessor(row) ?? '—')}
                       </td>
                     )

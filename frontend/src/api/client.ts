@@ -482,6 +482,20 @@ export async function lookupDemandFull(mpns: string[]): Promise<DemandFullRespon
   return data
 }
 
+export interface CurrencyRateResponse {
+  rate: number
+  from_currency: string
+  date: string
+  /** True when SAP had no genuine rate for this currency/date and `rate` is
+   * just a 1.0 last-resort placeholder — must not be cached as a real rate. */
+  is_fallback: boolean
+}
+
+export async function getCurrencyRate(fromCurrency: string, date: string): Promise<CurrencyRateResponse> {
+  const { data } = await http.post<CurrencyRateResponse>('/financials/currency-rate', { from_currency: fromCurrency, date }, { timeout: 30_000 })
+  return data
+}
+
 export interface DemandDbVersion {
   file:       string
   label:      string
