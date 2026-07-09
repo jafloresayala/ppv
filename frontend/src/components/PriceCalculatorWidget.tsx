@@ -152,7 +152,7 @@ const fmt6 = (v: number | null | undefined) =>
 const fmt2 = (v: number | null | undefined) =>
   v != null ? v.toLocaleString('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 2 }) : '—'
 const fmtLocal = (v: number | null | undefined, cur = '') =>
-  v != null ? `${v.toLocaleString('en-US', { minimumFractionDigits: 4 })} ${cur}`.trim() : '—'
+  v != null ? `${v.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 6 })} ${cur}`.trim() : '—'
 
 function buildPlantSummaries(rows: IQItem[], windowMs: number): PlantSummary[] {
   const map = new Map<string, IQItem[]>()
@@ -362,6 +362,8 @@ function PlantTable({ plants, bestPlant, pinnedSite, selectedSite, onPin, onSele
             <th className="px-3 py-2 text-left whitespace-nowrap">Supplier</th>
             <th className="px-3 py-2 text-right whitespace-nowrap">Last PO (USD)</th>
             <th className="px-3 py-2 text-right whitespace-nowrap">Std (USD)</th>
+            <th className="px-3 py-2 text-right whitespace-nowrap">Last PO (Local)</th>
+            <th className="px-3 py-2 text-right whitespace-nowrap">Std (Local)</th>
             <th className="px-3 py-2 text-left whitespace-nowrap">PO Date</th>
           </tr>
         </thead>
@@ -420,6 +422,8 @@ function PlantTable({ plants, bestPlant, pinnedSite, selectedSite, onPin, onSele
                 <td className="px-3 py-2 text-gray-700 whitespace-nowrap">{p.bestSupplier}</td>
                 <td className="px-3 py-2 text-right text-blue-700 font-mono whitespace-nowrap">{fmt6(p.bestPrice)}</td>
                 <td className="px-3 py-2 text-right text-gray-600 font-mono whitespace-nowrap">{fmt6(bestRow.standardPriceUsd)}</td>
+                <td className="px-3 py-2 text-right text-indigo-700 font-mono whitespace-nowrap">{fmtLocal(resolvePoLocal(p.bestRow), p.bestRow.localCurrency)}</td>
+                <td className="px-3 py-2 text-right text-gray-500 font-mono whitespace-nowrap">{fmtLocal(resolveStdLocal(bestRow), bestRow.localCurrency)}</td>
                 <td className="px-3 py-2 text-gray-500 whitespace-nowrap">{p.lastPoDate}</td>
               </tr>
             )
@@ -4025,7 +4029,7 @@ export default function PriceCalculatorWidget({ mode = 'widget' }: { mode?: 'wid
                       <div>
                         <div className="flex items-center justify-between mb-2">
                           <h4 className="text-sm font-semibold text-gray-700">Plant Summary</h4>
-                          <p className="text-xs text-gray-400">Click  to pin · click row for invoice or comparison</p>
+                          <p className="text-xs text-gray-400"></p>
                         </div>
                         <PlantTable
                           plants={plants}
