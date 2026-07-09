@@ -55,10 +55,11 @@ ADMIN_USERNAME = _os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = _os.getenv("ADMIN_PASSWORD", "admin123")
 
 # ── Azure AI Inference ────────────────────────────────────────────────────────
-AZ_INF_ENDPOINT = "https://k90016277-aippv-resource.services.ai.azure.com/models"
-AZ_INF_API_KEY  = "1quEgPspq8NjEo4zm8STsskX1RwSOc6Yzaiwh0LO8Rl8pnkAjS79JQQJ99CDACHYHv6XJ3w3AAAAACOGCMKx"
-AZ_INF_API_VER  = "2024-05-01-preview"
-AZ_INF_MODEL    = "Kimi-K2.6"
+AZ_INF_ENDPOINT = "AZ_INF_ENDPOINT"
+AZ_INF_API_KEY  = "AZ_INF_API_KEY"
+AZ_INF_API_VER  = "AZ_INF_API_VER"
+AZ_INF_MODEL    = "AZ_INF_MODEL"
+
 
 # ── CORS origins (add prod domain if ever deployed) ──────────────────────────
 ALLOWED_ORIGINS = ["http://localhost:5173", "http://localhost:4173", "http://localhost:3000", "http://localhost:8080"]
